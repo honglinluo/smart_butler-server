@@ -1,4 +1,6 @@
 # 系统配置文件 - 智能管家服务端
+# 敏感字段（密码、密钥、连接串）使用 ${ENV_VAR} 占位符，
+# 实际值在 .env 文件或系统环境变量中设置，不要在此文件中硬编码。
 
 system:
   # 记忆管理配置
@@ -23,21 +25,21 @@ system:
 # 数据库配置
 database:
   mysql:
-    url: "mysql+pymysql://root:root@localhost/agent_db"
+    url: "${MYSQL_URL}"             # 完整连接串，格式: mysql+pymysql://user:pass@host:port/db
     pool_size: 3
     max_overflow: 20
     min_connections: 2
     max_connections: 5
 
   redis:
-    url: "redis://localhost:6379/0"
+    url: "${REDIS_URL}"             # 完整连接串，格式: redis://:password@host:port/db
     db: 0
     encoding: "utf-8"
     min_connections: 2
     max_connections: 5
 
   elasticsearch:
-    url: "http://localhost:9200"
+    url: "${ELASTICSEARCH_URL}"     # ES 地址，格式: http://host:port
     index_prefix: "hermes_chat"
     vector_field: "message_vector"
     number_of_shards: 1
@@ -47,8 +49,9 @@ database:
 
 # 向量化配置
 embedding:
-  provider: "ollama"  # embedding 提供者，当前支持 Ollama 和 OpenAI
-  api_url: "http://localhost:11434"
+  provider: "ollama"               # embedding 提供者：ollama / openai
+  api_url: "${EMBEDDING_API_URL}"  # embedding 服务地址
+  api_key: "${EMBEDDING_API_KEY}"  # embedding 服务密钥（Ollama 留空即可）
   model_name: "qwen3-embedding:latest"          # 由 scripts/setup_embedding.py 写入
   model_dim: 4096         # qwen3-embedding 实际输出维度
   system_user_id: "0"     # MySQL users 表中的系统用户 ID
@@ -59,7 +62,6 @@ embedding:
 
 # 代理配置
 agents:
-  # 代理列表 (具体的代理定义在 agents_config.yaml 中)
   enable_router: true
   enable_workers: true
 
@@ -71,7 +73,6 @@ file_storage:
 
 # 工具配置
 tools:
-  # 工具注册机制
   auto_discover: true              # 自动发现工具
   tool_timeout: 30                 # 工具执行超时 (秒)
 
@@ -79,7 +80,7 @@ tools:
 logging:
   level: "INFO"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  
+
 # API 配置
 api:
   host: "0.0.0.0"
