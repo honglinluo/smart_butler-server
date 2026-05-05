@@ -402,7 +402,13 @@ async def register(user: UserRegister):
 
 @router.post("/login", response_model=dict, summary="用户登录")
 async def login(user: UserLogin):
-    """用户登录（用户名为手机号或邮箱，密码须经 RSA-OAEP-SHA256 加密后提交）。"""
+    """用户登录（用户名为手机号或邮箱，密码须经 RSA-OAEP-SHA256 加密后提交）。
+
+    Session 复用策略：
+    - 若该用户在其他平台已有有效 session，直接续期并返回已有 token
+    - 若所有 session 均已过期，签发新 token
+    - 过期的 token 引用自动从 sessions Set 清除
+    """
     redis_conn = await get_connection("redis", None)
     mysql_conn = await get_connection("mysql", "agent_db")
     if not redis_conn or not mysql_conn:
@@ -438,30 +444,53 @@ async def login(user: UserLogin):
             {"user_id": user_id, "last_login": datetime.now()},
         )
 
-        # 5. 签发 session token
-        token = generate_token()
-        await redis_conn.create(
-            SESSION_TOKEN.format(token=token),
-            {
-                "user_id":          user_id,
-                "username":         user.username,
-                "token":            token,
-                "is_authenticated": True,
-            },
-            ttl=SESSION_TTL,
-        )
-
-        # 6. 将 token 注册到用户 sessions Set（多平台并发登录支持）
+        # 5. 查找已有有效 session（多平台登录复用 token）
+        token: str = ""
+        is_reused  = False
         client = getattr(redis_conn, "redis_client", None)
+        sessions_key = USER_SESSIONS.format(user_id=user_id)
+
         if client:
-            sessions_key = USER_SESSIONS.format(user_id=user_id)
-            client.sadd(sessions_key, token)
-            client.expire(sessions_key, USER_SESSIONS_TTL)
+            existing_tokens = client.smembers(sessions_key)
+            stale_tokens: list = []
+            for t in existing_tokens:
+                t_str = t.decode() if isinstance(t, bytes) else t
+                session_key = SESSION_TOKEN.format(token=t_str)
+                if client.exists(session_key):
+                    # 找到有效 session → 续期后复用
+                    token     = t_str
+                    is_reused = True
+                    client.expire(session_key, SESSION_TTL)
+                    break
+                else:
+                    stale_tokens.append(t)
+            # 清理过期 token 引用
+            if stale_tokens:
+                client.srem(sessions_key, *stale_tokens)
+
+        # 6. 无有效 session → 签发新 token
+        if not token:
+            token = generate_token()
+            await redis_conn.create(
+                SESSION_TOKEN.format(token=token),
+                {
+                    "user_id":          user_id,
+                    "username":         user.username,
+                    "token":            token,
+                    "is_authenticated": True,
+                },
+                ttl=SESSION_TTL,
+            )
+            if client:
+                client.sadd(sessions_key, token)
+                client.expire(sessions_key, USER_SESSIONS_TTL)
 
         # 7. 预热用户初始化缓存
         await _load_user_init_data(user_id, redis_conn)
 
-        return {"message": "登录成功", "token": token, "user_id": user_id}
+        msg = "已在其他平台登录，返回现有会话" if is_reused else "登录成功"
+        logger.info("[login] user=%s is_reused=%s", user_id, is_reused)
+        return {"message": msg, "token": token, "user_id": user_id}
 
     finally:
         await release_connection("mysql", mysql_conn)
