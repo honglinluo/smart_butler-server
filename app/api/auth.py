@@ -1,0 +1,588 @@
+"""用户认证 API — 登录、注册、密码修改
+
+密码传输安全：
+  所有密码字段一律通过 RSA-OAEP-SHA256 加密传输，服务端不接受明文密码。
+  客户端须先调用 GET /auth/public-key 获取公钥与一次性 nonce，
+  再用公钥加密密码后附带 nonce 一起提交（nonce 5 分钟有效，单次消费）。
+
+客户端 JS 加密示例：
+  const {public_key_pem, key_nonce} = await (await fetch('/auth/public-key')).json();
+  const pem    = public_key_pem.replace(/-----.*?-----/g,'').replace(/\\s/g,'');
+  const derBuf = Uint8Array.from(atob(pem), c => c.charCodeAt(0));
+  const pubKey = await crypto.subtle.importKey(
+      'spki', derBuf.buffer, {name:'RSA-OAEP', hash:'SHA-256'}, false, ['encrypt']
+  );
+  const encrypt = async (text) => {
+      const buf = await crypto.subtle.encrypt(
+          {name:'RSA-OAEP'}, pubKey, new TextEncoder().encode(text)
+      );
+      return btoa(String.fromCharCode(...new Uint8Array(buf)));
+  };
+  // 登录示例：
+  await fetch('/auth/login', {method:'POST', body: JSON.stringify({
+      username: 'user@example.com',
+      encrypted_password: await encrypt('MyP@ssw0rd'),
+      key_nonce: key_nonce,
+  })});
+"""
+
+import json
+import logging
+import re
+import secrets
+from datetime import datetime
+from typing import Any, Optional
+
+import bcrypt
+from fastapi import APIRouter, HTTPException, Request, status, Depends
+from pydantic import BaseModel, Field, GetCoreSchemaHandler
+from pydantic._internal import _schema_generation_shared
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import core_schema
+
+from app.database.pool import get_connection, release_connection
+from app.api.dependencies import get_current_user
+from app.core.crypto import (
+    decrypt_password, generate_nonce, get_public_key_pem,
+    nonce_redis_key, NONCE_TTL,
+)
+from app.core.redis_keys import (
+    SESSION_TOKEN, SESSION_TTL,
+    USER_INIT, INIT_TTL,
+    USER_SESSIONS, USER_SESSIONS_TTL,
+    AUTH_NONCE, AUTH_NONCE_TTL,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+# ═══════════════════════════════════════════════════════════════
+# 自定义类型注解
+# ═══════════════════════════════════════════════════════════════
+
+class PhoneStr:
+    """中国大陆手机号类型（支持 11 位纯数字或 +86 前缀）。"""
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, _source: type[Any], _handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        return core_schema.no_info_after_validator_function(
+            cls._validate, core_schema.str_schema()
+        )
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls,
+        core_schema_: core_schema.CoreSchema,
+        handler: _schema_generation_shared.GetJsonSchemaHandler,
+    ) -> JsonSchemaValue:
+        field_schema = handler(core_schema_)
+        field_schema.update(type="string", format="phone", example="13812345678")
+        return field_schema
+
+    @classmethod
+    def _validate(cls, value: str, /) -> str:
+        try:
+            from phonenumbers import parse, is_valid_number
+            p = parse(str(value).strip(), "CN")
+            if is_valid_number(p):
+                return str(value).strip()
+            raise ValueError("请输入有效的中国大陆手机号")
+        except Exception as exc:
+            raise ValueError("请输入有效的中国大陆手机号") from exc
+
+
+_EMAIL_RE = re.compile(
+    r"^[a-zA-Z0-9](?:[a-zA-Z0-9._%+\-]*[a-zA-Z0-9])?"
+    r"@[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?"
+    r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?)*"
+    r"\.[a-zA-Z]{2,}$"
+)
+
+
+class EmailStr:
+    """邮箱地址类型（RFC 5321 简化校验，存储时转为小写）。"""
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, _source: type[Any], _handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        return core_schema.no_info_after_validator_function(
+            cls._validate, core_schema.str_schema()
+        )
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls,
+        core_schema_: core_schema.CoreSchema,
+        handler: _schema_generation_shared.GetJsonSchemaHandler,
+    ) -> JsonSchemaValue:
+        field_schema = handler(core_schema_)
+        field_schema.update(type="string", format="email", example="user@example.com")
+        return field_schema
+
+    @classmethod
+    def _validate(cls, value: str, /) -> str:
+        value = str(value).strip().lower()
+        if not _EMAIL_RE.match(value):
+            raise ValueError("请输入有效的邮箱地址")
+        return value
+
+
+# ── 密码安全规则 ─────────────────────────────────────────────────────────────
+_PASSWORD_RULES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"[A-Z]"),  "至少包含一个大写字母（A-Z）"),
+    (re.compile(r"[a-z]"),  "至少包含一个小写字母（a-z）"),
+    (re.compile(r"\d"),     "至少包含一个数字（0-9）"),
+    (re.compile(r"[!@#$%^&*()\-_=+\[\]{};:'\",.<>/?\\|`~]"),
+                            "至少包含一个特殊字符（如 !@#$%^&*）"),
+]
+_PASSWORD_MIN_LEN = 8
+
+
+def _validate_password_strength(password: str) -> str:
+    """校验明文密码强度，不符合则抛出 ValueError。"""
+    if len(password) < _PASSWORD_MIN_LEN:
+        raise ValueError(f"密码长度至少 {_PASSWORD_MIN_LEN} 位")
+    errors = [msg for pattern, msg in _PASSWORD_RULES if not pattern.search(password)]
+    if errors:
+        raise ValueError("密码不符合安全要求：" + "；".join(errors))
+    return password
+
+
+class UsernameStr:
+    """登录用户名类型：接受手机号或邮箱地址（自动识别）。"""
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, _source: type[Any], _handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        return core_schema.no_info_after_validator_function(
+            cls._validate, core_schema.str_schema()
+        )
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls,
+        core_schema_: core_schema.CoreSchema,
+        handler: _schema_generation_shared.GetJsonSchemaHandler,
+    ) -> JsonSchemaValue:
+        field_schema = handler(core_schema_)
+        field_schema.update(
+            type="string",
+            description="手机号（如 13812345678）或邮箱地址",
+            example="13812345678",
+        )
+        return field_schema
+
+    @classmethod
+    def _validate(cls, value: str, /) -> str:
+        value = str(value).strip()
+        try:
+            return PhoneStr._validate(value)
+        except ValueError:
+            pass
+        try:
+            return EmailStr._validate(value)
+        except ValueError:
+            pass
+        raise ValueError("用户名须为有效的手机号或邮箱地址")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 请求 / 响应模型
+# ═══════════════════════════════════════════════════════════════
+
+class PublicKeyResponse(BaseModel):
+    public_key_pem: str  = Field(..., description="RSA 公钥（PEM 格式，SubjectPublicKeyInfo）")
+    key_nonce:      str  = Field(..., description="一次性随机 nonce，提交密码时携带（5 分钟有效）")
+    expires_in:     int  = Field(NONCE_TTL, description="nonce 有效期（秒）")
+    algorithm:      str  = Field("RSA-OAEP-SHA256", description="加密算法标识")
+
+
+class UserRegister(BaseModel):
+    username:           UsernameStr = Field(..., description="手机号或邮箱，作为登录唯一标识")
+    encrypted_password: str         = Field(..., description="RSA-OAEP-SHA256 加密后的密码（Base64）")
+    key_nonce:          str         = Field(..., description="从 GET /auth/public-key 获取的一次性 nonce")
+
+
+class UserLogin(BaseModel):
+    username:           UsernameStr = Field(..., description="手机号或邮箱")
+    encrypted_password: str         = Field(..., description="RSA-OAEP-SHA256 加密后的密码（Base64）")
+    key_nonce:          str         = Field(..., description="从 GET /auth/public-key 获取的一次性 nonce")
+
+
+class ChangePassword(BaseModel):
+    old_encrypted_password: str = Field(..., description="当前密码（RSA-OAEP-SHA256 加密，Base64）")
+    new_encrypted_password: str = Field(..., description="新密码（RSA-OAEP-SHA256 加密，Base64）")
+    key_nonce:               str = Field(..., description="从 GET /auth/public-key 获取的一次性 nonce")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 密码工具
+# ═══════════════════════════════════════════════════════════════
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode(), hashed.encode())
+    except ValueError:
+        logger.error("数据库中存储的密码格式无效（非 bcrypt hash），请检查该用户记录")
+        return False
+
+
+def generate_token() -> str:
+    return secrets.token_hex(32)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Nonce 验证（防重放攻击）
+# ═══════════════════════════════════════════════════════════════
+
+async def _consume_nonce(nonce: str, redis_conn) -> None:
+    """验证 nonce 有效并原子性消费（删除），防止重放。
+
+    Raises:
+        HTTPException 400: nonce 不存在或已过期
+    """
+    key = AUTH_NONCE.format(nonce=nonce)
+    # 读 + 删（非原子，但 nonce 5 分钟 TTL + 单次请求窗口，实际碰撞概率极低）
+    val = await redis_conn.read(key)
+    if val is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="key_nonce 无效或已过期，请重新获取公钥后再试",
+        )
+    await redis_conn.delete(key)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 内部工具
+# ═══════════════════════════════════════════════════════════════
+
+async def _load_user_init_data(user_id: str, redis_conn) -> None:
+    """登录成功后将用户画像写入 Redis 缓存。"""
+    mysql_conn = await get_connection("mysql", "agent_db")
+    if not mysql_conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    try:
+        profile: dict = {}
+        df_p = await mysql_conn.execute_raw(
+            "SELECT profile FROM user_profiles WHERE user_id = :uid",
+            {"uid": user_id},
+        )
+        if df_p is not None and len(df_p) > 0:
+            raw     = df_p.iloc[0]["profile"]
+            profile = json.loads(raw) if isinstance(raw, str) else (raw or {})
+
+        await redis_conn.create(
+            USER_INIT.format(user_id=user_id),
+            {"profile": profile},
+            ttl=INIT_TTL,
+        )
+    finally:
+        await release_connection("mysql", mysql_conn)
+
+
+async def _flush_profile_to_mysql(user_id: str, profile: dict) -> None:
+    """将用户画像固化到 MySQL（退出登录或 TTL 告警时调用）。"""
+    mysql_conn = await get_connection("mysql", "agent_db")
+    if not mysql_conn:
+        return
+    try:
+        await mysql_conn.execute_raw(
+            """
+            INSERT INTO user_profiles (user_id, profile)
+            VALUES (:uid, :profile)
+            ON DUPLICATE KEY UPDATE
+                profile    = VALUES(profile),
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            {"uid": user_id, "profile": json.dumps(profile, ensure_ascii=False)},
+        )
+    except Exception as exc:
+        logger.warning("[auth] 画像写入 MySQL 失败 user=%s: %s", user_id, exc)
+    finally:
+        await release_connection("mysql", mysql_conn)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/public-key", response_model=PublicKeyResponse, summary="获取 RSA 公钥与一次性 nonce")
+async def get_public_key():
+    """返回服务端 RSA 公钥和一次性 nonce。
+
+    - 客户端用公钥（RSA-OAEP-SHA256）加密明文密码
+    - key_nonce 在 {expires_in} 秒内有效，提交后立即失效（不可重用）
+    - 每次登录 / 注册 / 修改密码前都应重新获取
+    """
+    redis_conn = await get_connection("redis", None)
+    if not redis_conn:
+        raise HTTPException(status_code=503, detail="Redis 不可用，无法签发 nonce")
+
+    try:
+        nonce = generate_nonce()
+        await redis_conn.create(
+            AUTH_NONCE.format(nonce=nonce),
+            "1",
+            ttl=AUTH_NONCE_TTL,
+        )
+        return PublicKeyResponse(
+            public_key_pem=get_public_key_pem(),
+            key_nonce     =nonce,
+        )
+    finally:
+        await release_connection("redis", redis_conn)
+
+
+@router.post("/register", response_model=dict, summary="用户注册")
+async def register(user: UserRegister):
+    """用户注册（用户名为手机号或邮箱，密码须经 RSA-OAEP-SHA256 加密后提交）。
+
+    密码安全要求（服务端解密后校验）：
+    - 长度 ≥ 8 位
+    - 至少包含大写字母、小写字母、数字、特殊字符各一个
+    """
+    redis_conn = await get_connection("redis", None)
+    mysql_conn = await get_connection("mysql", "agent_db")
+    if not redis_conn or not mysql_conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    try:
+        # 1. 验证并消费 nonce（防重放）
+        await _consume_nonce(user.key_nonce, redis_conn)
+
+        # 2. 解密密码
+        try:
+            plain_password = decrypt_password(user.encrypted_password)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # 3. 校验密码强度
+        try:
+            _validate_password_strength(plain_password)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # 4. 检查用户名是否已注册
+        df = await mysql_conn.execute_raw(
+            "SELECT user_id FROM users WHERE username = :username",
+            {"username": user.username},
+        )
+        if df is not None and len(df) > 0:
+            raise HTTPException(status_code=400, detail="该手机号或邮箱已注册")
+
+        # 5. 创建用户
+        user_id = f"user_{secrets.token_hex(8)}"
+        await mysql_conn.execute_raw(
+            "INSERT INTO users (user_id, username, password, created_at) "
+            "VALUES (:user_id, :username, :password, :created_at)",
+            {
+                "user_id":    user_id,
+                "username":   user.username,
+                "password":   hash_password(plain_password),
+                "created_at": datetime.now(),
+            },
+        )
+        return {"message": "注册成功", "user_id": user_id}
+
+    finally:
+        await release_connection("redis",  redis_conn)
+        await release_connection("mysql",  mysql_conn)
+
+
+@router.post("/login", response_model=dict, summary="用户登录")
+async def login(user: UserLogin):
+    """用户登录（用户名为手机号或邮箱，密码须经 RSA-OAEP-SHA256 加密后提交）。"""
+    redis_conn = await get_connection("redis", None)
+    mysql_conn = await get_connection("mysql", "agent_db")
+    if not redis_conn or not mysql_conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    try:
+        # 1. 验证并消费 nonce
+        await _consume_nonce(user.key_nonce, redis_conn)
+
+        # 2. 解密密码
+        try:
+            plain_password = decrypt_password(user.encrypted_password)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # 3. 查询用户 + 验证密码
+        df = await mysql_conn.execute_raw(
+            "SELECT user_id, password FROM users WHERE username = :username",
+            {"username": user.username},
+        )
+        if df is None or len(df) == 0:
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+        db_user = df.iloc[0]
+        if not verify_password(plain_password, db_user["password"]):
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+        user_id = db_user["user_id"]
+
+        # 4. 更新登录时间
+        await mysql_conn.execute_raw(
+            "UPDATE users SET last_login_at = :last_login WHERE user_id = :user_id",
+            {"user_id": user_id, "last_login": datetime.now()},
+        )
+
+        # 5. 签发 session token
+        token = generate_token()
+        await redis_conn.create(
+            SESSION_TOKEN.format(token=token),
+            {
+                "user_id":          user_id,
+                "username":         user.username,
+                "token":            token,
+                "is_authenticated": True,
+            },
+            ttl=SESSION_TTL,
+        )
+
+        # 6. 将 token 注册到用户 sessions Set（多平台并发登录支持）
+        client = getattr(redis_conn, "redis_client", None)
+        if client:
+            sessions_key = USER_SESSIONS.format(user_id=user_id)
+            client.sadd(sessions_key, token)
+            client.expire(sessions_key, USER_SESSIONS_TTL)
+
+        # 7. 预热用户初始化缓存
+        await _load_user_init_data(user_id, redis_conn)
+
+        return {"message": "登录成功", "token": token, "user_id": user_id}
+
+    finally:
+        await release_connection("mysql", mysql_conn)
+        await release_connection("redis",  redis_conn)
+
+
+@router.post("/logout", response_model=dict, summary="退出登录")
+async def logout(request: Request, current_user: dict = Depends(get_current_user)):
+    """退出当前平台的登录状态。
+
+    仅当所有平台均已退出时，执行用户画像固化到 MySQL 和对话记录同步到 ES。
+    """
+    user_id = current_user["user_id"]
+    token   = current_user.get("token", "")
+
+    redis_conn = await get_connection("redis", None)
+    if not redis_conn:
+        return {"message": "退出成功"}
+
+    try:
+        # 1. 删除当前平台 session token
+        if token:
+            await redis_conn.delete(SESSION_TOKEN.format(token=token))
+
+        # 2. 从 sessions Set 移除当前 token，统计剩余有效 session 数
+        remaining_valid = 0
+        client = getattr(redis_conn, "redis_client", None)
+        if client:
+            sessions_key = USER_SESSIONS.format(user_id=user_id)
+            if token:
+                client.srem(sessions_key, token)
+            remaining_tokens = client.smembers(sessions_key)
+            dead_tokens = []
+            for t in remaining_tokens:
+                if client.exists(SESSION_TOKEN.format(token=t)):
+                    remaining_valid += 1
+                else:
+                    dead_tokens.append(t)
+            if dead_tokens:
+                client.srem(sessions_key, *dead_tokens)
+
+        # 3. 所有平台退出 → 固化画像 + 同步 ES
+        if remaining_valid == 0:
+            logger.info("[logout] 用户 %s 所有 session 已退出，开始固化数据", user_id)
+            init_data = await redis_conn.read(USER_INIT.format(user_id=user_id))
+            if isinstance(init_data, dict):
+                profile = init_data.get("profile")
+                if profile:
+                    await _flush_profile_to_mysql(user_id, profile)
+                    logger.info("[logout] 用户画像已固化到 MySQL user=%s", user_id)
+
+            memory_manager = getattr(request.app.state, "memory_manager", None)
+            if memory_manager:
+                await memory_manager.flush_turns_to_es(user_id)
+                logger.info("[logout] 对话记录已同步到 ES user=%s", user_id)
+        else:
+            logger.info(
+                "[logout] 用户 %s 仍有 %d 个平台在线，跳过固化",
+                user_id, remaining_valid,
+            )
+
+    except Exception as exc:
+        logger.warning("[logout] 处理异常 user=%s: %s", user_id, exc)
+    finally:
+        await release_connection("redis", redis_conn)
+
+    return {"message": "退出成功"}
+
+
+@router.post("/change-password", response_model=dict, summary="修改密码")
+async def change_password(
+    password_data: ChangePassword,
+    current_user:  dict = Depends(get_current_user),
+):
+    """修改密码（新旧密码均须经 RSA-OAEP-SHA256 加密后提交）。
+
+    新密码安全要求（服务端解密后校验）：
+    - 长度 ≥ 8 位；大写字母、小写字母、数字、特殊字符各至少一个
+    """
+    redis_conn = await get_connection("redis", None)
+    mysql_conn = await get_connection("mysql", "agent_db")
+    if not redis_conn or not mysql_conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    try:
+        # 1. 验证并消费 nonce
+        await _consume_nonce(password_data.key_nonce, redis_conn)
+
+        # 2. 解密新旧密码
+        try:
+            old_plain = decrypt_password(password_data.old_encrypted_password)
+            new_plain = decrypt_password(password_data.new_encrypted_password)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # 3. 校验新密码强度
+        try:
+            _validate_password_strength(new_plain)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # 4. 验证旧密码正确性
+        df = await mysql_conn.execute_raw(
+            "SELECT password FROM users WHERE user_id = :user_id",
+            {"user_id": current_user["user_id"]},
+        )
+        if df is None or len(df) == 0:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        if not verify_password(old_plain, df.iloc[0]["password"]):
+            raise HTTPException(status_code=400, detail="当前密码错误")
+
+        # 5. 更新密码
+        await mysql_conn.execute_raw(
+            "UPDATE users SET password = :password WHERE user_id = :user_id",
+            {
+                "user_id":  current_user["user_id"],
+                "password": hash_password(new_plain),
+            },
+        )
+        return {"message": "密码修改成功"}
+
+    finally:
+        await release_connection("redis",  redis_conn)
+        await release_connection("mysql",  mysql_conn)

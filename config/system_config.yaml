@@ -1,0 +1,88 @@
+# 系统配置文件 - 智能管家服务端
+
+system:
+  # 记忆管理配置
+  max_recent_messages: 30          # 保持的最近消息数（兼容旧字段）
+  retention_days: 7                 # 消息保留天数
+  embedding_model: "bge-large-zh-v1.5"  # Embedding 模型名称
+
+  # Redis 短期缓存
+  redis_recent_turns: 10            # Redis 中保存的最近对话轮次数上限
+  es_sync_threshold_pct: 0.6        # Redis 列表达到此比例时触发同步到 ES（如 10*0.6=6条）
+
+  # 压缩策略
+  compression:
+    trigger_message_count: 30       # 累计轮次超过此值触发压缩
+    compression_batch_size: 10      # 每次压缩的消息数量
+
+  # 检索配置
+  retrieval:
+    top_k: 3                        # 记忆检索返回的最大条数（固定 3 条）
+    confidence_threshold: 0.7       # 相关性置信度阈值
+
+# 数据库配置
+database:
+  mysql:
+    url: "mysql+pymysql://root:root@localhost/agent_db"
+    pool_size: 3
+    max_overflow: 20
+    min_connections: 2
+    max_connections: 5
+
+  redis:
+    url: "redis://localhost:6379/0"
+    db: 0
+    encoding: "utf-8"
+    min_connections: 2
+    max_connections: 5
+
+  elasticsearch:
+    url: "http://localhost:9200"
+    index_prefix: "hermes_chat"
+    vector_field: "message_vector"
+    number_of_shards: 1
+    number_of_replicas: 0
+    min_connections: 1
+    max_connections: 5
+
+# 向量化配置
+embedding:
+  provider: "ollama"  # embedding 提供者，当前支持 Ollama 和 OpenAI
+  api_url: "http://localhost:11434"
+  model_name: "qwen3-embedding:latest"          # 由 scripts/setup_embedding.py 写入
+  model_dim: 4096         # qwen3-embedding 实际输出维度
+  system_user_id: "0"     # MySQL users 表中的系统用户 ID
+  chunk_size: 800         # 每个 chunk 最大字符数
+  chunk_overlap: 100      # 相邻 chunk 的重叠字符数
+  batch_size: 16          # embed_batch 每批大小
+  vector_index_suffix: "v" # 向量索引后缀，全名: {prefix}_v_{user_id}
+
+# 代理配置
+agents:
+  # 代理列表 (具体的代理定义在 agents_config.yaml 中)
+  enable_router: true
+  enable_workers: true
+
+# 文件存储配置
+file_storage:
+  upload_dir: "data/uploads"       # 文件保存根目录（相对项目根目录）
+  max_file_size_mb: 50             # 单文件最大大小（MB）
+  cleanup_days: 30                 # 文件保留天数（-1 = 永不清理）
+
+# 工具配置
+tools:
+  # 工具注册机制
+  auto_discover: true              # 自动发现工具
+  tool_timeout: 30                 # 工具执行超时 (秒)
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+# API 配置
+api:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
+  workers: 4

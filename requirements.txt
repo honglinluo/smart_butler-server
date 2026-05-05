@@ -1,0 +1,64 @@
+# Hermes Multi-Agent System — 依赖列表
+# 更新日期: 2026-04-25
+
+# ── 核心 Web 框架 ───────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+
+# ── LLM 与 Agent 框架 ──────────────────────────────────────────
+langchain                  # 核心 Chain、Prompt、OutputParser
+langchain-core             # BaseChatModel、BaseTool、Runnable 等核心抽象
+langchain-openai           # OpenAI 兼容模型支持（init_chat_model 必需）
+langchain-community        # 社区模型/工具集成
+langchain-elasticsearch    # ES 向量存储集成
+langgraph                  # 多 Agent 图编排（create_react_agent）
+openai                     # OpenAI 官方 SDK（底层调用）
+
+# ── 数据库与缓存 ────────────────────────────────────────────────
+sqlalchemy                 # ORM 与连接池
+pymysql                    # MySQL 驱动
+redis                      # Redis 客户端
+elasticsearch              # Elasticsearch 客户端
+pandas                     # DataFrame 处理（execute_raw 返回值）
+
+# ── 认证与安全 ──────────────────────────────────────────────────
+bcrypt                     # 密码哈希
+python-jose[cryptography]  # JWT Token 生成与校验
+
+# ── HTTP 客户端 ─────────────────────────────────────────────────
+httpx                      # Embedding 服务调用（异步）
+aiohttp                    # 可选异步 HTTP
+
+# ── 配置管理 ────────────────────────────────────────────────────
+pyyaml                     # YAML 配置文件解析
+python-dotenv              # .env 文件支持
+
+# ── 工具与实用程序 ──────────────────────────────────────────────
+phonenumbers               # 电话号码处理工具
+email-validator            # 邮箱格式校验
+
+# ── 数据库 Schema 与模型 ────────────────────────────────────────
+sqlmodel                   # SQLAlchemy + Pydantic 结合
+
+# ── 可观测性 ────────────────────────────────────────────────────
+langsmith                  # LangChain 链路追踪（可选）
+
+# ── 开发与测试工具 ──────────────────────────────────────────────
+pytest
+pytest-asyncio
+black
+flake8
+mypy
+
+# ── 文件解析（FileReaderTool）──────────────────────────────────
+pypdf                      # PDF 文字提取
+python-docx                # Word (.docx) 解析
+openpyxl                   # Excel (.xlsx) 解析
+python-pptx                # PowerPoint (.pptx) 解析
+chardet                    # 文本文件编码自动检测
+pillow                     # 图片读取与 base64 转换
+
+# ── 可选：本地向量嵌入模型 ─────────────────────────────────────
+# sentence-transformers    # 本地 Embedding（MemoryManager 降级路径）

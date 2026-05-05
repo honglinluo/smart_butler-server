@@ -1,0 +1,106 @@
+# 代理配置文件 - 定义各类智能体及其工具
+
+# 路由智能体配置
+router:
+  name: "router"
+  role: "路由智能体"
+  description: "负责意图识别、任务分解和代理路由"
+  prompt_template: "config/templates/router_system.txt"
+  enabled: true
+
+# 工作智能体配置
+workers:
+  - name: "data_analyst"
+    role: "数据分析师"
+    description: "负责数据查询、分析和可视化"
+    prompt_template: "config/templates/analyst_system.txt"
+    tools:
+      - "sql_query"
+      - "chart_generation"
+    enabled: true
+    
+  - name: "customer_support"
+    role: "客服专员"
+    description: "负责客户服务相关任务"
+    prompt_template: "config/templates/support_system.txt"
+    tools:
+      - "order_lookup"
+      - "refund_policy"
+      - "ticket_management"
+    enabled: true
+    
+  - name: "code_assistant"
+    role: "代码助手"
+    description: "负责代码审查、生成和调试"
+    prompt_template: "config/templates/code_assistant_system.txt"
+    tools:
+      - "code_generation"
+      - "code_review"
+      - "syntax_check"
+    enabled: true
+
+# 工具定义
+tools:
+  - id: "sql_query"
+    type: "python_function"
+    path: "app.tools.database.query"
+    description: "用于查询业务数据库"
+    timeout: 30
+    
+  - id: "chart_generation"
+    type: "python_function"
+    path: "app.tools.visualization.generate_chart"
+    description: "生成数据可视化图表"
+    timeout: 30
+    
+  - id: "order_lookup"
+    type: "python_function"
+    path: "app.tools.customer.lookup_order"
+    description: "查询订单信息"
+    timeout: 15
+    
+  - id: "refund_policy"
+    type: "python_function"
+    path: "app.tools.customer.get_refund_policy"
+    description: "获取退款政策"
+    timeout: 10
+    
+  - id: "ticket_management"
+    type: "python_function"
+    path: "app.tools.customer.manage_ticket"
+    description: "工单管理"
+    timeout: 20
+    
+  - id: "code_generation"
+    type: "python_function"
+    path: "app.tools.code.generate"
+    description: "生成代码"
+    timeout: 30
+    
+  - id: "code_review"
+    type: "python_function"
+    path: "app.tools.code.review"
+    description: "代码审查"
+    timeout: 30
+    
+  - id: "syntax_check"
+    type: "python_function"
+    path: "app.tools.code.check_syntax"
+    description: "语法检查"
+    timeout: 10
+
+  - id: "file_reader"
+    type: "python_function"
+    path: "app.tools.file_tools.tool_file_reader"
+    description: "读取本地文件内容（支持 .md .txt .py .json .yaml 等文本文件）"
+    timeout: 10
+
+  - id: "file_writer"
+    type: "python_function"
+    path: "app.tools.file_tools.tool_file_writer"
+    description: "将内容写入本地文件（自动创建父目录）"
+    timeout: 10
+
+# intent_agent_mapping 已移除 — 路由器改为动态模式：
+# LLM 在运行时直接从已注册的 Agent 中选出最合适的处理者，无需维护静态映射。
+# 如需恢复静态映射，重新在此添加 intent_agent_mapping: {...} 即可。
