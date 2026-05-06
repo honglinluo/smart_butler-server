@@ -181,53 +181,199 @@ async def test_hermes_basic():
         return False
 
 
+def test_client_env_unit() -> bool:
+    """client_env 模块单元测试（无需数据库或 LLM）。"""
+    logger.info("\n" + "=" * 70)
+    logger.info("🌐 客户端环境模块单元测试")
+    logger.info("=" * 70)
+
+    try:
+        from app.core.client_env import ClientType, normalize_client_type, format_env_for_prompt
+
+        cases_normalize = [
+            # (输入,          期望输出,         说明)
+            (None,           "unknown",        "None 归一化为 unknown"),
+            ("",             "unknown",        "空字符串归一化为 unknown"),
+            ("api",          "api",            "api 直调默认值"),
+            ("web",          "web",            "标准 web"),
+            ("feishu",       "lark",           "feishu 别名 → lark"),
+            ("Feishu",       "lark",           "Feishu 大写别名 → lark"),
+            ("lark",         "lark",           "lark 直接命中"),
+            ("mac",          "macos",          "mac 别名 → macos"),
+            ("WECHAT",       "wechat",         "大写 WECHAT 归一化"),
+            ("dingtalk",     "dingtalk",       "dingtalk"),
+            ("wework",       "wework",         "wework"),
+            ("my_custom_app","unknown",        "未知值 → unknown"),
+        ]
+
+        all_pass = True
+        for raw, expected, desc in cases_normalize:
+            got = normalize_client_type(raw)
+            if got == expected:
+                logger.info(f"   ✅  normalize({raw!r}) = {got!r}  ({desc})")
+            else:
+                logger.error(f"   ❌  normalize({raw!r}) = {got!r}，期望 {expected!r}  ({desc})")
+                all_pass = False
+
+        cases_format = [
+            # (client_type, version,  期望包含的字符串,       说明)
+            ("api",    None,    "API 直调",               "api 类型产生提示块"),
+            ("wechat", "8.0",   "微信",                   "wechat 含版本号"),
+            ("wechat", "8.0",   "8.0",                    "版本号出现在提示块"),
+            ("lark",   "7.2.1", "飞书",                   "lark 中文标签"),
+            ("unknown", None,   "",                        "unknown 返回空字符串"),
+            ("",       None,    "",                        "空字符串返回空字符串"),
+        ]
+
+        for ct, ver, expected_substr, desc in cases_format:
+            result = format_env_for_prompt(ct, ver)
+            if expected_substr == "":
+                ok = result == ""
+            else:
+                ok = expected_substr in result
+            if ok:
+                logger.info(f"   ✅  format_env({ct!r}, {ver!r}) 含 {expected_substr!r}  ({desc})")
+            else:
+                logger.error(f"   ❌  format_env({ct!r}, {ver!r}) = {result!r}，期望含 {expected_substr!r}  ({desc})")
+                all_pass = False
+
+        # 验证 API 枚举值存在
+        assert ClientType.API == "api", "ClientType.API 应等于 'api'"
+        logger.info("   ✅  ClientType.API 枚举值存在且值为 'api'")
+
+        return all_pass
+
+    except Exception as e:
+        logger.error(f"❌ client_env 单元测试异常: {e}")
+        import traceback; traceback.print_exc()
+        return False
+
+
+def test_request_headers_unit() -> bool:
+    """RequestHeaders 类单元测试（用 Mock Request 模拟请求头，无需数据库）。"""
+    logger.info("\n" + "=" * 70)
+    logger.info("🔌 RequestHeaders 类单元测试")
+    logger.info("=" * 70)
+
+    try:
+        from unittest.mock import MagicMock
+        from app.core.request_headers import RequestHeaders
+
+        def _make_request(headers: dict) -> MagicMock:
+            """构造带指定头信息的 Mock Request。"""
+            mock = MagicMock()
+            mock.headers.get = lambda key, default="": headers.get(key, default)
+            return mock
+
+        all_pass = True
+
+        def _check(desc: str, actual, expected) -> bool:
+            if actual == expected:
+                logger.info(f"   ✅  {desc}: {actual!r}")
+                return True
+            logger.error(f"   ❌  {desc}: 得到 {actual!r}，期望 {expected!r}")
+            return False
+
+        # ── 无头信息：默认值 ──────────────────────────────────
+        rh = RequestHeaders(_make_request({}))
+        all_pass &= _check("无头 → client_type 默认 api",     rh.client_type,    "api")
+        all_pass &= _check("无头 → client_version 默认空串", rh.client_version, "")
+
+        # ── 标准 web 头 ───────────────────────────────────────
+        rh = RequestHeaders(_make_request({"X-Client-Type": "web"}))
+        all_pass &= _check("X-Client-Type: web",  rh.client_type, "web")
+
+        # ── feishu 别名归一化 ─────────────────────────────────
+        rh = RequestHeaders(_make_request({"X-Client-Type": "feishu", "X-Client-Version": "7.2.1"}))
+        all_pass &= _check("X-Client-Type: feishu → lark",   rh.client_type,    "lark")
+        all_pass &= _check("X-Client-Version: 7.2.1",        rh.client_version, "7.2.1")
+
+        # ── 未知类型归一化为 unknown ──────────────────────────
+        rh = RequestHeaders(_make_request({"X-Client-Type": "my_custom_app"}))
+        all_pass &= _check("未知 client_type → unknown", rh.client_type, "unknown")
+
+        # ── to_context_dict() ─────────────────────────────────
+        rh = RequestHeaders(_make_request({"X-Client-Type": "wechat", "X-Client-Version": "8.0"}))
+        ctx = rh.to_context_dict()
+        all_pass &= _check("to_context_dict _client_type",    ctx.get("_client_type"),    "wechat")
+        all_pass &= _check("to_context_dict _client_version", ctx.get("_client_version"), "8.0")
+
+        # ── context.update() 不覆盖已有非客户端键 ────────────
+        context = {"history": [], "user_data": "preserved"}
+        context.update(rh.to_context_dict())
+        all_pass &= _check("update 不影响 history 键",    context.get("history"),    [])
+        all_pass &= _check("update 不影响 user_data 键", context.get("user_data"), "preserved")
+
+        return all_pass
+
+    except Exception as e:
+        logger.error(f"❌ RequestHeaders 单元测试异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    except Exception as e:
+        logger.error(f"❌ client_env 单元测试异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 async def main():
     """主测试流程"""
     logger.info("\n")
     logger.info("╔" + "=" * 68 + "╗")
     logger.info("║" + " " * 20 + "🤖 Hermes LLM 集成测试" + " " * 23 + "║")
     logger.info("╚" + "=" * 68 + "╝")
-    
+
     # 环境检查
     logger.info("\n📋 环境检查:")
     logger.info(f"   - Python: {sys.version.split()[0]}")
     logger.info(f"   - 工作目录: {os.getcwd()}")
     logger.info(f"   - 项目路径: {Path(__file__).parent}")
-    
+
     # 检查 API 密钥
     has_openai_key = bool(os.getenv("OPENAI_API_KEY"))
     logger.info(f"   - OpenAI Key: {'✅ 已配置' if has_openai_key else '❌ 未配置'}")
-    
+
     results = {}
-    
+
+    # 测试 0: client_env 单元测试（无外部依赖）
+    logger.info("\n" + "-" * 70)
+    results["client_env 单元测试"] = test_client_env_unit()
+
+    # 测试 0b: RequestHeaders 单元测试（无外部依赖）
+    logger.info("\n" + "-" * 70)
+    results["RequestHeaders 单元测试"] = test_request_headers_unit()
+
     # 测试 1: 基础 LLM
     logger.info("\n" + "-" * 70)
     model = await test_basic_llm()
     results["基础 LLM"] = model is not None
-    
+
     # 测试 2: 消息处理
     logger.info("\n" + "-" * 70)
     msg_result = await test_message_processing()
     results["消息处理"] = msg_result
-    
+
     # 测试 3: Hermes 基础
     logger.info("\n" + "-" * 70)
     hermes_result = await test_hermes_basic()
     results["Hermes 基础"] = hermes_result
-    
+
     # 输出总结
     logger.info("\n" + "=" * 70)
     logger.info("📊 测试总结")
     logger.info("=" * 70)
-    
+
     for test_name, result in results.items():
         status = "✅" if result else "❌"
         logger.info(f"{status} {test_name}")
-    
+
     passed = sum(1 for v in results.values() if v)
     total = len(results)
     logger.info(f"\n结果: {passed}/{total} 测试通过")
-    
+
     if passed == total:
         logger.info("\n🎉 所有测试通过！")
         logger.info("\n💡 下一步:")

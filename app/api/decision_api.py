@@ -13,10 +13,11 @@ import json
 import logging
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from app.agents.loop.decision_gate import DecisionState, UserDecisionGate
+from app.core.headers import ResponseHeaders
 
 logger = logging.getLogger(__name__)
 
@@ -48,18 +49,20 @@ def _redis(request: Request):
 # ── 决策管理端点 ───────────────────────────────────────────────────────────────
 
 @router.get("/pending", summary="查询所有挂起的工具构建决策")
-async def list_pending() -> Dict[str, str]:
+async def list_pending(response: Response) -> Dict[str, str]:
     """返回当前所有等待用户确认的工具构建请求，格式 {decision_id: "pending"}。"""
+    ResponseHeaders().apply(response)
     return UserDecisionGate.list_pending()
 
 
 @router.post("/{decision_id}/resolve", summary="确认或拒绝一个挂起决策")
-async def resolve_decision(decision_id: str, body: ResolveBody) -> Dict[str, Any]:
+async def resolve_decision(decision_id: str, body: ResolveBody, response: Response) -> Dict[str, Any]:
     """唤醒挂起的事件循环协程并设置决策结果。
 
     - state="allow"：批准工具构建，循环继续执行
     - state="deny" ：拒绝构建，循环终止并返回提示给用户
     """
+    ResponseHeaders().apply(response)
     if body.state not in ("allow", "deny"):
         raise HTTPException(status_code=400, detail="state 必须为 allow 或 deny")
 
@@ -78,11 +81,13 @@ async def get_loop_logs(
     session_id: str,
     user_id: str,
     request: Request,
+    response: Response,
 ) -> Dict[str, Any]:
     """从 Redis 拉取事件循环的完整调用日志（JSON 数组）。
 
     日志格式每条：{event_type, agent_name, message, timestamp, iteration, data}
     """
+    ResponseHeaders().apply(response)
     redis_db = _redis(request)
     if redis_db is None:
         raise HTTPException(status_code=503, detail="Redis 不可用")
@@ -103,8 +108,9 @@ async def get_loop_logs(
 # ── 用户策略端点 ───────────────────────────────────────────────────────────────
 
 @router.get("/users/{user_id}/decision-policy", summary="获取用户工具构建授权策略")
-async def get_policy(user_id: str, request: Request) -> Dict[str, str]:
+async def get_policy(user_id: str, request: Request, response: Response) -> Dict[str, str]:
     """读取当前用户的工具构建授权策略（allow / ask / deny）。"""
+    ResponseHeaders().apply(response)
     redis_db = _redis(request)
     gate     = UserDecisionGate(redis_db=redis_db)
     policy   = await gate._get_policy(user_id)
@@ -113,7 +119,7 @@ async def get_policy(user_id: str, request: Request) -> Dict[str, str]:
 
 @router.put("/users/{user_id}/decision-policy", summary="设置用户工具构建授权策略")
 async def set_policy(
-    user_id: str, body: PolicyBody, request: Request,
+    user_id: str, body: PolicyBody, request: Request, response: Response,
 ) -> Dict[str, str]:
     """配置工具构建的默认授权策略。
 
@@ -121,6 +127,7 @@ async def set_policy(
     - ask  ：每次构建前通知并等待用户确认（默认值）
     - deny ：拒绝所有工具构建请求
     """
+    ResponseHeaders().apply(response)
     if body.policy not in ("allow", "ask", "deny"):
         raise HTTPException(status_code=400, detail="policy 必须为 allow / ask / deny")
 

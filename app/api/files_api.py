@@ -23,11 +23,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
 
 from app.api.dependencies import get_current_user
 from app.core.file_storage import UPLOAD_ROOT, SUBDIR_UPLOADS, SUBDIR_GENERATED
+from app.core.headers import ResponseHeaders
 from app.core.paths import PROJECT_ROOT
 
 router = APIRouter(prefix="/files", tags=["Files"])
@@ -141,6 +142,7 @@ def _scan_user_files(user_id: str, file_type: Optional[str]) -> List[Dict[str, A
 
 @router.get("/list", summary="列出用户所有文件")
 async def list_files(
+    response: Response,
     file_type: Optional[str] = Query(
         None,
         description="过滤文件类型：uploads（上传文件）或 generated（生成文件），不填则返回全部",
@@ -155,6 +157,7 @@ async def list_files(
     - **file_type=generated**: 仅返回 AI 生成的文件
     - 不传 file_type：返回全部
     """
+    ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     files   = _scan_user_files(user_id, file_type)
     return {
@@ -168,6 +171,7 @@ async def list_files(
 @router.get("/download/{file_id}", summary="下载文件")
 async def download_file(
     file_id: str,
+    response: Response,
     current_user: dict = Depends(get_current_user),
 ):
     """
@@ -176,6 +180,7 @@ async def download_file(
     - 只能下载当前登录用户自己的文件（跨用户访问返回 403）
     - 文件不存在返回 404
     """
+    ResponseHeaders().apply(response)
     user_id  = current_user["user_id"]
     abs_path = _path_from_file_id(file_id, user_id)
 
@@ -195,11 +200,13 @@ async def download_file(
 @router.delete("/{file_id}", summary="删除文件")
 async def delete_file(
     file_id: str,
+    response: Response,
     current_user: dict = Depends(get_current_user),
 ):
     """
     按 file_id 删除文件。只能删除当前用户自己的文件。
     """
+    ResponseHeaders().apply(response)
     user_id  = current_user["user_id"]
     abs_path = _path_from_file_id(file_id, user_id)
 

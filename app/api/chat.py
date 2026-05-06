@@ -4,10 +4,11 @@ import asyncio
 import logging
 from typing import List, Optional, AsyncIterator
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, status, Depends
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Response, UploadFile, status, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from app.api.dependencies import get_current_user, get_user_model, require_local_or_auth
+from app.core.headers import RequestHeaders, ResponseHeaders
 from app.core.hermes_engine import LLMInfo
 
 logger = logging.getLogger(__name__)
@@ -18,8 +19,8 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 
 class ChatMessage(BaseModel):
     message:    str
-    context:    dict           = {}
-    agent_name: Optional[str]  = None  # 指定 Agent（可选）
+    context:    dict          = {}
+    agent_name: Optional[str] = None  # 指定 Agent（可选）
 
 
 async def get_hermes_engine(request: Request):
@@ -34,11 +35,14 @@ async def get_hermes_engine(request: Request):
 async def send_message(
     chat_data: ChatMessage,
     request: Request,
+    response: Response,
     current_user: dict = Depends(get_current_user),
     user_model = Depends(get_user_model),
-    engine = Depends(get_hermes_engine)
+    engine = Depends(get_hermes_engine),
+    req_headers: RequestHeaders = Depends(RequestHeaders),
 ):
     """发送聊天消息"""
+    ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     logger.debug("收到聊天请求: user_id=%s message=%r", user_id, chat_data.message)
 
@@ -63,6 +67,9 @@ async def send_message(
                 llm_instance = user_model
         except Exception:
             llm_instance = None
+
+        # 从请求头注入客户端环境（无 header 时默认 api，engine 内部会传递给子 Agent）
+        context.update(req_headers.to_context_dict())
 
         logger.debug("调用引擎: user_id=%s context_keys=%s", user_id, list(context.keys()))
         response = await engine.process_user_input(
@@ -95,9 +102,11 @@ async def send_message(
 async def stream_message(
     chat_data: ChatMessage,
     request: Request,
+    response: Response,
     current_user: dict = Depends(get_current_user),
     user_model = Depends(get_user_model),
-    engine = Depends(get_hermes_engine)
+    engine = Depends(get_hermes_engine),
+    req_headers: RequestHeaders = Depends(RequestHeaders),
 ):
     """
     流式聊天接口，使用 SSE (Server-Sent Events) 格式实时推送 token。
@@ -108,6 +117,7 @@ async def stream_message(
     - event: done     — 完成（data.turn_id）
     - event: error    — 发生错误（data.message）
     """
+    ResponseHeaders(extra={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}).apply(response)
     user_id = current_user["user_id"]
     logger.debug("收到流式聊天请求: user_id=%s message=%r", user_id, chat_data.message)
 
@@ -128,12 +138,16 @@ async def stream_message(
     except Exception:
         llm_instance = None
 
+    stream_context = dict(chat_data.context or {})
+    # 从请求头注入客户端环境（无 header 时默认 api）
+    stream_context.update(req_headers.to_context_dict())
+
     async def event_generator() -> AsyncIterator[str]:
         try:
             async for sse_event in engine.process_user_input_stream(
                 user_id=user_id,
                 user_input=chat_data.message,
-                context=chat_data.context or {},
+                context=stream_context,
                 llm=llm_instance,
                 agent_name=chat_data.agent_name,
             ):
@@ -141,19 +155,13 @@ async def stream_message(
         except asyncio.CancelledError:
             logger.debug("SSE 流被客户端断开: user_id=%s", user_id)
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.get("/history")
 async def get_chat_history(
     request: Request,
+    response: Response,
     current_user: dict = Depends(get_current_user),
     size: int = Query(default=20, ge=1, le=100, description="返回条数"),
     page: int = Query(default=1, ge=1, description="页码（从 1 开始）"),
@@ -161,6 +169,7 @@ async def get_chat_history(
     """
     查询当前用户的聊天历史记录，从 Elasticsearch 分页返回。
     """
+    ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     engine = getattr(request.app.state, "hermes_engine", None)
     if not engine or not hasattr(engine, "chat_history"):
@@ -201,6 +210,7 @@ async def get_chat_history(
 )
 async def upload_content(
     request:      Request,
+    response:     Response,
     current_user: dict = Depends(get_current_user),
     user_model         = Depends(get_user_model),
     files:  List[UploadFile] = File(default=[], description="上传文件列表（文件、图片、代码等）"),
@@ -212,6 +222,7 @@ async def upload_content(
     上传入口。文件和长文本均经沙箱安全检查，通过后保存到用户目录。
     若同时携带 message，则将沙箱摘要注入上下文后调用 Hermes 引擎。
     """
+    ResponseHeaders().apply(response)
     from app.sandbox.file_handler import file_handler, MAX_FILES_PER_REQUEST
 
     user_id = current_user["user_id"]
@@ -337,21 +348,23 @@ class RevectorizeRequest(BaseModel):
     ),
 )
 async def revectorize(
-    req:     RevectorizeRequest,
-    request: Request,
-    _:       Optional[dict] = Depends(require_local_or_auth),
+    req:      RevectorizeRequest,
+    request:  Request,
+    response: Response,
+    _:        Optional[dict] = Depends(require_local_or_auth),
 ):
     """重新向量化聊天历史（本机无鉴权，远程需 Token）。"""
-    vector_store = getattr(request.app.state, "vector_store", None)
-    if not vector_store:
-        raise HTTPException(status_code=503, detail="VectorStore 未初始化")
+    ResponseHeaders().apply(response)
+    rag_pipeline = getattr(request.app.state, "rag_pipeline", None)
+    if not rag_pipeline:
+        raise HTTPException(status_code=503, detail="RagPipeline 未初始化")
 
     embedding_service = getattr(request.app.state, "embedding_service", None)
     if not embedding_service or not embedding_service.enabled:
         raise HTTPException(status_code=503, detail="Embedding 服务未启用")
 
     asyncio.create_task(
-        vector_store.revectorize_filtered(user_id=req.user_id, date_str=req.date)
+        rag_pipeline.revectorize(user_id=req.user_id, date_str=req.date)
     )
 
     return {

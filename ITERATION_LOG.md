@@ -2,8 +2,62 @@
 
 **项目**：smart_butler-server（`/home/seven/smart_butler-server`）
 **语言**：Python 3 / FastAPI / LangChain + LangGraph
-**最后更新**：2026-05-05
-**当前版本**：v2.6
+**最后更新**：2026-05-06
+**当前版本**：v2.7
+
+---
+
+## v2.7 — 2026-05-06：客户端环境追踪 + RAG 模块独立提取
+
+### 1. 客户端环境追踪（Task 1）
+
+**目标**：记录客户端类型/版本，将其随上下文传递给子 Agent，注入模型系统提示，供工具调用路由使用。
+
+**新增文件**：
+
+- `app/core/client_env.py`：`ClientType` 枚举（14 种平台），`normalize_client_type()`（别名归一化：feishu→lark / mac→macos），`format_env_for_prompt()` 生成 `<client-env>` XML 块
+
+**修改文件**：
+
+| 文件 | 变更要点 |
+| --- | --- |
+| `app/api/auth.py` | `UserLogin` 新增 `client_type` / `client_version`，登录时写入 Redis session |
+| `app/api/chat.py` | `ChatMessage` 新增 `client_type` / `client_version`，注入 `context["_client_type"]` / `context["_client_version"]`（同步+流式路径） |
+| `app/core/hermes_engine.py` | `process_user_input/stream` 预加载 `_user_profile`；`turn_metadata` 记录 `client_type/version`；`_generate_llm_response/stream` 将 `<client-env>` 追加到基础系统提示 |
+| `app/agents/base.py` | `_build_system_prompt(context)` 从 context 读取 `_client_type` / `_user_profile`，追加 `<client-env>` 和用户画像到子 Agent 系统提示 |
+
+**数据流**：前端登录/请求携带 `client_type` → `context["_client_type"]` → `hermes_engine` 预加载画像 → `_build_system_prompt()` 拼入系统提示 → LLM 感知客户端环境
+
+---
+
+### 2. RAG 模块独立提取（Task 2）
+
+**目标**：将散落在 `context_manager.py` / `embedding_service.py` / `memory_manager.py` / `vector_store.py` 中的 RAG 逻辑集中到独立的 `app/rag/` 包，对外暴露单一入口 `RagPipeline`，方便后续独立优化。
+
+**新增文件（`app/rag/` 包，7 个）**：
+
+| 文件 | 职责 |
+| --- | --- |
+| `__init__.py` | 暴露 `RagPipeline`、`RagContext` |
+| `types.py` | `RagContext` 数据类（替代 `ContextBundle`），含 `to_prompt_context()` |
+| `chunker.py` | `Chunk` 数据类 + `TurnChunker`（从 `EmbeddingService` 提取的切片逻辑） |
+| `formatter.py` | `sanitize_memory_content` / `build_memory_context_block` / `format_memories`（从 `ContextManager` 提取） |
+| `retriever.py` | `HybridRetriever`：预取缓存（GETDEL）→ 向量 KNN → BM25 全文三步检索 + 相关性过滤 |
+| `indexer.py` | `TurnIndexer`：`index_turn` / `revectorize` / `delete_all_indices`（封装 `VectorStore`） |
+| `pipeline.py` | `RagPipeline`：统一门面，`build_context` / `index_turn` / `revectorize` / `delete_all_vector_indices` / `queue_prefetch` |
+
+**修改文件**：
+
+| 文件 | 变更要点 |
+| --- | --- |
+| `app/core/embedding_service.py` | 移除 `Chunk`/`TurnChunker` 实现，`chunk_turn()` 保留为向后兼容委托；新增 `from app.rag.chunker import Chunk, TurnChunker` |
+| `app/core/context_manager.py` | 重写为薄封装层；`ContextBundle = RagContext` 别名；`build_context()` 委托 `RagPipeline`，未注入时用 `HybridRetriever` 内联兜底 |
+| `app/core/memory_manager.py` | 移除 `store_turn()` 内的 `vector_store.store_turn_vectors()` 调用（由 `HermesEngine` 通过 `RagPipeline.index_turn()` 触发） |
+| `app/core/hermes_engine.py` | 新增 `rag_pipeline` 字段和 `set_rag_pipeline()`；两条处理路径均用 `_rag_source = rag_pipeline or context_manager`；`store_turn()` 后后台 `index_turn()`；预取改走 `rag_pipeline.queue_prefetch()` |
+| `app/api/chat.py` | `/admin/revectorize` 改用 `rag_pipeline.revectorize()`，从 `app.state.rag_pipeline` 获取 |
+| `main.py` | step 5b 创建 `RagPipeline` 并注入 `hermes_engine`；`validate_embedding_config` 新增 `rag` 参数，优先调用 `rag.revectorize()`；`app.state.rag_pipeline` 挂载；移除冗余的 `context_manager.set_vector_store()` |
+
+**向后兼容保证**：`ContextBundle`、`EmbeddingService.chunk_turn()`、`ContextManager.build_context()` 均保留，现有调用方无需修改。
 
 ---
 
@@ -175,19 +229,20 @@ Ollama NaN bug 三层降级：预处理 → /api/embed → 截半重试
 
 ---
 
-## 代码规模（截至 v2.6）
+## 代码规模（截至 v2.7）
 
 | 模块 | 估算行数 |
 | --- | --- |
-| app/core | ~4,050 行 |
+| app/core | ~4,100 行 |
 | app/agents | ~3,150 行 |
 | app/api | ~2,500 行 |
+| app/rag | ~650 行（新增） |
 | app/database | ~2,150 行 |
 | app/tools | ~1,600 行 |
 | app/scheduler | ~1,050 行 |
 | app/sandbox | ~590 行 |
-| main.py | ~450 行 |
-| **总计** | **~15,500+ 行** |
+| main.py | ~460 行 |
+| **总计** | **~16,250+ 行** |
 
 ---
 
@@ -204,8 +259,10 @@ Ollama NaN bug 三层降级：预处理 → /api/embed → 截半重试
 
 | 功能 | 说明 |
 | --- | --- |
-| revectorize 保留 agent 结构 | 全量重建时历史 turn 无 agent_outputs 字段 |
+| revectorize 保留 agent 结构 | 全量重建时历史 turn 无 agent_outputs 字段（TurnIndexer 尚未从 ES 读取原始 agent_outputs） |
+| RAG 重排序（reranker） | HybridRetriever 当前仅评分过滤，可接入 cross-encoder reranker 提升召回精度 |
 | PII 脱敏接入 | _desensitize() 仅清空字段 |
+| Agent 间结构化消息协议 | 串行流水线靠 context["prev_result"] 传递，无正式 Schema |
 
 ### 低优先级
 
@@ -214,3 +271,4 @@ Ollama NaN bug 三层降级：预处理 → /api/embed → 截半重试
 | API 速率限制 | slowapi 或自定义中间件 |
 | Docker Compose 编排 | 一键启动全服务 |
 | Prometheus 指标导出 | /metrics 端点 |
+| LangSmith 全链路追踪 | 未接入 LangSmith / Arize Phoenix |

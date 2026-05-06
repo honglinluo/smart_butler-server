@@ -34,7 +34,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import bcrypt
-from fastapi import APIRouter, HTTPException, Request, status, Depends
+from fastapi import APIRouter, HTTPException, Request, Response, status, Depends
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from pydantic._internal import _schema_generation_shared
 from pydantic.json_schema import JsonSchemaValue
@@ -42,6 +42,7 @@ from pydantic_core import core_schema
 
 from app.database.pool import get_connection, release_connection
 from app.api.dependencies import get_current_user
+from app.core.headers import RequestHeaders, ResponseHeaders
 from app.core.crypto import (
     decrypt_password, generate_nonce, get_public_key_pem,
     nonce_redis_key, NONCE_TTL,
@@ -210,9 +211,9 @@ class UserRegister(BaseModel):
 
 
 class UserLogin(BaseModel):
-    username:           UsernameStr = Field(..., description="手机号或邮箱")
-    encrypted_password: str         = Field(..., description="RSA-OAEP-SHA256 加密后的密码（Base64）")
-    key_nonce:          str         = Field(..., description="从 GET /auth/public-key 获取的一次性 nonce")
+    username:           UsernameStr    = Field(..., description="手机号或邮箱")
+    encrypted_password: str            = Field(..., description="RSA-OAEP-SHA256 加密后的密码（Base64）")
+    key_nonce:          str            = Field(..., description="从 GET /auth/public-key 获取的一次性 nonce")
 
 
 class ChangePassword(BaseModel):
@@ -318,13 +319,14 @@ async def _flush_profile_to_mysql(user_id: str, profile: dict) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 @router.get("/public-key", response_model=PublicKeyResponse, summary="获取 RSA 公钥与一次性 nonce")
-async def get_public_key():
+async def get_public_key(response: Response):
     """返回服务端 RSA 公钥和一次性 nonce。
 
     - 客户端用公钥（RSA-OAEP-SHA256）加密明文密码
     - key_nonce 在 {expires_in} 秒内有效，提交后立即失效（不可重用）
     - 每次登录 / 注册 / 修改密码前都应重新获取
     """
+    ResponseHeaders().apply(response)
     redis_conn = await get_connection("redis", None)
     if not redis_conn:
         raise HTTPException(status_code=503, detail="Redis 不可用，无法签发 nonce")
@@ -345,13 +347,14 @@ async def get_public_key():
 
 
 @router.post("/register", response_model=dict, summary="用户注册")
-async def register(user: UserRegister):
+async def register(user: UserRegister, response: Response):
     """用户注册（用户名为手机号或邮箱，密码须经 RSA-OAEP-SHA256 加密后提交）。
 
     密码安全要求（服务端解密后校验）：
     - 长度 ≥ 8 位
     - 至少包含大写字母、小写字母、数字、特殊字符各一个
     """
+    ResponseHeaders().apply(response)
     redis_conn = await get_connection("redis", None)
     mysql_conn = await get_connection("mysql", "agent_db")
     if not redis_conn or not mysql_conn:
@@ -401,7 +404,7 @@ async def register(user: UserRegister):
 
 
 @router.post("/login", response_model=dict, summary="用户登录")
-async def login(user: UserLogin):
+async def login(user: UserLogin, response: Response, req_headers: RequestHeaders = Depends(RequestHeaders)):
     """用户登录（用户名为手机号或邮箱，密码须经 RSA-OAEP-SHA256 加密后提交）。
 
     Session 复用策略：
@@ -409,6 +412,7 @@ async def login(user: UserLogin):
     - 若所有 session 均已过期，签发新 token
     - 过期的 token 引用自动从 sessions Set 清除
     """
+    ResponseHeaders().apply(response)
     redis_conn = await get_connection("redis", None)
     mysql_conn = await get_connection("mysql", "agent_db")
     if not redis_conn or not mysql_conn:
@@ -478,6 +482,8 @@ async def login(user: UserLogin):
                     "username":         user.username,
                     "token":            token,
                     "is_authenticated": True,
+                    "client_type":      req_headers.client_type,
+                    "client_version":   req_headers.client_version,
                 },
                 ttl=SESSION_TTL,
             )
@@ -498,11 +504,12 @@ async def login(user: UserLogin):
 
 
 @router.post("/logout", response_model=dict, summary="退出登录")
-async def logout(request: Request, current_user: dict = Depends(get_current_user)):
+async def logout(request: Request, response: Response, current_user: dict = Depends(get_current_user)):
     """退出当前平台的登录状态。
 
     仅当所有平台均已退出时，执行用户画像固化到 MySQL 和对话记录同步到 ES。
     """
+    ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     token   = current_user.get("token", "")
 
@@ -563,6 +570,7 @@ async def logout(request: Request, current_user: dict = Depends(get_current_user
 @router.post("/change-password", response_model=dict, summary="修改密码")
 async def change_password(
     password_data: ChangePassword,
+    response:      Response,
     current_user:  dict = Depends(get_current_user),
 ):
     """修改密码（新旧密码均须经 RSA-OAEP-SHA256 加密后提交）。
@@ -570,6 +578,7 @@ async def change_password(
     新密码安全要求（服务端解密后校验）：
     - 长度 ≥ 8 位；大写字母、小写字母、数字、特殊字符各至少一个
     """
+    ResponseHeaders().apply(response)
     redis_conn = await get_connection("redis", None)
     mysql_conn = await get_connection("mysql", "agent_db")
     if not redis_conn or not mysql_conn:

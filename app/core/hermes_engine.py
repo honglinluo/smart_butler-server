@@ -215,8 +215,7 @@ class RegistryToolAdapter(BaseTool):
         self._agent_name = agent_name
 
     def _run(self, *args: Any, **kwargs: Any) -> Any:
-        import asyncio
-        return asyncio.get_event_loop().run_until_complete(self._arun(*args, **kwargs))
+        raise NotImplementedError("RegistryToolAdapter must be called via _arun in async context")
 
     async def _arun(self, *args: Any, **kwargs: Any) -> Any:
         import json as _json

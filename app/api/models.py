@@ -1,10 +1,11 @@
 """模型管理 API - 创建、更改模型"""
 
 from typing import Optional, Literal
-from fastapi import APIRouter, HTTPException, Request, status, Depends
+from fastapi import APIRouter, HTTPException, Request, Response, status, Depends
 from pydantic import BaseModel, Field
 from app.database.pool import get_connection, release_connection
 from app.api.dependencies import get_current_user
+from app.core.headers import ResponseHeaders
 
 
 router = APIRouter(prefix="/models", tags=["Models"])
@@ -60,9 +61,11 @@ async def _test_model(url: str, api_key: str, model_name: str) -> tuple[bool, st
 @router.post("/create", response_model=dict)
 async def create_model(
     model_data: CreateModel,
+    response: Response,
     current_user: dict = Depends(get_current_user)
 ):
     """创建新模型（创建前自动发送测试消息验证配置）"""
+    ResponseHeaders().apply(response)
     # 仅对 text/multimodal 类型做接口连通性测试
     if model_data.model_type in ("text", "multimodal"):
         ok, err = await _test_model(model_data.url, model_data.api_key, model_data.model_name)
@@ -98,10 +101,12 @@ async def create_model(
 @router.post("/change", response_model=dict)
 async def change_model(
     request: Request,
+    response: Response,
     change_data: ChangeModel,
     current_user: dict = Depends(get_current_user)
 ):
     """更改当前使用的模型"""
+    ResponseHeaders().apply(response)
     mysql_conn = await get_connection("mysql", "agent_db")
     if not mysql_conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -152,8 +157,9 @@ async def change_model(
 
 
 @router.get("/list", response_model=list)
-async def list_models(current_user: dict = Depends(get_current_user)):
+async def list_models(response: Response, current_user: dict = Depends(get_current_user)):
     """列出当前用户的所有模型，同时返回系统内置默认模型（标记 is_system_default=True）"""
+    ResponseHeaders().apply(response)
     mysql_conn = await get_connection("mysql", "agent_db")
     if not mysql_conn:
         raise HTTPException(status_code=500, detail="Database connection failed")

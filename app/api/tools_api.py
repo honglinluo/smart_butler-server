@@ -8,10 +8,11 @@
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 
 from app.api.dependencies import get_current_user, get_user_model
+from app.core.headers import ResponseHeaders
 from app.tools.base import (
     EXEC_CLIENT, EXEC_SERVER,
     VIS_EXCLUSIVE, VIS_PRIVATE, VIS_PUBLIC,
@@ -197,12 +198,13 @@ async def _get_engine(request: Request):
     ),
 )
 async def list_tools(
+    response: Response,
     source:        Optional[str] = Query(None, description=f"按来源过滤：{sorted(_VALID_SOURCES)}"),
     exec_location: Optional[str] = Query(None, description="按执行位置过滤：server / client"),
     current_user: dict = Depends(get_current_user),
 ) -> List[ToolSummary]:
     """查询当前用户可用的工具列表（排除 exclusive 专用工具）。"""
-
+    ResponseHeaders().apply(response)
     # 参数校验
     if source and source not in _VALID_SOURCES:
         raise HTTPException(
@@ -281,11 +283,13 @@ async def list_tools(
 async def create_tool(
     body:         ToolCreate,
     request:      Request,
+    response:     Response,
     current_user: dict = Depends(get_current_user),
     user_model:   dict = Depends(get_user_model),
     engine             = Depends(_get_engine),
 ) -> ToolCreateResponse:
     """用户通过代码或自然语言描述创建工具，立即注册并持久化。"""
+    ResponseHeaders().apply(response)
     from app.tools.registry import registry
     from app.tools.loader import ToolLoader
 
@@ -402,9 +406,11 @@ async def create_tool(
 async def update_tool(
     tool_id:      str,
     body:         ToolUpdate,
+    response:     Response,
     current_user: dict = Depends(get_current_user),
 ) -> dict:
     """修改工具元信息（description / visibility / exec_location）。"""
+    ResponseHeaders().apply(response)
     from app.tools.registry import registry
     from app.database.pool import get_connection, release_connection
 
@@ -467,9 +473,11 @@ async def update_tool(
 )
 async def delete_tool(
     tool_id:      str,
+    response:     Response,
     current_user: dict = Depends(get_current_user),
 ) -> dict:
     """删除用户自己创建的工具（软删除）。"""
+    ResponseHeaders().apply(response)
     from app.tools.registry import registry
     from app.database.pool import get_connection, release_connection
 

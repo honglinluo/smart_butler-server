@@ -9,10 +9,11 @@ import secrets
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_current_user
+from app.core.headers import ResponseHeaders
 from app.database.pool import get_connection, release_connection
 
 logger = logging.getLogger(__name__)
@@ -116,8 +117,9 @@ async def _get_agent_ratings(agent_name: str) -> dict:
 # ── API 端点 ─────────────────────────────────────────────────────────────────
 
 @router.get("", response_model=dict)
-async def list_agents(current_user: dict = Depends(get_current_user)):
+async def list_agents(response: Response, current_user: dict = Depends(get_current_user)):
     """返回当前用户所有可用的 Agent 列表（代码 Agent + 公有/自有 DB Agent）。"""
+    ResponseHeaders().apply(response)
     from app.agents.registry import registry
     user_id = current_user["user_id"]
     agents  = registry.list_available_for_user(user_id)
@@ -136,9 +138,11 @@ async def list_agents(current_user: dict = Depends(get_current_user)):
 @router.post("", response_model=dict, status_code=status.HTTP_201_CREATED)
 async def create_agent(
     data: AgentCreate,
+    response: Response,
     current_user: dict = Depends(get_current_user),
 ):
     """通过 API 创建 DB Agent（支持文字描述方式）。"""
+    ResponseHeaders().apply(response)
     from app.agents.base import BaseAgent
     from app.agents.registry import registry
 
@@ -192,9 +196,11 @@ async def create_agent(
 async def update_agent(
     agent_name: str,
     data: AgentUpdate,
+    response: Response,
     current_user: dict = Depends(get_current_user),
 ):
     """更新 DB Agent（仅创建者可操作）。"""
+    ResponseHeaders().apply(response)
     from app.agents.registry import registry
     user_id = current_user["user_id"]
 
@@ -253,9 +259,11 @@ async def update_agent(
 @router.delete("/{agent_name}", response_model=dict)
 async def delete_agent(
     agent_name: str,
+    response: Response,
     current_user: dict = Depends(get_current_user),
 ):
     """软删除 DB Agent（仅创建者可操作）。"""
+    ResponseHeaders().apply(response)
     from app.agents.registry import registry
     user_id = current_user["user_id"]
 
@@ -286,9 +294,11 @@ async def delete_agent(
 async def rate_agent(
     agent_name: str,
     data: AgentRating,
+    response: Response,
     current_user: dict = Depends(get_current_user),
 ):
     """对公有 Agent 进行评分（每个用户只能评一次，可覆盖）。"""
+    ResponseHeaders().apply(response)
     from app.agents.registry import registry
     user_id = current_user["user_id"]
 
@@ -323,8 +333,9 @@ async def rate_agent(
 
 
 @router.get("/notifications/my", response_model=dict)
-async def get_my_notifications(current_user: dict = Depends(get_current_user)):
+async def get_my_notifications(response: Response, current_user: dict = Depends(get_current_user)):
     """获取当前用户创建的公有 Agent 的低分提醒及同类高分推荐。"""
+    ResponseHeaders().apply(response)
     from app.agents.registry import registry
     user_id = current_user["user_id"]
 
@@ -383,11 +394,12 @@ async def get_my_notifications(current_user: dict = Depends(get_current_user)):
 
 
 @router.post("/admin/reload", response_model=dict)
-async def reload_code_agents(current_user: dict = Depends(get_current_user)):
+async def reload_code_agents(response: Response, current_user: dict = Depends(get_current_user)):
     """
     重新扫描并注册所有代码 Agent（扫描 app/agents/workers/ 目录）。
     同时重新加载所有 DB Agent。
     """
+    ResponseHeaders().apply(response)
     from app.agents.registry import registry
 
     # 1. 扫描 workers 目录，重新导入模块（触发 @agent 装饰器）

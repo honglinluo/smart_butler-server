@@ -18,6 +18,7 @@ from app.core.embedding_service import EmbeddingService
 from app.core.hermes_engine import HermesEngine
 from app.core.memory_manager import MemoryManager
 from app.core.vector_store import VectorStore
+from app.rag import RagPipeline
 from app.database.pool import initialize_pools, close_all_pools, get_connection, release_connection
 from app.api import auth, models, chat, agents_api, tools_api, scheduler_api, decision_api, files_api
 from app.api.dependencies import get_current_user
@@ -50,6 +51,7 @@ hermes_engine:     HermesEngine              = None
 memory_manager:    MemoryManager             = None
 embedding_service: EmbeddingService          = None
 vector_store:      VectorStore               = None
+rag_pipeline:      RagPipeline               = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -151,7 +153,7 @@ async def _upsert_db_embedding_config(
             await release_connection("mysql", conn)
 
 
-async def validate_embedding_config(config: dict, vs: VectorStore) -> bool:
+async def validate_embedding_config(config: dict, vs: VectorStore, rag=None) -> bool:
     """校验配置文件中的 embedding 模型与 MySQL 是否一致。
 
     不一致时：
@@ -189,11 +191,11 @@ async def validate_embedding_config(config: dict, vs: VectorStore) -> bool:
     await _upsert_db_embedding_config(sys_uid, cfg_model, cfg_url)
 
     # 2. 删除 ES 向量索引
-    deleted = await vs.delete_all_vector_indices()
+    deleted = await (rag.delete_all_vector_indices() if rag else vs.delete_all_vector_indices())
     logger.info(f"已删除旧向量索引 {deleted} 个")
 
     # 3. 后台重向量化（不阻塞启动）
-    asyncio.create_task(vs.revectorize_all_history())
+    asyncio.create_task(rag.revectorize() if rag else vs.revectorize_all_history())
     logger.info("已启动全量历史向量化后台任务")
     return False
 
@@ -252,7 +254,7 @@ async def _flush_all_profiles_on_shutdown() -> None:
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     from app.scheduler.runner import scheduler as task_scheduler
-    global config_loader, hermes_engine, memory_manager, embedding_service, vector_store
+    global config_loader, hermes_engine, memory_manager, embedding_service, vector_store, rag_pipeline
 
     logger.info("🚀 启动智能管家服务端...")
     try:
@@ -282,6 +284,11 @@ async def lifespan(application: FastAPI):
         embedding_service = EmbeddingService(system_config)
         vector_store      = VectorStore(embedding_service, system_config)
 
+        # 5b. 创建 RagPipeline（统一 RAG 检索/索引/重向量化接口）
+        rag_pipeline = RagPipeline(embedding_service, vector_store, memory_manager, system_config)
+        hermes_engine.set_rag_pipeline(rag_pipeline)
+        logger.info("✅ RagPipeline 初始化成功")
+
         if embedding_service.enabled:
             available = await embedding_service.is_available()
             if available:
@@ -290,7 +297,7 @@ async def lifespan(application: FastAPI):
                     f"model={embedding_service.model_name}"
                 )
                 # 6. 校验 embedding 配置，必要时重建向量索引
-                await validate_embedding_config(system_config, vector_store)
+                await validate_embedding_config(system_config, vector_store, rag_pipeline)
             else:
                 logger.warning(
                     f"⚠️  Embedding 服务不可达 ({embedding_service.api_url})，"
@@ -332,13 +339,12 @@ async def lifespan(application: FastAPI):
         except Exception as e:
             logger.warning(f"⚠️  内置工具注册失败（可忽略）: {e}")
 
-        # 8. 将 VectorStore 注入 MemoryManager 和 ContextManager
+        # 8. 将 VectorStore 注入 MemoryManager（Redis/MySQL 直写路径仍需要）
         memory_manager.set_vector_store(vector_store)
-        if hermes_engine.context_manager is not None:
-            hermes_engine.context_manager.set_vector_store(vector_store)
 
         application.state.vector_store      = vector_store
         application.state.embedding_service = embedding_service
+        application.state.rag_pipeline      = rag_pipeline
 
         # 9. 启动定时任务调度器
         try:

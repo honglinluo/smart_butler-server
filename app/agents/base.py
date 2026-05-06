@@ -249,7 +249,7 @@ class BaseAgent:
 
         try:
             await self.load_skills()
-            system_prompt = self._build_system_prompt()
+            system_prompt = self._build_system_prompt(context=context)
             task_desc     = task.get("description", "")
 
             # 注入历史上下文（最近 5 轮）
@@ -405,8 +405,14 @@ class BaseAgent:
                 self.name, tpl_path,
             )
 
-    def _build_system_prompt(self) -> str:
-        """构建包含角色、背景和技能的系统提示词。"""
+    def _build_system_prompt(self, context: Optional[Dict[str, Any]] = None) -> str:
+        """构建包含角色、背景、技能、客户端环境和用户画像的系统提示词。
+
+        Args:
+            context: 当前请求上下文，含 _client_type/_client_version/_user_profile 键时自动注入。
+        """
+        from app.core.client_env import format_env_for_prompt
+
         parts = []
         if self.role:
             parts.append(f"你是{self.role}。")
@@ -416,6 +422,19 @@ class BaseAgent:
         if skills_ctx:
             parts.append("")
             parts.append(skills_ctx)
+
+        if isinstance(context, dict):
+            env_block = format_env_for_prompt(
+                context.get("_client_type"), context.get("_client_version")
+            )
+            if env_block:
+                parts.append("")
+                parts.append(env_block)
+            profile_block = context.get("_user_profile", "")
+            if profile_block:
+                parts.append("")
+                parts.append(str(profile_block))
+
         return "\n".join(parts) or "你是一个智能助手。"
 
     # ── 技能记忆系统 ────────────────────────────────────────────────

@@ -122,11 +122,11 @@ class UserDecisionGate:
     # ── 内部 ──────────────────────────────────────────────────────────────────
 
     async def _get_policy(self, user_id: str) -> str:
-        """从 Redis 读取用户决策策略，默认 ask。"""
+        """从 Redis 读取用户决策策略，默认 allow。"""
         if self._redis is None:
             return "allow"
         try:
             val = await self._redis.get(f"user:{user_id}:decision_policy")
-            return val if val in ("allow", "ask", "deny") else "ask"
+            return val if val in ("allow", "ask", "deny") else "allow"
         except Exception:
             return "allow"

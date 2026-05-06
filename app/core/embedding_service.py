@@ -30,28 +30,16 @@ config/system_config.yaml 示例：
 
 import asyncio
 import logging
-import re
 import unicodedata
-from dataclasses import dataclass, field
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
 
+# Chunk 数据类和切片逻辑已迁移至 app.rag.chunker，此处保留向后兼容导出
+from app.rag.chunker import Chunk, TurnChunker  # noqa: F401
+
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class Chunk:
-    """一个向量化存储单元，对应会话 turn 的一个语义片段。"""
-    chunk_id:       str            # ES 文档 ID，格式 {turn_id}_q0 / _a0 / _{agent}_0 等
-    chunk_text:     str            # 用于 embedding 及展示的文本
-    chunk_type:     str            # "question" | "answer" | "agent_output"
-    chunk_index:    int            # 本 turn 内的位置索引
-    total_chunks:   int            # 本 turn 生成的 chunk 总数（事后填充）
-    ref_doc_id:     str            # 关联的聊天历史 ES 文档 ID（turn_id）
-    ref_chat_index: str            # 关联的聊天历史 ES 完整索引名
-    agent_name:     str            = ""   # 产生该 chunk 的 Agent 名称（"" = 未知/合并回复）
-    metadata:       Dict[str, Any] = field(default_factory=dict)
 
 
 class EmbeddingService:
@@ -68,6 +56,8 @@ class EmbeddingService:
         self.chunk_overlap = int(embed_cfg.get("chunk_overlap", 100))
         self.batch_size    = int(embed_cfg.get("batch_size", 16))
         self._http: Optional[httpx.AsyncClient] = None
+        # 切片器：委托给 app.rag.chunker.TurnChunker，此处保留 chunk_turn() 向后兼容接口
+        self._chunker = TurnChunker(self.chunk_size, self.chunk_overlap)
 
     # ── 可用性 ─────────────────────────────────────────────────
 
@@ -244,123 +234,21 @@ class EmbeddingService:
                 results.append(await self.embed(t))
         return results
 
-    # ── 文本切片 ───────────────────────────────────────────────
-
-    # 用户输入短于此值时视为确认/决策操作，不生成 question chunk
-    _MIN_Q_CHARS = 10
-
-    def _split_text(self, text: str, max_chars: int, overlap: int) -> List[str]:
-        """在句子边界切分文本，相邻片段保留 overlap 字符衔接上下文。"""
-        if len(text) <= max_chars:
-            return [text]
-
-        sentences = re.split(r'(?<=[。！？!?.…\n])', text)
-        sentences = [s for s in sentences if s.strip()]
-
-        chunks: List[str] = []
-        current = ""
-        for sent in sentences:
-            if len(current) + len(sent) <= max_chars:
-                current += sent
-            else:
-                if current:
-                    chunks.append(current.strip())
-                tail = current[-overlap:] if overlap > 0 and len(current) > overlap else ""
-                current = tail + sent
-
-        if current.strip():
-            chunks.append(current.strip())
-
-        result: List[str] = []
-        for c in chunks:
-            if len(c) <= max_chars:
-                result.append(c)
-            else:
-                for start in range(0, len(c), max_chars - overlap):
-                    result.append(c[start: start + max_chars])
-        return result if result else [text[:max_chars]]
+    # ── 文本切片（向后兼容接口，实现已迁移至 app.rag.chunker.TurnChunker）──
 
     def chunk_turn(
         self,
-        user_input: str,
+        user_input:         str,
         assistant_response: str,
-        turn_id: str,
-        chat_index: str,
-        agent_outputs: Optional[List[Dict[str, str]]] = None,
+        turn_id:            str,
+        chat_index:         str,
+        agent_outputs:      Optional[List[Dict[str, str]]] = None,
     ) -> List[Chunk]:
-        """将一轮对话切分为若干 Chunk。
-
-        策略：
-        - 用户问题和模型回复始终独立成 chunk，不再合并为 qa_combined
-        - 若提供 agent_outputs，则每个 Agent 的输出单独成一组 chunk（req 2）
-        - 用户输入短于 _MIN_Q_CHARS 字符视为确认/决策操作，不生成 question chunk（req 4）
-        - 工具调用参数与路由决策元数据不传入此方法，由调用链自然过滤（req 3/4）
-
-        agent_outputs 格式：[{"agent_name": "xxx", "output": "..."}, ...]
-        """
-        chunks: List[Chunk] = []
-
-        # ── 用户问题 ─────────────────────────────────────────────
-        q_text = user_input.strip()
-        if len(q_text) >= self._MIN_Q_CHARS:
-            for i, part in enumerate(self._split_text(q_text, self.chunk_size, 0)):
-                chunks.append(Chunk(
-                    chunk_id       = f"{turn_id}_q{i}",
-                    chunk_text     = part,
-                    chunk_type     = "question",
-                    chunk_index    = len(chunks),
-                    total_chunks   = 0,
-                    ref_doc_id     = turn_id,
-                    ref_chat_index = chat_index,
-                    agent_name     = "",
-                ))
-
-        # ── 模型回复 ─────────────────────────────────────────────
-        if agent_outputs:
-            # 多 Agent 结构化输出：每个 Agent 单独成块（req 2）
-            for agent_out in agent_outputs:
-                name = (agent_out.get("agent_name") or "").strip()
-                text = (agent_out.get("output") or "").strip()
-                if not text:
-                    continue
-                # 将 agent 名转为合法 ID 片段
-                safe_name = re.sub(r"\W+", "_", name) if name else "agent"
-                for i, part in enumerate(
-                    self._split_text(text, self.chunk_size, self.chunk_overlap)
-                ):
-                    chunks.append(Chunk(
-                        chunk_id       = f"{turn_id}_{safe_name}_{i}",
-                        chunk_text     = part,
-                        chunk_type     = "agent_output",
-                        chunk_index    = len(chunks),
-                        total_chunks   = 0,
-                        ref_doc_id     = turn_id,
-                        ref_chat_index = chat_index,
-                        agent_name     = name,
-                    ))
-        else:
-            # 无结构化输出时：将合并回复整体切片（req 1：仍独立于 question 块）
-            a_text = assistant_response.strip()
-            if a_text:
-                for i, part in enumerate(
-                    self._split_text(a_text, self.chunk_size, self.chunk_overlap)
-                ):
-                    chunks.append(Chunk(
-                        chunk_id       = f"{turn_id}_a{i}",
-                        chunk_text     = part,
-                        chunk_type     = "answer",
-                        chunk_index    = len(chunks),
-                        total_chunks   = 0,
-                        ref_doc_id     = turn_id,
-                        ref_chat_index = chat_index,
-                        agent_name     = "",
-                    ))
-
-        total = len(chunks)
-        for c in chunks:
-            c.total_chunks = total
-
-        return chunks
+        """将一轮对话切分为若干 Chunk（委托给 TurnChunker）。"""
+        return self._chunker.chunk(
+            user_input, assistant_response, turn_id, chat_index,
+            agent_outputs=agent_outputs,
+        )
 
 
 # 向后兼容别名

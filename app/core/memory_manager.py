@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 from app.database.pool import get_connection, release_connection
 from app.core.redis_keys import (
     MEMORY_TURNS            as _KEY_TURNS,
+    MEMORY_SESSION_TURNS    as _KEY_SESSION_TURNS,
     MEMORY_TOTAL            as _KEY_TOTAL,
     MEMORY_LOCK             as _KEY_LOCK,
     MEMORY_LAST_ACTIVITY    as _KEY_LAST_ACTIVITY,
@@ -128,7 +129,7 @@ class MemoryManager:
         """存储一轮完整对话。
 
         流程：
-          1. 写入 Redis 最近对话列表，保持不超过 redis_recent_turns 条
+          1. 写入 Redis 全局列表（ES 同步用）和 session 级列表（history 检索用）
           2. 累计计数器 +1，判断是否触发 ES 同步
           3. 累计总量超过阈值时触发压缩任务
           4. 在 MySQL 初始化引用统计记录
@@ -141,7 +142,8 @@ class MemoryManager:
             **(metadata or {}),
         }
 
-        await self._redis_push_turn(user_id, turn)
+        client_type = (metadata or {}).get("client_type", "") or "api"
+        await self._redis_push_turn(user_id, turn, client_type=client_type)
 
         total     = await self._redis_increment_total(user_id)
         redis_len = await self._redis_recent_length(user_id)
@@ -163,15 +165,7 @@ class MemoryManager:
 
         # MySQL 初始化引用记录（后台）
         asyncio.create_task(self._mysql_init_ref(user_id, turn_id))
-
-        # 向量化：切片 → embedding → 写入独立向量索引（后台）
-        if self._vector_store is not None:
-            asyncio.create_task(
-                self._vector_store.store_turn_vectors(
-                    user_id, turn_id, user_input, assistant_response,
-                    agent_outputs=agent_outputs,
-                )
-            )
+        # 向量化由 HermesEngine 调用 RagPipeline.index_turn() 完成，此处不再重复触发
 
 
     async def retrieve_memory(
@@ -220,14 +214,22 @@ class MemoryManager:
 
         return results
 
-    async def get_recent_turns(self, user_id: str) -> List[Dict[str, Any]]:
-        """从 Redis 加载最近 N 轮对话，供上下文拼接使用（按时间升序返回）。"""
+    async def get_recent_turns(
+        self, user_id: str, client_type: str = ""
+    ) -> List[Dict[str, Any]]:
+        """从 Redis 加载最近 N 轮对话（按时间升序返回）。
+
+        client_type: 非空时读取 session 隔离列表；空时读取全局列表（ES 同步/降级用）。
+        """
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
             if not redis_conn:
                 return []
-            key   = _KEY_TURNS.format(user_id=user_id)
+            if client_type:
+                key = _KEY_SESSION_TURNS.format(user_id=user_id, client_type=client_type)
+            else:
+                key = _KEY_TURNS.format(user_id=user_id)
             turns = await redis_conn.read_list(key, 0, self.redis_recent_turns - 1)
             # LPUSH 使最新在前，reverse 后得到时间升序（旧→新）
             return list(reversed(turns)) if turns else []
@@ -253,19 +255,35 @@ class MemoryManager:
     # Redis 操作
     # ══════════════════════════════════════════════════════════
 
-    async def _redis_push_turn(self, user_id: str, turn: Dict[str, Any]) -> None:
-        """LPUSH 新轮次，LTRIM 保持列表不超过 redis_recent_turns 条。"""
+    async def _redis_push_turn(
+        self, user_id: str, turn: Dict[str, Any], client_type: str = "api"
+    ) -> None:
+        """LPUSH 新轮次到全局列表与 session 列表，LTRIM 保持各列表不超过 redis_recent_turns 条。
+
+        全局列表（MEMORY_TURNS）供 ES 同步与总计数使用；
+        session 列表（MEMORY_SESSION_TURNS）按 client_type 隔离，供 history 检索使用。
+        """
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
             if not redis_conn:
                 return
-            key = _KEY_TURNS.format(user_id=user_id)
-            await redis_conn.push_to_list(key, turn, ttl=3600 * 24 * 30)
-            # LTRIM 保留最新的 N 条（index 0 = 最新）
             client = getattr(redis_conn, "redis_client", None)
+            _ttl = 3600 * 24 * 30
+
+            # 全局列表（ES 同步 + 计数）
+            global_key = _KEY_TURNS.format(user_id=user_id)
+            await redis_conn.push_to_list(global_key, turn, ttl=_ttl)
             if client:
-                client.ltrim(key, 0, self.redis_recent_turns - 1)
+                client.ltrim(global_key, 0, self.redis_recent_turns - 1)
+
+            # Session 列表（按 client_type 隔离，history 检索用）
+            session_key = _KEY_SESSION_TURNS.format(
+                user_id=user_id, client_type=client_type
+            )
+            await redis_conn.push_to_list(session_key, turn, ttl=_ttl)
+            if client:
+                client.ltrim(session_key, 0, self.redis_recent_turns - 1)
         except Exception as e:
             logger.warning(f"Redis push_turn 失败 user={user_id}: {e}")
         finally:
@@ -682,13 +700,14 @@ class MemoryManager:
         """将 ES hit 统一转换为标准 result 格式。"""
         src = hit.get("_source", hit)
         return {
-            "turn_id": src.get("turn_id") or hit.get("_id", ""),
-            "user_input": src.get("user_input", ""),
+            "turn_id":            src.get("turn_id") or hit.get("_id", ""),
+            "user_input":         src.get("user_input", ""),
             "assistant_response": src.get("assistant_response", ""),
-            "timestamp": src.get("timestamp"),
-            "intent": src.get("intent"),
-            "_score": hit.get("_score"),
-            "_source": source,
+            "timestamp":          src.get("timestamp"),
+            "intent":             src.get("intent"),
+            "client_type":        src.get("client_type", ""),
+            "_score":             hit.get("_score"),
+            "_source":            source,
         }
 
     @staticmethod

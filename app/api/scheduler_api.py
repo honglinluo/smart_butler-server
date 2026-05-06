@@ -15,11 +15,12 @@ import logging
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.api.dependencies import get_current_user
+from app.core.headers import ResponseHeaders
 from app.scheduler.models import (
     ActionType, ScheduledTask, TaskStatus, TaskType,
 )
@@ -106,9 +107,11 @@ def _cst_hour_to_utc(hour: int, minute: int):
     response_model=dict,
 )
 async def list_tasks(
+    response: Response,
     current_user: dict = Depends(get_current_user),
     status_filter: Optional[str] = Query(None, alias="status", description="按状态过滤：active/paused/done/cancelled/failed"),
 ):
+    ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     tasks   = await task_store.list_user_tasks(user_id, status=status_filter)
     return {
@@ -126,8 +129,10 @@ async def list_tasks(
 )
 async def create_task(
     body:         TaskCreateRequest,
+    response:     Response,
     current_user: dict = Depends(get_current_user),
 ):
+    ResponseHeaders().apply(response)
     user_id  = current_user["user_id"]
     utc_hour, utc_minute = _cst_hour_to_utc(body.hour, body.minute)
 
@@ -185,8 +190,10 @@ async def create_task(
 )
 async def get_task(
     task_id:      str,
+    response:     Response,
     current_user: dict = Depends(get_current_user),
 ):
+    ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     task    = await task_store.get_task(task_id)
     if not task or task.user_id != user_id:
@@ -201,8 +208,10 @@ async def get_task(
 )
 async def cancel_task(
     task_id:      str,
+    response:     Response,
     current_user: dict = Depends(get_current_user),
 ):
+    ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     task    = await task_store.get_task(task_id)
     if not task or task.user_id != user_id:
@@ -221,9 +230,11 @@ async def cancel_task(
 )
 async def get_task_logs(
     task_id:      str,
+    response:     Response,
     current_user: dict = Depends(get_current_user),
     limit:        int  = Query(20, ge=1, le=100),
 ):
+    ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     task    = await task_store.get_task(task_id)
     if not task or task.user_id != user_id:
@@ -242,9 +253,11 @@ async def get_task_logs(
     response_model=dict,
 )
 async def consume_notifications(
+    response:     Response,
     current_user: dict = Depends(get_current_user),
     max_count:    int  = Query(20, ge=1, le=100),
 ):
+    ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     msgs    = await pop_notifications(user_id, max_count=max_count)
     return {"user_id": user_id, "count": len(msgs), "notifications": msgs}
@@ -256,9 +269,11 @@ async def consume_notifications(
     response_model=dict,
 )
 async def preview_notifications(
+    response:     Response,
     current_user: dict = Depends(get_current_user),
     count:        int  = Query(20, ge=1, le=100),
 ):
+    ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     msgs    = await peek_notifications(user_id, count=count)
     return {"user_id": user_id, "count": len(msgs), "notifications": msgs}
@@ -276,14 +291,9 @@ async def preview_notifications(
     ),
 )
 async def stream_notifications(
+    response:     Response,
     current_user: dict = Depends(get_current_user),
 ):
+    ResponseHeaders(extra={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}).apply(response)
     user_id = current_user["user_id"]
-    return StreamingResponse(
-        sse_notification_stream(user_id),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return StreamingResponse(sse_notification_stream(user_id), media_type="text/event-stream")

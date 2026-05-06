@@ -1,7 +1,7 @@
 # Hermes Multi-Agent System — 项目完成说明
 
-**更新日期**: 2026-05-05
-**版本**: 2.6
+**更新日期**: 2026-05-06
+**版本**: 2.7
 **状态**: ✅ 核心系统已就绪，持续迭代中
 
 ---
@@ -58,7 +58,9 @@ Hermes Multi-Agent System 是一套企业级多智能体协作平台，基于 La
 | 项目根路径统一管理 | ✅ | PROJECT_ROOT 环境变量 + app/core/paths.py |
 | 程序关闭时画像固化 | ✅ | Redis 用户画像批量写入 MySQL |
 | 记忆压缩（摘要归档） | ✅ | 8 节 XML 结构，全替换，不保留原始 turn |
-| revectorize 保留 agent 结构 | 🔧 | 全量重建仅处理合并文本 |
+| 客户端环境追踪 | ✅ | ClientType 枚举 14 种平台，`<client-env>` 注入子 Agent 系统提示 |
+| RAG 模块独立提取 | ✅ | app/rag/ 包：RagPipeline 统一门面，HybridRetriever/TurnIndexer/TurnChunker 独立 |
+| revectorize 保留 agent 结构 | 🔧 | 全量重建时历史 turn 无 agent_outputs 字段 |
 
 ### 2.3 Agent 系统 (app/agents)
 
@@ -127,6 +129,24 @@ Hermes Multi-Agent System 是一套企业级多智能体协作平台，基于 La
 
 ## 三、更新历史
 
+### v2.7 — 2026-05-06：客户端环境追踪 + RAG 模块独立提取
+
+#### 1. 客户端环境追踪
+
+新增 `app/core/client_env.py`（`ClientType` 枚举 14 种平台、`normalize_client_type`、`format_env_for_prompt`）。
+`auth.py` / `chat.py` 接收 `client_type` / `client_version` 字段，写入 turn_metadata 和 context 字典；
+`hermes_engine.py` + `base.py` 将 `<client-env>` 块注入 LLM 系统提示，供工具调用决策使用。
+
+#### 2. RAG 模块独立提取
+
+新增 `app/rag/` 包（7 文件）：`RagPipeline`（门面）/ `HybridRetriever`（三步检索）/ `TurnIndexer`（向量索引）/
+`TurnChunker`（切片）/ `RagContext`（数据类）/ `formatter`（记忆格式化）。
+`ContextManager` / `EmbeddingService` / `MemoryManager` 重构为薄封装，保持向后兼容。
+`main.py` step 5b 创建并注入 `RagPipeline`；`/admin/revectorize` 端点迁移至 `rag_pipeline.revectorize()`；
+`hermes_engine` 两条路径（同步/流式）均在 `store_turn()` 后后台触发 `index_turn()`。
+
+---
+
 ### v2.6 — 2026-05-05：Bug 修复
 
 #### 1. LLMInfo 导入错误修复（chat.py）
@@ -152,7 +172,7 @@ Hermes Multi-Agent System 是一套企业级多智能体协作平台，基于 La
 
 ---
 
-### v2.5 — 2026-04-29：记忆系统深度优化 + 月度/年度归档 + 系统级定时任务
+### v2.5 — 2026-04-29：记忆系统深度优化 + 月度 / 年度归档 + 系统级定时任务
 
 - hermes-agent 记忆功能移植（on_delegation / 用户画像注入 / 背景预取）
 - Summarizer 完整重写：8 节 XML 结构，全替换上下文
@@ -205,7 +225,8 @@ Hermes Multi-Agent System 是一套企业级多智能体协作平台，基于 La
 
 | 功能 | 说明 |
 | --- | --- |
-| revectorize 保留 agent 结构 | 全量重建时历史 turn 无 agent_outputs 字段 |
+| revectorize 保留 agent 结构 | 全量重建时历史 turn 无 agent_outputs 字段（TurnIndexer 需从 ES 读取原始结构） |
+| RAG 重排序（reranker） | HybridRetriever 当前仅评分过滤，可接入 cross-encoder reranker 提升精度 |
 | PII 脱敏完整实现 | _desensitize() 仅清空字段，未接入脱敏库 |
 | Agent 间结构化消息协议 | 串行流水线靠 context["prev_result"] 传递，无正式 Schema |
 
@@ -224,11 +245,13 @@ Hermes Multi-Agent System 是一套企业级多智能体协作平台，基于 La
 ## 五、快速验证
 
 ```bash
-# 语法检查（核心模块）
+# 语法检查（核心模块 + RAG 包）
 python3 -m py_compile main.py \
   app/core/hermes_engine.py app/core/memory_manager.py \
   app/core/embedding_service.py app/core/vector_store.py \
-  app/core/context_manager.py app/core/paths.py \
+  app/core/context_manager.py app/core/client_env.py app/core/paths.py \
+  app/rag/__init__.py app/rag/pipeline.py app/rag/retriever.py \
+  app/rag/indexer.py app/rag/chunker.py app/rag/formatter.py app/rag/types.py \
   app/agents/loop/event_loop.py app/agents/loop/decision_gate.py \
   app/agents/system/monthly_archiver.py app/agents/system/yearly_archiver.py
 
@@ -245,12 +268,13 @@ curl http://localhost:8000/health
 
 | 模块 | 估算行数 |
 | --- | --- |
-| app/core | ~4,050 行 |
+| app/core | ~4,100 行（含 client_env.py） |
 | app/agents | ~3,150 行（含 loop/、monthly/yearly archiver） |
 | app/api | ~2,500 行（含 tools_api、scheduler_api、decision_api） |
+| app/rag | ~650 行（新增，7 文件） |
 | app/database | ~2,150 行 |
 | app/scheduler | ~1,050 行 |
 | app/tools | ~1,600 行（含 file_reader） |
 | app/sandbox | ~590 行 |
-| main.py | ~450 行 |
-| **总计** | **~15,500+ 行** |
+| main.py | ~460 行 |
+| **总计** | **~16,250+ 行** |
