@@ -49,6 +49,7 @@ from app.core.config_loader import ConfigLoader
 from app.database.pool import get_connection, release_connection
 from app.core.chat_history_store import ChatHistoryStore
 from app.core.context_manager import ContextManager
+from app.rag import RagPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -516,10 +517,12 @@ class HermesEngine:
         self.agent_graphs: Dict[str, Any] = {}  # LangGraph 代理图缓存
         # 聊天记录存储
         self.chat_history = ChatHistoryStore()
-        # 上下文管理器（依赖 MemoryManager，在 initialize() 中完成注入）
+        # 上下文管理器（兼容保留；主链路已由 RagPipeline 取代）
         self.context_manager: Optional[ContextManager] = None
         # 记忆管理器（由 set_memory_manager() 注入）
         self.memory_manager = None
+        # RAG 流水线（由 set_rag_pipeline() 注入，负责检索/索引/重向量化）
+        self.rag_pipeline: Optional[RagPipeline] = None
         # 按代理名称缓存的系统 Prompt 模板（从 templates/ 目录加载）
         self._agent_system_prompts: Dict[str, str] = {}
         # Agent 事件循环（initialize() 后可用）
@@ -628,15 +631,26 @@ class HermesEngine:
         )
 
     def set_memory_manager(self, memory_manager) -> None:
-        """注入 MemoryManager 并创建 ContextManager（由 main.py 在两者均初始化后调用）。"""
+        """注入 MemoryManager 并创建 ContextManager（兼容保留）。"""
         self.memory_manager = memory_manager
         self.context_manager = ContextManager(memory_manager, self.config)
         if self.default_llm and hasattr(memory_manager, "set_default_llm"):
             memory_manager.set_default_llm(self.default_llm)
+
+    def set_rag_pipeline(self, rag_pipeline: "RagPipeline") -> None:
+        """注入 RagPipeline（由 main.py 在 VectorStore 初始化后调用）。
+
+        注入后 process_user_input / process_user_input_stream 均走 RagPipeline 路径。
+        同时将 rag_pipeline 注入 ContextManager，使兜底路径也能受益。
+        """
+        self.rag_pipeline = rag_pipeline
+        if self.context_manager is not None:
+            self.context_manager.set_rag_pipeline(rag_pipeline)
+        logger.info("RagPipeline 已注入 HermesEngine")
         # 实例化并注入 MemoryArchiverAgent（系统内置，不注册到 registry）
-        if hasattr(memory_manager, "set_archiver"):
+        if hasattr(self.memory_manager, "set_archiver"):
             from app.agents.system.memory_archiver import MemoryArchiverAgent
-            memory_manager.set_archiver(MemoryArchiverAgent())
+            self.memory_manager.set_archiver(MemoryArchiverAgent())
             logger.info("✅ MemoryArchiverAgent 已注入 MemoryManager")
 
     @staticmethod
@@ -753,23 +767,24 @@ class HermesEngine:
         try:
             turn_id = uuid.uuid4().hex
 
-            # 使用 ContextManager 组装上下文（记忆检索 + 历史加载 + 相关性过滤）
-            if self.context_manager is not None:
+            # 使用 RagPipeline 组装上下文（检索 + 历史加载 + 相关性过滤）
+            _rag_source = self.rag_pipeline or self.context_manager
+            if _rag_source is not None:
                 try:
-                    bundle  = await self.context_manager.build_context(
+                    bundle  = await _rag_source.build_context(
                         user_id=user_id,
                         user_input=user_input,
                         base_context=context if isinstance(context, dict) else {},
                     )
                     context = bundle.to_prompt_context()
                     logger.info(
-                        f"上下文组装完成 user={user_id} "
-                        f"history={len(bundle.history)} memories={len(bundle.memories)}"
+                        "上下文组装完成 user=%s history=%d memories=%d",
+                        user_id, len(bundle.history), len(bundle.memories),
                     )
                 except Exception as e:
-                    logger.warning(f"ContextManager.build_context 失败，使用原始 context: {e}")
+                    logger.warning("RAG build_context 失败，使用原始 context: %s", e)
             else:
-                # 降级：ContextManager 未注入时沿用旧的 ES 历史加载
+                # 降级：均未注入时沿用旧的 ES 历史加载
                 try:
                     history_size = int(os.getenv("CHAT_HISTORY_SIZE", "5"))
                     history_from_es = await self.chat_history.get_recent_messages(user_id, size=history_size)
@@ -780,7 +795,7 @@ class HermesEngine:
                         else:
                             context["history"] = history_from_es
                 except Exception as e:
-                    logger.warning(f"降级加载 ES 历史失败: {e}")
+                    logger.warning("降级加载 ES 历史失败: %s", e)
 
             # 上下文长度检查：超限则立即触发记忆压缩（后台，不阻塞本次请求）
             if self.memory_manager is not None:
@@ -798,6 +813,16 @@ class HermesEngine:
             logger.info(f"开始处理用户输入 (user_id={user_id})")
             logger.debug(f"用户输入: {user_input}")
             logger.debug(f"上下文信息: {context}")
+
+            # 加载用户画像到 context，供子 Agent 系统提示注入
+            if isinstance(context, dict) and self.memory_manager is not None:
+                if "_user_profile" not in context:
+                    try:
+                        profile_block = await self.memory_manager.build_system_prompt_block(user_id)
+                        if profile_block:
+                            context["_user_profile"] = profile_block
+                    except Exception as _pe:
+                        logger.debug("预加载用户画像失败 user=%s: %s", user_id, _pe)
 
             # 路由处理（传入本次请求的 LLM 用于意图识别和任务分解）
             router_result = await self.router_agent.process(user_input, context, llm=llm)
@@ -861,15 +886,18 @@ class HermesEngine:
                     tool_results=None,
                 )
                 agent_outputs = [{"agent_name": target_agent or self.router_agent.name, "output": response}]
+            _ctx_dict     = context if isinstance(context, dict) else {}
             turn_metadata = {
-                "intent":        intent,
-                "target_agent":  target_agent,
-                "tasks":         tasks,
-                "tool_results":  tool_results,
-                "tool_steps":    tool_steps,
-                "mode":          mode,
-                "pipeline":      [{"step": p["step"], "agent_name": p["agent_name"]} for p in pipeline],
-                "agent_outputs": agent_outputs or [],
+                "intent":         intent,
+                "target_agent":   target_agent,
+                "tasks":          tasks,
+                "tool_results":   tool_results,
+                "tool_steps":     tool_steps,
+                "mode":           mode,
+                "pipeline":       [{"step": p["step"], "agent_name": p["agent_name"]} for p in pipeline],
+                "agent_outputs":  agent_outputs or [],
+                "client_type":    _ctx_dict.get("_client_type", ""),
+                "client_version": _ctx_dict.get("_client_version", ""),
             }
 
             # 1. 立即写入 ES（保证可检索性）
@@ -897,8 +925,16 @@ class HermesEngine:
                         agent_outputs=agent_outputs or None,
                     )
                     logger.debug(f"已写入 MemoryManager L1: user_id={user_id} turn_id={turn_id}")
+                    # 后台向量化：通过 RagPipeline 索引本轮对话供后续检索
+                    if self.rag_pipeline is not None:
+                        asyncio.create_task(self.rag_pipeline.index_turn(
+                            user_id=user_id, turn_id=turn_id,
+                            user_input=user_input, assistant_response=response,
+                            agent_outputs=agent_outputs or None,
+                        ))
                     # 后台预取：为下一轮对话提前缓存相关记忆（TTL 5 min）
-                    self.memory_manager.queue_prefetch(user_id, user_input)
+                    prefetch_src = self.rag_pipeline or self.memory_manager
+                    prefetch_src.queue_prefetch(user_id, user_input)
                 except Exception as e:
                     logger.warning(f"MemoryManager.store_turn 失败: {e}")
 
@@ -1245,14 +1281,25 @@ class HermesEngine:
 
             if langchain_tools:
                 try:
-                    # 优先使用 registry agent 的完整背景作为系统提示
+                    # 优先使用 registry agent 的完整背景作为系统提示，并注入 client_env + user_profile
                     from app.agents.registry import registry as _ag_registry
                     _ag = _ag_registry.get(worker_name)
                     if _ag and _ag.background:
-                        system_prompt = _ag._build_system_prompt()
+                        system_prompt = _ag._build_system_prompt(context=context)
                     else:
                         agent_role    = worker_config.get("role", worker_name)
                         system_prompt = f"你是 {agent_role} 代理，负责执行分配的任务。"
+                        # 注入 client_env + user_profile（无 BaseAgent 实例时手动拼接）
+                        from app.core.client_env import format_env_for_prompt
+                        _ctx = context if isinstance(context, dict) else {}
+                        _env_block = format_env_for_prompt(
+                            _ctx.get("_client_type"), _ctx.get("_client_version")
+                        )
+                        _profile_block = _ctx.get("_user_profile", "")
+                        if _env_block:
+                            system_prompt += "\n\n" + _env_block
+                        if _profile_block:
+                            system_prompt += "\n\n" + _profile_block
                     graph = create_react_agent(llm, langchain_tools, state_modifier=system_prompt)
                     self.agent_graphs[executor_key] = graph
                     logger.info(
@@ -1349,15 +1396,25 @@ class HermesEngine:
             return "当前无法调用 LLM，请稍后重试。"
 
         try:
-            # 用户画像注入：从 Redis 加载 user:{user_id}:init 中的 profile，拼接到系统提示末尾
+            from app.core.client_env import format_env_for_prompt as _fmt_env
+            # 用户画像注入：优先从 context["_user_profile"] 取（process_user_input 已预加载），
+            # 降级时再从 Redis 加载。
             base_sys_prompt = self._get_system_prompt(agent_name)
-            if self.memory_manager is not None:
+            _ctx_dict_gen = context if isinstance(context, dict) else {}
+            profile_block = _ctx_dict_gen.get("_user_profile", "")
+            if not profile_block and self.memory_manager is not None:
                 try:
                     profile_block = await self.memory_manager.build_system_prompt_block(user_id)
-                    if profile_block:
-                        base_sys_prompt = base_sys_prompt + "\n\n" + profile_block
                 except Exception as _pe:
                     logger.debug(f"加载用户画像失败 user={user_id}: {_pe}")
+            if profile_block:
+                base_sys_prompt = base_sys_prompt + "\n\n" + profile_block
+            # 客户端环境注入
+            env_block = _fmt_env(
+                _ctx_dict_gen.get("_client_type"), _ctx_dict_gen.get("_client_version")
+            )
+            if env_block:
+                base_sys_prompt = base_sys_prompt + "\n\n" + env_block
 
             # 使用 ChatPromptTemplate 构建提示 (LCEL 方式)
             system_prompt = ChatPromptTemplate.from_messages([
@@ -1440,15 +1497,24 @@ class HermesEngine:
             yield "当前无法调用 LLM，请稍后重试。"
             return
         try:
-            # 用户画像注入：从 Redis 加载 user:{user_id}:init 中的 profile，拼接到系统提示末尾
+            from app.core.client_env import format_env_for_prompt as _fmt_env_s
+            # 用户画像注入：优先从 context["_user_profile"] 取，降级时再从 Redis 加载。
             base_sys_prompt = self._get_system_prompt(agent_name)
-            if self.memory_manager is not None:
+            _ctx_dict_str = context if isinstance(context, dict) else {}
+            profile_block = _ctx_dict_str.get("_user_profile", "")
+            if not profile_block and self.memory_manager is not None:
                 try:
                     profile_block = await self.memory_manager.build_system_prompt_block(user_id)
-                    if profile_block:
-                        base_sys_prompt = base_sys_prompt + "\n\n" + profile_block
                 except Exception as _pe:
-                    logger.debug(f"加载用户画像失败 user={user_id}: {_pe}")
+                    logger.debug(f"[stream] 加载用户画像失败 user={user_id}: {_pe}")
+            if profile_block:
+                base_sys_prompt = base_sys_prompt + "\n\n" + profile_block
+            # 客户端环境注入
+            env_block_s = _fmt_env_s(
+                _ctx_dict_str.get("_client_type"), _ctx_dict_str.get("_client_version")
+            )
+            if env_block_s:
+                base_sys_prompt = base_sys_prompt + "\n\n" + env_block_s
 
             system_prompt = ChatPromptTemplate.from_messages([
                 ("system", base_sys_prompt),
@@ -1516,15 +1582,20 @@ class HermesEngine:
         try:
             turn_id = uuid.uuid4().hex
 
-            if self.context_manager is not None:
+            _rag_source = self.rag_pipeline or self.context_manager
+            if _rag_source is not None:
                 try:
-                    bundle  = await self.context_manager.build_context(
+                    bundle  = await _rag_source.build_context(
                         user_id=user_id, user_input=user_input,
                         base_context=context if isinstance(context, dict) else {},
                     )
                     context = bundle.to_prompt_context()
+                    logger.info(
+                        "上下文组装完成 user=%s history=%d memories=%d [stream]",
+                        user_id, len(bundle.history), len(bundle.memories),
+                    )
                 except Exception as e:
-                    logger.warning(f"ContextManager.build_context 失败: {e}")
+                    logger.warning("RAG build_context 失败，使用原始 context [stream]: %s", e)
 
             # 上下文长度检查（流式版本）
             if self.memory_manager is not None:
@@ -1538,6 +1609,16 @@ class HermesEngine:
                     asyncio.create_task(
                         self.memory_manager.compress_immediately(user_id, "context_overflow")
                     )
+
+            # 加载用户画像到 context，供子 Agent 系统提示注入
+            if isinstance(context, dict) and self.memory_manager is not None:
+                if "_user_profile" not in context:
+                    try:
+                        profile_block = await self.memory_manager.build_system_prompt_block(user_id)
+                        if profile_block:
+                            context["_user_profile"] = profile_block
+                    except Exception as _pe:
+                        logger.debug("[stream] 预加载用户画像失败 user=%s: %s", user_id, _pe)
 
             router_result = await self.router_agent.process(user_input, context, llm=llm)
             intent       = router_result.get("intent", "general_question")
@@ -1579,12 +1660,15 @@ class HermesEngine:
 
             full_response = "".join(full_response_parts)
 
+            _sctx = context if isinstance(context, dict) else {}
             # 异步保存到存储层（不阻塞流）
             asyncio.create_task(self._save_turn_async(
                 user_id=user_id, user_input=user_input,
                 response=full_response, turn_id=turn_id,
                 intent=intent, target_agent=target_agent,
                 tasks=tasks, mode=mode, pipeline=pipeline,
+                client_type=_sctx.get("_client_type", ""),
+                client_version=_sctx.get("_client_version", ""),
             ))
 
             yield f'event: done\ndata: {_json.dumps({"turn_id": turn_id}, ensure_ascii=False)}\n\n'
@@ -1598,12 +1682,15 @@ class HermesEngine:
         user_id: str, user_input: str, response: str,
         turn_id: str, intent: str, target_agent: str,
         tasks: list, mode: str, pipeline: list,
+        client_type: str = "", client_version: str = "",
     ) -> None:
         """后台保存对话轮次到 ES 和 MemoryManager。"""
         turn_metadata = {
             "intent": intent, "target_agent": target_agent,
             "tasks": tasks, "mode": mode,
             "pipeline": [{"step": p["step"], "agent_name": p["agent_name"]} for p in pipeline],
+            "client_type":    client_type,
+            "client_version": client_version,
         }
         try:
             await self.chat_history.save_turn(
@@ -1619,8 +1706,15 @@ class HermesEngine:
                     user_input=user_input, assistant_response=response,
                     metadata=turn_metadata,
                 )
+                # 后台向量化：通过 RagPipeline 索引本轮对话供后续检索
+                if self.rag_pipeline is not None:
+                    asyncio.create_task(self.rag_pipeline.index_turn(
+                        user_id=user_id, turn_id=turn_id,
+                        user_input=user_input, assistant_response=response,
+                    ))
                 # 后台预取：为下一轮对话提前缓存相关记忆（TTL 5 min）
-                self.memory_manager.queue_prefetch(user_id, user_input)
+                prefetch_src = self.rag_pipeline or self.memory_manager
+                prefetch_src.queue_prefetch(user_id, user_input)
             except Exception as e:
                 logger.warning(f"流式存档 MemoryManager 失败: {e}")
 
