@@ -6,7 +6,7 @@
 用法::
 
     # 请求头（FastAPI Depends）
-    from app.core.headers import RequestHeaders, ResponseHeaders
+    from app.utils.headers import RequestHeaders, ResponseHeaders
 
     @router.post("/send")
     async def send_message(
@@ -27,7 +27,7 @@ from typing import ClassVar
 
 from fastapi import Request, Response
 
-from app.core.client_env import normalize_client_type
+from app.utils.client_env import normalize_client_type
 
 logger = logging.getLogger(__name__)
 

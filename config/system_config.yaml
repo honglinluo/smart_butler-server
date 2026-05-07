@@ -78,8 +78,8 @@ tools:
 
 # 日志配置
 logging:
-  level: "INFO"
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  level: "DEBUG"              # 日志级别：DEBUG, INFO, WARNING, ERROR, CRITICAL
+  # json_file: "logs/hermes.json"   # 启用后同步写入 JSON 文件，供 ELK/Loki 采集（注释掉则不启用）
 
 # API 配置
 api:

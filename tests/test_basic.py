@@ -188,7 +188,7 @@ def test_client_env_unit() -> bool:
     logger.info("=" * 70)
 
     try:
-        from app.core.client_env import ClientType, normalize_client_type, format_env_for_prompt
+        from app.utils.client_env import ClientType, normalize_client_type, format_env_for_prompt
 
         cases_normalize = [
             # (输入,          期望输出,         说明)

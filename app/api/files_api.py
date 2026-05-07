@@ -28,7 +28,7 @@ from fastapi.responses import FileResponse
 
 from app.api.dependencies import get_current_user
 from app.core.file_storage import UPLOAD_ROOT, SUBDIR_UPLOADS, SUBDIR_GENERATED
-from app.core.headers import ResponseHeaders
+from app.utils.headers import ResponseHeaders
 from app.core.paths import PROJECT_ROOT
 
 router = APIRouter(prefix="/files", tags=["Files"])

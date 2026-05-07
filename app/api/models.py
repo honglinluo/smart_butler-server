@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status, Depends
 from pydantic import BaseModel, Field
 from app.database.pool import get_connection, release_connection
 from app.api.dependencies import get_current_user
-from app.core.headers import ResponseHeaders
+from app.utils.headers import ResponseHeaders
 
 
 router = APIRouter(prefix="/models", tags=["Models"])

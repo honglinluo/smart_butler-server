@@ -2,6 +2,7 @@
 
 import json
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
@@ -548,10 +549,50 @@ class RouterAgent:
             intent, mode, len(pipeline),
             [p["agent_name"] for p in pipeline],
         )
+
+        # ── L1 任务写入（后台异步，不阻塞路由响应）──────────────────────────
+        turn_id = context.get("turn_id") if isinstance(context, dict) else None
+        if turn_id and len(pipeline) > 1:
+            # 多 Agent 流水线才记录 L1 任务（单 agent 场景跳过以节省开销）
+            import asyncio as _asyncio
+            user_id = context.get("user_id", "") if isinstance(context, dict) else ""
+            if user_id:
+                _asyncio.ensure_future(
+                    self._write_l1_tasks(user_id, turn_id, tasks_with_agents, llm)
+                )
+
         return {
             "intent": intent,
             "mode": mode,
             "pipeline": pipeline,
             "target_agent": target_agent,
             "tasks": tasks,
+            "turn_id": turn_id or "",
         }
+
+    async def _write_l1_tasks(
+        self,
+        user_id:           str,
+        turn_id:           str,
+        tasks_with_agents: List[Dict[str, Any]],
+        llm:               Optional[BaseChatModel],
+    ) -> None:
+        """将 Router 分解的 Agent 级任务写入 L1 TaskStore（后台任务）。"""
+        try:
+            from app.core.task_planner import make_l1_store
+            store, _ = make_l1_store(user_id, turn_id)
+            raw = [
+                {
+                    "content":    t.get("description", ""),
+                    "tags":       [f"agent:{t.get('agent_name', '')}"],
+                    "agent_name": t.get("agent_name", ""),
+                }
+                for t in tasks_with_agents
+            ]
+            await store.replace(raw)
+            logger.debug(
+                "[RouterAgent] L1 任务已写入 user=%s turn=%s tasks=%d",
+                user_id, turn_id, len(raw),
+            )
+        except Exception as e:
+            logger.warning("[RouterAgent] L1 任务写入失败: %s", e)

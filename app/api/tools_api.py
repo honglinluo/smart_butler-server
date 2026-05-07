@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from pydantic import BaseModel, Field, field_validator
 
 from app.api.dependencies import get_current_user, get_user_model
-from app.core.headers import ResponseHeaders
+from app.utils.headers import ResponseHeaders
 from app.tools.base import (
     EXEC_CLIENT, EXEC_SERVER,
     VIS_EXCLUSIVE, VIS_PRIVATE, VIS_PUBLIC,

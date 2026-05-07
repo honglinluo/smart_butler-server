@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -42,9 +43,12 @@ class _RegistryToolAdapter(LCBaseTool):
         self._agent_name = agent_name
 
     def _run(self, *args: Any, **kwargs: Any) -> Any:
-        return asyncio.get_event_loop().run_until_complete(self._arun(*args, **kwargs))
+        raise NotImplementedError("_RegistryToolAdapter 必须在异步上下文中通过 _arun 调用")
 
     async def _arun(self, *args: Any, **kwargs: Any) -> Any:
+        from app.utils.log_bus import get_bus
+        bus = get_bus()
+
         # LangGraph 以 kwargs 传入；无 schema 时 LangChain 可能以单字符串传入
         if args and isinstance(args[0], str) and not kwargs:
             try:
@@ -55,12 +59,25 @@ class _RegistryToolAdapter(LCBaseTool):
             params = dict(kwargs)
 
         context = {"user_id": self._user_id, "agent_name": self._agent_name}
+        bus.tool_call(self._user_id, self._agent_name, self.name, params)
+        t0 = time.monotonic()
         try:
             result = await self._rt.execute(params, context)
-            return json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+            result_str = (
+                json.dumps(result, ensure_ascii=False)
+                if isinstance(result, dict)
+                else str(result)
+            )
+            bus.tool_result(
+                self._user_id, self._agent_name, self.name,
+                result_str, (time.monotonic() - t0) * 1000,
+            )
+            return result_str
         except Exception as e:
-            logger.warning("[_RegistryToolAdapter] %s 失败 user=%s: %s", self.name, self._user_id, e)
-            return f"工具 {self.name} 执行失败: {e}"
+            error_msg = f"工具 {self.name} 执行失败: {e}"
+            bus.tool_error(self._user_id, self._agent_name, self.name, str(e))
+            # 将错误作为 ToolMessage 内容反馈给 LLM，不静默忽略
+            return error_msg
 
 
 @dataclass
@@ -226,6 +243,9 @@ class BaseAgent:
 
     # ── 核心执行（DB Agent 直接使用此实现；代码 Agent 可重写）───────
 
+    # L2 拆分阈值：任务描述超过此字数时触发 L2 拆分（可通过子类覆盖）
+    _L2_DECOMPOSE_THRESHOLD: int = 80
+
     async def execute(
         self,
         task:    Dict[str, Any],
@@ -237,9 +257,8 @@ class BaseAgent:
         流程：
           1. 加载技能记忆，构建 system prompt
           2. 收集可用工具（公共 + 专属）
-          3. 有工具且 LangGraph 可用 → ReAct agent（LLM 可自主调用工具）
-             有工具但 LangGraph 不可用 → bind_tools 手动循环
-             无工具 → 纯 LLM 单次调用
+          3. 若任务复杂（描述超过阈值），先做 L2 拆分，再逐步执行
+          4. 有工具且 LangGraph 可用 → ReAct agent；否则 bind_tools / 纯 LLM
 
         Returns:
             {"result": str, "success": bool, "metadata": {...}}
@@ -251,6 +270,8 @@ class BaseAgent:
             await self.load_skills()
             system_prompt = self._build_system_prompt(context=context)
             task_desc     = task.get("description", "")
+            user_id       = context.get("user_id", self.user_id) if isinstance(context, dict) else self.user_id
+            lc_tools      = self.collect_tools(user_id)
 
             # 注入历史上下文（最近 5 轮）
             history_lines = []
@@ -263,24 +284,31 @@ class BaseAgent:
                     if a:
                         history_lines.append(f"助手: {a}")
 
-            human_content = task_desc
-            if history_lines:
-                human_content = "历史对话:\n" + "\n".join(history_lines) + "\n\n当前任务:\n" + task_desc
+            # ── L2 拆分：任务复杂时先分解再按步执行 ─────────────────────────
+            t0 = time.monotonic()
+            if len(task_desc) >= self._L2_DECOMPOSE_THRESHOLD:
+                result_text, l2_meta = await self._execute_with_l2(
+                    task_desc, user_id, lc_tools, system_prompt, history_lines, llm, context,
+                )
+            else:
+                human_content = task_desc
+                if history_lines:
+                    human_content = "历史对话:\n" + "\n".join(history_lines) + "\n\n当前任务:\n" + task_desc
+                result_text = await self._invoke_with_tools(
+                    llm, system_prompt, human_content, lc_tools, user_id=user_id,
+                )
+                l2_meta = {}
 
-            # 收集工具
-            user_id  = context.get("user_id", self.user_id) if isinstance(context, dict) else self.user_id
-            lc_tools = self.collect_tools(user_id)
-
-            result_text = await self._invoke_with_tools(
-                llm, system_prompt, human_content, lc_tools
+            from app.utils.log_bus import get_bus
+            get_bus().llm_output(
+                user_id, self.name, result_text, (time.monotonic() - t0) * 1000,
             )
-
             logger.debug("Agent 执行完成: name=%s tools=%d task_len=%d",
                          self.name, len(lc_tools), len(task_desc))
             return {
                 "result":   result_text,
                 "success":  True,
-                "metadata": {"agent": self.name, "tools_used": len(lc_tools)},
+                "metadata": {"agent": self.name, "tools_used": len(lc_tools), **l2_meta},
             }
 
         except Exception as e:
@@ -290,12 +318,129 @@ class BaseAgent:
         finally:
             self._record_call()
 
+    async def _execute_with_l2(
+        self,
+        task_desc:     str,
+        user_id:       str,
+        lc_tools:      List[LCBaseTool],
+        system_prompt: str,
+        history_lines: List[str],
+        llm:           Any,
+        context:       Dict[str, Any],
+    ) -> tuple:
+        """L2 拆分后逐步执行，返回 (最终结果文字, l2 元数据字典)。
+
+        执行策略
+        ────────
+        - 按 priority 顺序执行步骤
+        - blocked 步骤等待前置完成后自动解锁
+        - on_fail=terminate 的步骤失败时立即终止并返回错误
+        - on_fail=skip 的步骤失败时跳过并继续
+        - on_fail=retry:N 的步骤失败时最多重试 N 次
+        """
+        from app.core.task_planner import make_l2_store, TaskStatus
+        import uuid as _uuid
+
+        exec_id = _uuid.uuid4().hex[:8]
+        store, decomposer = make_l2_store(user_id, self.name, exec_id)
+        store._cache = []   # 绕过 Redis（无连接时降级为内存）
+
+        # 工具名称摘要，供 L2 提示词参考粒度
+        tools_info = ", ".join(t.name for t in lc_tools) if lc_tools else "（无专用工具）"
+
+        steps = await decomposer.decompose(task_desc, llm, tools_info=tools_info)
+        if not steps:
+            # 拆分失败，降级为整体执行
+            logger.warning("[L2] 步骤拆分失败，降级整体执行 agent=%s", self.name)
+            human_content = task_desc
+            if history_lines:
+                human_content = "历史对话:\n" + "\n".join(history_lines) + "\n\n当前任务:\n" + task_desc
+            result = await self._invoke_with_tools(llm, system_prompt, human_content, lc_tools)
+            return result, {"l2_steps": 0, "l2_fallback": True}
+
+        logger.info("[L2] agent=%s 任务已拆分为 %d 步", self.name, len(steps))
+
+        step_results: List[str] = []
+        completed_ids: List[str] = []
+        failed_ids:    List[str] = []
+
+        for step in steps:
+            if step.status == TaskStatus.BLOCKED:
+                # 依赖未完成，跳过（不应发生，_recompute_blocked 已处理）
+                logger.debug("[L2] 步骤 %s 仍被阻塞，跳过", step.task_id)
+                continue
+
+            await store.set_status(step.task_id, TaskStatus.IN_PROGRESS)
+
+            # 构建单步输入
+            prev_context = "\n".join(step_results[-3:])   # 最近 3 步结果作为上下文
+            step_input = step.content
+            if prev_context:
+                step_input = f"前序执行结果：\n{prev_context}\n\n当前步骤：{step.content}"
+            if history_lines:
+                step_input = "历史对话:\n" + "\n".join(history_lines) + "\n\n" + step_input
+
+            on_fail     = decomposer.get_on_fail(step)
+            retry_count = decomposer.get_retry_count(step)
+            attempts    = max(1, retry_count + 1)
+            step_ok     = False
+            step_result = ""
+
+            for attempt in range(attempts):
+                try:
+                    step_result = await self._invoke_with_tools(
+                        llm, system_prompt, step_input, lc_tools, user_id=user_id,
+                    )
+                    step_ok = True
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "[L2] 步骤 %s 第 %d/%d 次执行失败 agent=%s: %s",
+                        step.task_id, attempt + 1, attempts, self.name, exc,
+                    )
+                    if attempt + 1 == attempts:
+                        step_result = f"[步骤失败: {exc}]"
+
+            if step_ok:
+                await store.set_status(step.task_id, TaskStatus.COMPLETED)
+                completed_ids.append(step.task_id)
+                step_results.append(f"步骤「{step.content[:40]}」结果：{step_result[:200]}")
+            else:
+                await store.set_status(step.task_id, TaskStatus.CANCELLED)
+                failed_ids.append(step.task_id)
+
+                if on_fail == "terminate" or decomposer.should_terminate(step):
+                    logger.warning("[L2] 步骤 %s 失败且策略为 terminate，中止任务 agent=%s", step.task_id, self.name)
+                    partial = "\n".join(step_results) if step_results else "（无已完成步骤）"
+                    return (
+                        f"任务执行中止（步骤「{step.content[:40]}」失败）。\n已完成部分：\n{partial}",
+                        {"l2_steps": len(steps), "l2_completed": len(completed_ids), "l2_terminated": True},
+                    )
+                # skip：记录并继续
+                step_results.append(f"步骤「{step.content[:40]}」已跳过（失败）")
+
+        # 汇总所有步骤结果，交给 LLM 生成最终输出
+        summary_input = (
+            f"以下是任务「{task_desc[:100]}」各步骤的执行结果，请综合整理为完整的最终回答：\n\n"
+            + "\n".join(step_results)
+        )
+        final_result = await self._invoke_with_tools(
+            llm, system_prompt, summary_input, lc_tools, user_id=user_id,
+        )
+
+        return final_result, {
+            "l2_steps":     len(steps),
+            "l2_completed": len(completed_ids),
+            "l2_failed":    len(failed_ids),
+        }
+
     async def _invoke_with_tools(
         self,
         llm:           Any,
         system_prompt: str,
         human_content: str,
         lc_tools:      List[LCBaseTool],
+        user_id:       str = "",
     ) -> str:
         """统一的 LLM 调用入口，按工具可用情况选择最优执行策略。
 
@@ -304,6 +449,14 @@ class BaseAgent:
           2. 有工具 + 无 LangGraph   → bind_tools 手动单轮工具调用
           3. 无工具                   → 直接 ainvoke
         """
+        from app.utils.log_bus import get_bus
+        bus = get_bus()
+        uid = user_id or self.user_id
+        bus.llm_input(
+            uid, self.name, human_content, system_prompt,
+            [t.name for t in lc_tools],
+        )
+
         if not lc_tools:
             resp = await llm.ainvoke([
                 SystemMessage(content=system_prompt),
@@ -312,9 +465,9 @@ class BaseAgent:
             return resp.content if hasattr(resp, "content") else str(resp)
 
         if _HAS_LANGGRAPH and _create_react_agent is not None:
-            return await self._run_react_agent(llm, system_prompt, human_content, lc_tools)
+            return await self._run_react_agent(llm, system_prompt, human_content, lc_tools, user_id=uid)
 
-        return await self._run_bind_tools(llm, system_prompt, human_content, lc_tools)
+        return await self._run_bind_tools(llm, system_prompt, human_content, lc_tools, user_id=uid)
 
     async def _run_react_agent(
         self,
@@ -322,8 +475,12 @@ class BaseAgent:
         system_prompt: str,
         human_content: str,
         lc_tools:      List[LCBaseTool],
+        user_id:       str = "",
     ) -> str:
-        """使用 LangGraph create_react_agent 执行（支持多轮工具调用）。"""
+        """使用 LangGraph create_react_agent 执行（支持多轮工具调用）。
+
+        工具调用日志由 _RegistryToolAdapter._arun 自动发射，无需在此重复。
+        """
         graph  = _create_react_agent(llm, lc_tools, state_modifier=system_prompt)
         output = await graph.ainvoke({"messages": [HumanMessage(content=human_content)]})
         msgs   = output.get("messages", [])
@@ -336,9 +493,18 @@ class BaseAgent:
         system_prompt: str,
         human_content: str,
         lc_tools:      List[LCBaseTool],
+        user_id:       str = "",
     ) -> str:
-        """bind_tools 手动单轮工具调用（LangGraph 不可用时的降级实现）。"""
+        """bind_tools 手动单轮工具调用（LangGraph 不可用时的降级实现）。
+
+        工具错误以 ToolMessage 形式反馈给 LLM，不静默忽略。
+        _RegistryToolAdapter.arun 已处理工具级别的日志；
+        此处额外记录非 RegistryToolAdapter 工具的错误。
+        """
         from langchain_core.messages import ToolMessage
+        from app.utils.log_bus import get_bus
+        bus = get_bus()
+        uid = user_id or self.user_id
 
         llm_with_tools = llm.bind_tools(lc_tools)
         tool_map       = {t.name: t for t in lc_tools}
@@ -368,9 +534,12 @@ class BaseAgent:
                     try:
                         output = await tool.arun(args)
                     except Exception as e:
-                        output = f"工具调用失败: {e}"
+                        # 非 _RegistryToolAdapter 工具：单独记录错误并将错误信息反馈给 LLM
+                        bus.tool_error(uid, self.name, name, str(e))
+                        output = f"工具 {name} 执行失败: {e}"
                 else:
                     output = f"未找到工具: {name}"
+                    logger.warning("[bind_tools] 未找到工具 %s agent=%s", name, self.name)
 
                 messages.append(ToolMessage(content=str(output), tool_call_id=call_id))
 
@@ -411,7 +580,7 @@ class BaseAgent:
         Args:
             context: 当前请求上下文，含 _client_type/_client_version/_user_profile 键时自动注入。
         """
-        from app.core.client_env import format_env_for_prompt
+        from app.utils.client_env import format_env_for_prompt
 
         parts = []
         if self.role:

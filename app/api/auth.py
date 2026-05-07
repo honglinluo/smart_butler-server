@@ -42,8 +42,8 @@ from pydantic_core import core_schema
 
 from app.database.pool import get_connection, release_connection
 from app.api.dependencies import get_current_user
-from app.core.headers import RequestHeaders, ResponseHeaders
-from app.core.crypto import (
+from app.utils.headers import RequestHeaders, ResponseHeaders
+from app.utils.crypto import (
     decrypt_password, generate_nonce, get_public_key_pem,
     nonce_redis_key, NONCE_TTL,
 )

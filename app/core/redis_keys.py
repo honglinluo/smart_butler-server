@@ -67,6 +67,11 @@ LOOP_LOGS_TTL    = 3_600        # 1 h
 # 用户工具构建授权策略（allow / ask / deny），默认 ask
 DECISION_POLICY  = "user:{user_id}:decision_policy"         # str
 
+# ── 任务规划列表（按 user_id 索引）──────────────────────────
+# 值：JSON 序列化的 List[TaskItem]，TTL 7 天
+TASK_LIST     = "task:{user_id}:list"    # str — JSON
+TASK_LIST_TTL = 7 * 86_400              # 7 d
+
 # ── 周期归档调度锁（按 user_id 索引）─────────────────────────────
 # 防止同一用户在同一月/年内重复触发归档任务
 # TTL 设为 32 天（月度锁）/ 370 天（年度锁），覆盖一个完整周期

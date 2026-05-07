@@ -38,10 +38,8 @@ def _read_log_cfg() -> dict:
     return {}
 
 _log_cfg = _read_log_cfg()
-logging.basicConfig(
-    level=getattr(logging, _log_cfg.get("level", "INFO").upper(), logging.INFO),
-    format=_log_cfg.get("format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"),
-)
+from app.utils.log_bus import init_log_bus
+init_log_bus(_log_cfg)
 logger = logging.getLogger(__name__)
 
 

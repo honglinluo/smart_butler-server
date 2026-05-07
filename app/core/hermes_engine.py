@@ -764,6 +764,11 @@ class HermesEngine:
             return "当前无法调用 LLM，请稍后重试。"
 
         try:
+            from app.utils.log_bus import get_bus as _get_bus
+            _bus = _get_bus()
+            _ctx_pre = context if isinstance(context, dict) else {}
+            _bus.user_message(user_id, user_input, _ctx_pre.get("_client_type", "api"))
+
             turn_id = uuid.uuid4().hex
 
             # 使用 RagPipeline 组装上下文（检索 + 历史加载 + 相关性过滤）
@@ -776,9 +781,9 @@ class HermesEngine:
                         base_context=context if isinstance(context, dict) else {},
                     )
                     context = bundle.to_prompt_context()
-                    logger.info(
-                        "上下文组装完成 user=%s history=%d memories=%d",
+                    _bus.context_built(
                         user_id, len(bundle.history), len(bundle.memories),
+                        (context if isinstance(context, dict) else {}).get("_client_type", ""),
                     )
                 except Exception as e:
                     logger.warning("RAG build_context 失败，使用原始 context: %s", e)
@@ -847,6 +852,7 @@ class HermesEngine:
             logger.info("路由决策: intent=%s mode=%s target=%s steps=%d",
                         intent, mode, target_agent, len(pipeline))
             logger.debug("路由结果详情: %s", router_result)
+            _bus.routing(user_id, intent, mode, target_agent, len(pipeline))
 
             # 模型适配性检查（日志警告，不阻断）
             model_name = getattr(llm, "model_name", getattr(llm, "model", "")) or ""
@@ -885,6 +891,10 @@ class HermesEngine:
                     tool_results=None,
                 )
                 agent_outputs = [{"agent_name": target_agent or self.router_agent.name, "output": response}]
+
+            # engine 级别记录最终回复（agent 内部单步 llm_output 已记录中间步骤）
+            _bus.llm_output(user_id, target_agent, response)
+
             _ctx_dict     = context if isinstance(context, dict) else {}
             turn_metadata = {
                 "intent":         intent,
@@ -1289,7 +1299,7 @@ class HermesEngine:
                         agent_role    = worker_config.get("role", worker_name)
                         system_prompt = f"你是 {agent_role} 代理，负责执行分配的任务。"
                         # 注入 client_env + user_profile（无 BaseAgent 实例时手动拼接）
-                        from app.core.client_env import format_env_for_prompt
+                        from app.utils.client_env import format_env_for_prompt
                         _ctx = context if isinstance(context, dict) else {}
                         _env_block = format_env_for_prompt(
                             _ctx.get("_client_type"), _ctx.get("_client_version")
@@ -1395,7 +1405,7 @@ class HermesEngine:
             return "当前无法调用 LLM，请稍后重试。"
 
         try:
-            from app.core.client_env import format_env_for_prompt as _fmt_env
+            from app.utils.client_env import format_env_for_prompt as _fmt_env
             # 用户画像注入：优先从 context["_user_profile"] 取（process_user_input 已预加载），
             # 降级时再从 Redis 加载。
             base_sys_prompt = self._get_system_prompt(agent_name)
@@ -1496,7 +1506,7 @@ class HermesEngine:
             yield "当前无法调用 LLM，请稍后重试。"
             return
         try:
-            from app.core.client_env import format_env_for_prompt as _fmt_env_s
+            from app.utils.client_env import format_env_for_prompt as _fmt_env_s
             # 用户画像注入：优先从 context["_user_profile"] 取，降级时再从 Redis 加载。
             base_sys_prompt = self._get_system_prompt(agent_name)
             _ctx_dict_str = context if isinstance(context, dict) else {}
@@ -1579,6 +1589,11 @@ class HermesEngine:
             return
 
         try:
+            from app.utils.log_bus import get_bus as _get_bus
+            _bus = _get_bus()
+            _ctx_pre = context if isinstance(context, dict) else {}
+            _bus.user_message(user_id, user_input, _ctx_pre.get("_client_type", "api"))
+
             turn_id = uuid.uuid4().hex
 
             _rag_source = self.rag_pipeline or self.context_manager
@@ -1589,9 +1604,9 @@ class HermesEngine:
                         base_context=context if isinstance(context, dict) else {},
                     )
                     context = bundle.to_prompt_context()
-                    logger.info(
-                        "上下文组装完成 user=%s history=%d memories=%d [stream]",
+                    _bus.context_built(
                         user_id, len(bundle.history), len(bundle.memories),
+                        (context if isinstance(context, dict) else {}).get("_client_type", ""),
                     )
                 except Exception as e:
                     logger.warning("RAG build_context 失败，使用原始 context [stream]: %s", e)
@@ -1635,6 +1650,7 @@ class HermesEngine:
                     mode         = "single"
                     target_agent = agent_name
 
+            _bus.routing(user_id, intent, mode, target_agent, len(pipeline))
             yield (
                 f'event: routing\n'
                 f'data: {_json.dumps({"intent": intent, "mode": mode, "agent": target_agent}, ensure_ascii=False)}\n\n'
@@ -1658,6 +1674,7 @@ class HermesEngine:
                 yield f'event: token\ndata: {_json.dumps({"text": trailing}, ensure_ascii=False)}\n\n'
 
             full_response = "".join(full_response_parts)
+            _bus.llm_output(user_id, target_agent, full_response)
 
             _sctx = context if isinstance(context, dict) else {}
             # 异步保存到存储层（不阻塞流）

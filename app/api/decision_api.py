@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from app.agents.loop.decision_gate import DecisionState, UserDecisionGate
-from app.core.headers import ResponseHeaders
+from app.utils.headers import ResponseHeaders
 
 logger = logging.getLogger(__name__)
 

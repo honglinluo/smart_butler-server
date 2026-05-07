@@ -10,7 +10,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.agents.base import BaseAgent
 from app.agents.decorators import agent
-from app.core.content_fetcher import (
+from app.utils.content_fetcher import (
     detect_output_request,
     fetch_context_for_input,
     write_output_file,

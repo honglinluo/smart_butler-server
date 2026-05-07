@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.api.dependencies import get_current_user
-from app.core.headers import ResponseHeaders
+from app.utils.headers import ResponseHeaders
 from app.scheduler.models import (
     ActionType, ScheduledTask, TaskStatus, TaskType,
 )

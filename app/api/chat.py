@@ -8,7 +8,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Respon
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from app.api.dependencies import get_current_user, get_user_model, require_local_or_auth
-from app.core.headers import RequestHeaders, ResponseHeaders
+from app.utils.headers import RequestHeaders, ResponseHeaders
 from app.core.hermes_engine import LLMInfo
 
 logger = logging.getLogger(__name__)
@@ -163,11 +163,14 @@ async def get_chat_history(
     request: Request,
     response: Response,
     current_user: dict = Depends(get_current_user),
+    req_headers: RequestHeaders = Depends(RequestHeaders),
     size: int = Query(default=20, ge=1, le=100, description="返回条数"),
     page: int = Query(default=1, ge=1, description="页码（从 1 开始）"),
+    all_clients: bool = Query(default=False, description="是否返回所有客户端历史"),
 ):
     """
     查询当前用户的聊天历史记录，从 Elasticsearch 分页返回。
+    all_clients=false（默认）时只返回当前客户端的历史；all_clients=true 返回全部。
     """
     ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
@@ -175,15 +178,20 @@ async def get_chat_history(
     if not engine or not hasattr(engine, "chat_history"):
         raise HTTPException(status_code=500, detail="Chat history service unavailable")
 
+    client_type_filter: Optional[str] = None if all_clients else req_headers.client_type
+
     try:
         from_ = (page - 1) * size
-        turns = await engine.chat_history.get_recent_turns(user_id, size=size, from_=from_)
-        total = await engine.chat_history.count_index_docs(user_id)
+        turns = await engine.chat_history.get_recent_turns(
+            user_id, size=size, from_=from_, client_type=client_type_filter
+        )
+        total = await engine.chat_history.count_index_docs(user_id, client_type=client_type_filter)
         return {
             "user_id": user_id,
             "page": page,
             "size": size,
             "total": total,
+            "all_clients": all_clients,
             "history": turns,
         }
     except Exception as e:

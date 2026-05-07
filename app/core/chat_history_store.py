@@ -203,10 +203,12 @@ class ChatHistoryStore:
         user_id: str,
         size: int = 20,
         from_: int = 0,
+        client_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """获取对话轮次列表，每条包含 user_input + assistant_response，按 timestamp 降序分页。
 
         供历史记录 API 使用；引擎内部构建 LLM 上下文请继续使用 get_recent_messages。
+        client_type 非空时只返回该客户端的对话。
         """
         es_conn = None
         try:
@@ -214,9 +216,14 @@ class ChatHistoryStore:
             if not es_conn:
                 return []
 
+            if client_type:
+                query: dict = {"term": {"client_type": client_type}}
+            else:
+                query = {"match_all": {}}
+
             res = await es_conn.search(
                 index=user_id,
-                query={"match_all": {}},
+                query=query,
                 size=size,
                 from_=from_,
                 sort=[{"timestamp": {"order": "desc", "unmapped_type": "date"}}],
@@ -243,6 +250,7 @@ class ChatHistoryStore:
                     "user_input":         src.get("user_input", ""),
                     "assistant_response": src.get("assistant_response", ""),
                     "timestamp":          src.get("timestamp"),
+                    "client_type":        src.get("client_type", ""),
                 })
 
             return turns
@@ -309,8 +317,8 @@ class ChatHistoryStore:
             if es_conn:
                 await release_connection("elasticsearch", es_conn)
 
-    async def count_index_docs(self, user_id: str) -> int:
-        """返回指定索引（user_id）中的文档数量。"""
+    async def count_index_docs(self, user_id: str, client_type: Optional[str] = None) -> int:
+        """返回指定索引（user_id）中的文档数量。client_type 非空时只统计该客户端。"""
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
@@ -321,13 +329,10 @@ class ChatHistoryStore:
             if not client:
                 return 0
 
-            full_index = f"{client.options.index_prefix}/{user_id}" if False else None
-            # 使用封装的 count_documents 方法如果可用
+            query: Optional[dict] = {"term": {"client_type": client_type}} if client_type else None
             try:
-                # ElasticsearchDatabase 提供了 count_documents
-                return await es_conn.count_documents(index=user_id)
+                return await es_conn.count_documents(index=user_id, query=query)
             except Exception:
-                # 回退：直接使用底层 client
                 try:
                     resp = client.count(index=f"{es_conn.index_prefix}_{user_id}")
                     return int(resp.get('count', 0))
