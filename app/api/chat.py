@@ -158,6 +158,28 @@ async def stream_message(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+@router.post("/cancel")
+async def cancel_stream(
+    request: Request,
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+    engine = Depends(get_hermes_engine),
+):
+    """终止当前用户正在进行的流式对话，并丢弃本轮未保存的内容（恢复到上一次对话状态）。
+
+    前端在用户点击"停止"按钮时调用此接口。
+    服务端设置取消信号 → stream 生成器在下一个检查点停止 → 本轮不写入存储层。
+    """
+    ResponseHeaders().apply(response)
+    user_id = current_user["user_id"]
+    cancelled = engine.request_cancel(user_id)
+    return {
+        "cancelled": cancelled,
+        "user_id":   user_id,
+        "message":   "取消信号已发送" if cancelled else "当前无活跃流式对话",
+    }
+
+
 @router.get("/history")
 async def get_chat_history(
     request: Request,

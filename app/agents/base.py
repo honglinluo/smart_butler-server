@@ -136,6 +136,13 @@ class BaseAgent:
                 _f: Any = _orig,
             ) -> Dict[str, Any]:
                 try:
+                    from app.skills.loader import load_skills_text
+                    file_skills = await load_skills_text(self.name)
+                    if isinstance(context, dict) and file_skills:
+                        context["_file_skills"] = file_skills
+                except Exception:
+                    pass
+                try:
                     return await _f(self, task, context, llm)
                 finally:
                     self._record_call()
@@ -267,11 +274,19 @@ class BaseAgent:
             return {"result": "LLM 未配置，无法执行任务", "success": False, "metadata": {}}
 
         try:
+            try:
+                from app.skills.loader import load_skills_text
+                file_skills = await load_skills_text(self.name)
+                if isinstance(context, dict) and file_skills:
+                    context["_file_skills"] = file_skills
+            except Exception:
+                pass
             await self.load_skills()
             system_prompt = self._build_system_prompt(context=context)
             task_desc     = task.get("description", "")
             user_id       = context.get("user_id", self.user_id) if isinstance(context, dict) else self.user_id
             lc_tools      = self.collect_tools(user_id)
+            extra_ctx     = self._build_context_messages(context)
 
             # 注入历史上下文（最近 5 轮）
             history_lines = []
@@ -289,6 +304,7 @@ class BaseAgent:
             if len(task_desc) >= self._L2_DECOMPOSE_THRESHOLD:
                 result_text, l2_meta = await self._execute_with_l2(
                     task_desc, user_id, lc_tools, system_prompt, history_lines, llm, context,
+                    extra_messages=extra_ctx,
                 )
             else:
                 human_content = task_desc
@@ -296,6 +312,7 @@ class BaseAgent:
                     human_content = "历史对话:\n" + "\n".join(history_lines) + "\n\n当前任务:\n" + task_desc
                 result_text = await self._invoke_with_tools(
                     llm, system_prompt, human_content, lc_tools, user_id=user_id,
+                    extra_messages=extra_ctx,
                 )
                 l2_meta = {}
 
@@ -303,6 +320,7 @@ class BaseAgent:
             get_bus().llm_output(
                 user_id, self.name, result_text, (time.monotonic() - t0) * 1000,
             )
+            await self.update_skill(task_desc[:50], result_text, success=True)
             logger.debug("Agent 执行完成: name=%s tools=%d task_len=%d",
                          self.name, len(lc_tools), len(task_desc))
             return {
@@ -320,13 +338,14 @@ class BaseAgent:
 
     async def _execute_with_l2(
         self,
-        task_desc:     str,
-        user_id:       str,
-        lc_tools:      List[LCBaseTool],
-        system_prompt: str,
-        history_lines: List[str],
-        llm:           Any,
-        context:       Dict[str, Any],
+        task_desc:      str,
+        user_id:        str,
+        lc_tools:       List[LCBaseTool],
+        system_prompt:  str,
+        history_lines:  List[str],
+        llm:            Any,
+        context:        Dict[str, Any],
+        extra_messages: Optional[list] = None,
     ) -> tuple:
         """L2 拆分后逐步执行，返回 (最终结果文字, l2 元数据字典)。
 
@@ -355,7 +374,9 @@ class BaseAgent:
             human_content = task_desc
             if history_lines:
                 human_content = "历史对话:\n" + "\n".join(history_lines) + "\n\n当前任务:\n" + task_desc
-            result = await self._invoke_with_tools(llm, system_prompt, human_content, lc_tools)
+            result = await self._invoke_with_tools(
+                llm, system_prompt, human_content, lc_tools, extra_messages=extra_messages,
+            )
             return result, {"l2_steps": 0, "l2_fallback": True}
 
         logger.info("[L2] agent=%s 任务已拆分为 %d 步", self.name, len(steps))
@@ -364,6 +385,8 @@ class BaseAgent:
         completed_ids: List[str] = []
         failed_ids:    List[str] = []
 
+        from app.utils import progress_bus as _pb
+
         for step in steps:
             if step.status == TaskStatus.BLOCKED:
                 # 依赖未完成，跳过（不应发生，_recompute_blocked 已处理）
@@ -371,6 +394,11 @@ class BaseAgent:
                 continue
 
             await store.set_status(step.task_id, TaskStatus.IN_PROGRESS)
+            _pb.push("step_start", {
+                "agent_name":  self.name,
+                "step_id":     step.task_id,
+                "description": step.content[:120],
+            })
 
             # 构建单步输入
             prev_context = "\n".join(step_results[-3:])   # 最近 3 步结果作为上下文
@@ -390,6 +418,7 @@ class BaseAgent:
                 try:
                     step_result = await self._invoke_with_tools(
                         llm, system_prompt, step_input, lc_tools, user_id=user_id,
+                        extra_messages=extra_messages,
                     )
                     step_ok = True
                     break
@@ -400,6 +429,13 @@ class BaseAgent:
                     )
                     if attempt + 1 == attempts:
                         step_result = f"[步骤失败: {exc}]"
+
+            _pb.push("step_done", {
+                "agent_name": self.name,
+                "step_id":    step.task_id,
+                "success":    step_ok,
+                "result":     step_result[:150] if step_ok else "",
+            })
 
             if step_ok:
                 await store.set_status(step.task_id, TaskStatus.COMPLETED)
@@ -426,6 +462,7 @@ class BaseAgent:
         )
         final_result = await self._invoke_with_tools(
             llm, system_prompt, summary_input, lc_tools, user_id=user_id,
+            extra_messages=extra_messages,
         )
 
         return final_result, {
@@ -436,18 +473,19 @@ class BaseAgent:
 
     async def _invoke_with_tools(
         self,
-        llm:           Any,
-        system_prompt: str,
-        human_content: str,
-        lc_tools:      List[LCBaseTool],
-        user_id:       str = "",
+        llm:            Any,
+        system_prompt:  str,
+        human_content:  str,
+        lc_tools:       List[LCBaseTool],
+        user_id:        str = "",
+        extra_messages: Optional[list] = None,
     ) -> str:
         """统一的 LLM 调用入口，按工具可用情况选择最优执行策略。
 
         策略优先级：
           1. 有工具 + LangGraph 可用 → create_react_agent（完整 ReAct 循环）
           2. 有工具 + 无 LangGraph   → bind_tools 手动单轮工具调用
-          3. 无工具                   → 直接 ainvoke
+          3. 无工具                   → 直接 ainvoke（extra_messages 注入在此路径生效）
         """
         from app.utils.log_bus import get_bus
         bus = get_bus()
@@ -458,11 +496,12 @@ class BaseAgent:
         )
 
         if not lc_tools:
-            resp = await llm.ainvoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=human_content),
-            ])
-            return resp.content if hasattr(resp, "content") else str(resp)
+            msgs: list = [SystemMessage(content=system_prompt)]
+            if extra_messages:
+                msgs.extend(extra_messages)
+            msgs.append(HumanMessage(content=human_content))
+            resp = await llm.ainvoke(msgs)
+            return resp.content
 
         if _HAS_LANGGRAPH and _create_react_agent is not None:
             return await self._run_react_agent(llm, system_prompt, human_content, lc_tools, user_id=uid)
@@ -485,7 +524,7 @@ class BaseAgent:
         output = await graph.ainvoke({"messages": [HumanMessage(content=human_content)]})
         msgs   = output.get("messages", [])
         final  = msgs[-1] if msgs else None
-        return final.content if (final and hasattr(final, "content")) else str(final)
+        return final.content if final else ""
 
     async def _run_bind_tools(
         self,
@@ -544,7 +583,7 @@ class BaseAgent:
                 messages.append(ToolMessage(content=str(output), tool_call_id=call_id))
 
         final = messages[-1]
-        return final.content if hasattr(final, "content") else str(final)
+        return final.content
 
     def _load_background_from_template(self) -> None:
         """在 config/templates/{name}.txt 中查找背景模板，找到则覆盖 self.background。
@@ -593,6 +632,10 @@ class BaseAgent:
             parts.append(skills_ctx)
 
         if isinstance(context, dict):
+            file_skills_ctx = context.get("_file_skills", "")
+            if file_skills_ctx:
+                parts.append("")
+                parts.append(str(file_skills_ctx))
             env_block = format_env_for_prompt(
                 context.get("_client_type"), context.get("_client_version")
             )
@@ -605,6 +648,10 @@ class BaseAgent:
                 parts.append(str(profile_block))
 
         return "\n".join(parts) or "你是一个智能助手。"
+
+    def _build_context_messages(self, context: Dict[str, Any]) -> list:
+        """子类重写此方法，返回额外的上下文 Message 列表（注入在 HumanMessage 之前）。"""
+        return []
 
     # ── 技能记忆系统 ────────────────────────────────────────────────
 

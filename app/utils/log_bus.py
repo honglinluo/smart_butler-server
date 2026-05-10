@@ -218,6 +218,8 @@ class HermesLogger:
                 "tool_args":  str(args)[:300],
             },
         )
+        from app.utils.progress_bus import push as _pb
+        _pb("tool_call", {"agent_name": agent_name, "tool_name": tool_name, "args": str(args)[:200]})
 
     def tool_result(
         self,
@@ -241,6 +243,13 @@ class HermesLogger:
                 **({"elapsed_ms": round(elapsed_ms, 1)} if elapsed_ms is not None else {}),
             },
         )
+        from app.utils.progress_bus import push as _pb
+        _pb("tool_result", {
+            "agent_name": agent_name,
+            "tool_name":  tool_name,
+            "result":     result[:300],
+            **({"elapsed_ms": round(elapsed_ms, 1)} if elapsed_ms is not None else {}),
+        })
 
     def tool_error(
         self,
@@ -261,6 +270,8 @@ class HermesLogger:
                 "error":      error[:300],
             },
         )
+        from app.utils.progress_bus import push as _pb
+        _pb("tool_error", {"agent_name": agent_name, "tool_name": tool_name, "error": error[:300]})
 
 
 # ── 模块级单例 ────────────────────────────────────────────────────────────────

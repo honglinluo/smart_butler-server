@@ -45,6 +45,7 @@ except ImportError:
     create_react_agent = None
 
 from app.agents.router import RouterAgent
+from app.agents.base import _RegistryToolAdapter
 from app.core.config_loader import ConfigLoader
 from app.database.pool import get_connection, release_connection
 from app.core.chat_history_store import ChatHistoryStore
@@ -197,47 +198,6 @@ class LangChainToolWrapper(BaseTool):
         if inspect.iscoroutinefunction(self.tool_func):
             return await self.tool_func(*args, **kwargs)
         return self.tool_func(*args, **kwargs)
-
-
-class RegistryToolAdapter(BaseTool):
-    """将 app.tools.base.BaseTool（registry 工具）适配为 LangChain Tool。
-
-    LangGraph 调用工具时以 kwargs 形式传入参数；适配层将其封装为
-    (params, context) 后调用 BaseTool.execute()，结果序列化为字符串返回。
-    """
-
-    def __init__(self, registry_tool: Any, user_id: str, agent_name: str = ""):
-        super().__init__()
-        self.name        = registry_tool.name
-        self.description = registry_tool.description or f"Tool: {registry_tool.name}"
-        self._registry_tool = registry_tool
-        self._user_id    = user_id
-        self._agent_name = agent_name
-
-    def _run(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError("RegistryToolAdapter must be called via _arun in async context")
-
-    async def _arun(self, *args: Any, **kwargs: Any) -> Any:
-        import json as _json
-        # LangGraph 以 kwargs 传入；无 schema 时 LangChain 可能以单字符串传入
-        if args and isinstance(args[0], str) and not kwargs:
-            try:
-                params = _json.loads(args[0])
-            except Exception:
-                params = {"input": args[0]}
-        else:
-            params = dict(kwargs)
-
-        context = {"user_id": self._user_id, "agent_name": self._agent_name}
-        try:
-            result = await self._registry_tool.execute(params, context)
-            if isinstance(result, dict):
-                return _json.dumps(result, ensure_ascii=False)
-            return str(result)
-        except Exception as e:
-            logger.warning("[RegistryToolAdapter] %s 执行失败 user=%s: %s",
-                           self.name, self._user_id, e)
-            return f"工具 {self.name} 执行失败: {e}"
 
 
 @dataclass
@@ -516,6 +476,10 @@ class HermesEngine:
         self.agent_graphs: Dict[str, Any] = {}  # LangGraph 代理图缓存
         # 聊天记录存储
         self.chat_history = ChatHistoryStore()
+        # 流式取消信号（每用户一个 Event）
+        self._cancel_signals: Dict[str, asyncio.Event] = {}
+        # 已取消的 turn_id 集合（阻止 _save_turn_async 写入）
+        self._cancelled_turns: set = set()
         # 上下文管理器（兼容保留；主链路已由 RagPipeline 取代）
         self.context_manager: Optional[ContextManager] = None
         # 记忆管理器（由 set_memory_manager() 注入）
@@ -1038,7 +1002,7 @@ class HermesEngine:
     def clear_llm_cache(self, user_id: Optional[str] = None) -> None:
         """
         清空 LLM 缓存
-        
+
         Args:
             user_id: 指定用户 ID，如果为 None 则清空所有缓存
         """
@@ -1049,6 +1013,22 @@ class HermesEngine:
         else:
             self.llm_cache.clear()
             logger.info("已清空所有 LLM 缓存")
+
+    def request_cancel(self, user_id: str) -> bool:
+        """请求终止用户当前进行中的流式对话。
+
+        设置取消信号后，stream 生成器将在下一个检查点停止，
+        并阻止本轮对话写入存储层（实现"恢复到上一次对话状态"）。
+
+        Returns:
+            bool: True 表示有活跃流且已发送取消信号，False 表示无活跃流。
+        """
+        ev = self._cancel_signals.get(user_id)
+        if ev is not None:
+            ev.set()
+            logger.info("已发送取消信号 user=%s", user_id)
+            return True
+        return False
 
     async def call_tool(self, tool_name: str, **kwargs) -> Any:
         """
@@ -1127,7 +1107,7 @@ class HermesEngine:
         for t in available:
             if t.exec_location != EXEC_SERVER:
                 continue
-            adapters.append(RegistryToolAdapter(t, user_id=user_id, agent_name=agent_name))
+            adapters.append(_RegistryToolAdapter(t, user_id=user_id, agent_name=agent_name))
         return adapters
 
     def _get_agent_executor_cache(self, user_id: str) -> AgentExecutorCache:
@@ -1568,15 +1548,21 @@ class HermesEngine:
         llm=None,
         agent_name: Optional[str] = None,
     ):
-        """
-        流式处理用户输入，yield SSE 格式事件字符串。
+        """流式处理用户输入，yield SSE 格式事件字符串。
 
-        event: routing   — 路由决策完成
-        event: token     — LLM token 块
-        event: done      — 全部完成
-        event: error     — 发生错误
+        新增事件类型（在原有 routing/token/done/error 基础上）：
+          planning     — 路由完成，返回完整 pipeline 计划
+          agent_start  — 某 Agent 开始执行
+          step_start   — Agent 内部 L2 子步骤开始
+          step_done    — Agent 内部 L2 子步骤完成
+          tool_call    — 工具调用开始
+          tool_result  — 工具调用成功
+          tool_error   — 工具调用失败
+          agent_done   — Agent 执行完成
+          cancelled    — 对话已被前端终止
         """
         import json as _json
+        from app.utils import progress_bus as _pb
 
         if self.router_agent is None:
             yield 'event: error\ndata: {"message": "Router not initialized"}\n\n'
@@ -1588,110 +1574,196 @@ class HermesEngine:
             yield 'event: error\ndata: {"message": "LLM unavailable"}\n\n'
             return
 
-        try:
-            from app.utils.log_bus import get_bus as _get_bus
-            _bus = _get_bus()
-            _ctx_pre = context if isinstance(context, dict) else {}
-            _bus.user_message(user_id, user_input, _ctx_pre.get("_client_type", "api"))
+        # ── 取消信号（每用户一个 Event，每次请求重置） ──────────────────────────
+        cancel_ev = self._cancel_signals.setdefault(user_id, asyncio.Event())
+        cancel_ev.clear()
 
-            turn_id = uuid.uuid4().hex
+        # ── 进度队列：所有进度事件（含 token）均经此队列流出 ─────────────────────
+        q: asyncio.Queue = asyncio.Queue(maxsize=500)
+        _pb.set_queue(q)   # ContextVar 在当前 coroutine 及其 child-task 中均可见
 
-            _rag_source = self.rag_pipeline or self.context_manager
-            if _rag_source is not None:
-                try:
-                    bundle  = await _rag_source.build_context(
-                        user_id=user_id, user_input=user_input,
-                        base_context=context if isinstance(context, dict) else {},
-                    )
-                    context = bundle.to_prompt_context()
-                    _bus.context_built(
-                        user_id, len(bundle.history), len(bundle.memories),
-                        (context if isinstance(context, dict) else {}).get("_client_type", ""),
-                    )
-                except Exception as e:
-                    logger.warning("RAG build_context 失败，使用原始 context [stream]: %s", e)
+        turn_id = uuid.uuid4().hex
 
-            # 上下文长度检查（流式版本）
-            if self.memory_manager is not None:
-                ctx_chars = self._estimate_context_length(context)
-                ctx_limit = getattr(self.memory_manager, "context_length_limit", 20_000)
-                if ctx_chars > ctx_limit:
-                    logger.info(
-                        f"[stream] 上下文过长 {ctx_chars}/{ctx_limit} chars，"
-                        f"立即触发记忆压缩 user={user_id}"
-                    )
-                    asyncio.create_task(
-                        self.memory_manager.compress_immediately(user_id, "context_overflow")
-                    )
+        # ── 后台处理任务：执行完整 pipeline 并将所有事件放入队列 ─────────────────
+        async def _run() -> None:
+            try:
+                from app.utils.log_bus import get_bus as _get_bus
+                _bus = _get_bus()
+                _ctx_pre = context if isinstance(context, dict) else {}
+                _bus.user_message(user_id, user_input, _ctx_pre.get("_client_type", "api"))
 
-            # 加载用户画像到 context，供子 Agent 系统提示注入
-            if isinstance(context, dict) and self.memory_manager is not None:
-                if "_user_profile" not in context:
+                # ── RAG 上下文组装 ──────────────────────────────────────────────
+                ctx = context
+                _rag_source = self.rag_pipeline or self.context_manager
+                if _rag_source is not None:
                     try:
-                        profile_block = await self.memory_manager.build_system_prompt_block(user_id)
-                        if profile_block:
-                            context["_user_profile"] = profile_block
-                    except Exception as _pe:
-                        logger.debug("[stream] 预加载用户画像失败 user=%s: %s", user_id, _pe)
+                        bundle = await _rag_source.build_context(
+                            user_id=user_id, user_input=user_input,
+                            base_context=ctx if isinstance(ctx, dict) else {},
+                        )
+                        ctx = bundle.to_prompt_context()
+                        _bus.context_built(
+                            user_id, len(bundle.history), len(bundle.memories),
+                            (ctx if isinstance(ctx, dict) else {}).get("_client_type", ""),
+                        )
+                    except Exception as e:
+                        logger.warning("RAG build_context 失败 [stream]: %s", e)
 
-            router_result = await self.router_agent.process(user_input, context, llm=llm)
-            intent       = router_result.get("intent", "general_question")
-            mode         = router_result.get("mode", "single")
-            pipeline     = router_result.get("pipeline", [])
-            tasks        = router_result.get("tasks", [])
-            target_agent = router_result.get("target_agent") or self.router_agent.name
+                # 上下文长度检查
+                if self.memory_manager is not None:
+                    ctx_chars = self._estimate_context_length(ctx)
+                    ctx_limit = getattr(self.memory_manager, "context_length_limit", 20_000)
+                    if ctx_chars > ctx_limit:
+                        asyncio.create_task(
+                            self.memory_manager.compress_immediately(user_id, "context_overflow")
+                        )
 
-            if agent_name:
-                override_ag = await self._get_or_load_agent(agent_name, user_id)
-                if override_ag:
-                    pipeline     = [{"step": 0, "agent_name": agent_name,
-                                     "task": {"task_id": "task_1", "type": intent,
-                                              "description": user_input}}]
-                    mode         = "single"
-                    target_agent = agent_name
+                # 加载用户画像
+                if isinstance(ctx, dict) and self.memory_manager is not None:
+                    if "_user_profile" not in ctx:
+                        try:
+                            pb = await self.memory_manager.build_system_prompt_block(user_id)
+                            if pb:
+                                ctx["_user_profile"] = pb
+                        except Exception as _pe:
+                            logger.debug("[stream] 预加载用户画像失败 user=%s: %s", user_id, _pe)
 
-            _bus.routing(user_id, intent, mode, target_agent, len(pipeline))
+                # ── 路由 ────────────────────────────────────────────────────────
+                if cancel_ev.is_set():
+                    q.put_nowait({"event": "cancelled", "data": {"turn_id": turn_id}})
+                    return
+
+                router_result = await self.router_agent.process(user_input, ctx, llm=llm)
+                intent        = router_result.get("intent", "general_question")
+                mode          = router_result.get("mode", "single")
+                pipeline      = router_result.get("pipeline", [])
+                tasks         = router_result.get("tasks", [])
+                target_agent  = router_result.get("target_agent") or self.router_agent.name
+
+                if agent_name:
+                    override_ag = await self._get_or_load_agent(agent_name, user_id)
+                    if override_ag:
+                        pipeline     = [{"step": 0, "agent_name": agent_name,
+                                         "task": {"task_id": "task_1", "type": intent,
+                                                  "description": user_input}}]
+                        mode         = "single"
+                        target_agent = agent_name
+
+                _bus.routing(user_id, intent, mode, target_agent, len(pipeline))
+
+                # planning 事件：完整 pipeline 计划
+                q.put_nowait({"event": "planning", "data": {
+                    "intent":  intent,
+                    "mode":    mode,
+                    "agent":   target_agent,
+                    "pipeline": [
+                        {
+                            "step":        p["step"],
+                            "agent_name":  p["agent_name"],
+                            "description": (p.get("task") or {}).get("description", "")[:100],
+                        }
+                        for p in pipeline
+                    ],
+                }})
+
+                # ── Pipeline 执行 ────────────────────────────────────────────────
+                if cancel_ev.is_set():
+                    self._cancelled_turns.add(turn_id)
+                    q.put_nowait({"event": "cancelled", "data": {"turn_id": turn_id}})
+                    return
+
+                dispatch_id = turn_id
+                await self._dispatch_to_redis(user_id, dispatch_id, pipeline, mode, intent, user_input)
+
+                agent_outputs: List[Dict[str, str]] = []
+                if pipeline and target_agent != self.router_agent.name:
+                    pipeline_response, agent_outputs = await self._execute_pipeline(
+                        pipeline=pipeline, mode=mode, intent=intent,
+                        user_id=user_id, llm=llm, context=ctx,
+                        dispatch_id=dispatch_id, user_input=user_input,
+                    )
+                else:
+                    pipeline_response = ""
+
+                # ── 最终 LLM 流式输出 ─────────────────────────────────────────────
+                if cancel_ev.is_set():
+                    self._cancelled_turns.add(turn_id)
+                    q.put_nowait({"event": "cancelled", "data": {"turn_id": turn_id}})
+                    return
+
+                full_response_parts: List[str] = []
+                scrubber = StreamingContextScrubber()
+
+                if pipeline_response:
+                    # 有 pipeline 结果：流式综合为最终回复
+                    ctx_with_result = dict(ctx) if isinstance(ctx, dict) else {}
+                    ctx_with_result["_pipeline_result"] = pipeline_response
+                    stream_gen = self._generate_llm_response_stream(
+                        llm=llm, user_id=user_id, user_input=user_input,
+                        intent=intent, tasks=tasks, context=ctx_with_result,
+                        agent_name=target_agent,
+                    )
+                else:
+                    # 无 pipeline（Router 自处理）：直接流式回复
+                    stream_gen = self._generate_llm_response_stream(
+                        llm=llm, user_id=user_id, user_input=user_input,
+                        intent=intent, tasks=tasks, context=ctx,
+                        agent_name=target_agent,
+                    )
+
+                async for chunk in stream_gen:
+                    if cancel_ev.is_set():
+                        break
+                    visible = scrubber.feed(chunk)
+                    if visible:
+                        full_response_parts.append(visible)
+                        q.put_nowait({"event": "token", "data": {"text": visible}})
+
+                trailing = scrubber.flush()
+                if trailing and not cancel_ev.is_set():
+                    full_response_parts.append(trailing)
+                    q.put_nowait({"event": "token", "data": {"text": trailing}})
+
+                if cancel_ev.is_set():
+                    self._cancelled_turns.add(turn_id)
+                    q.put_nowait({"event": "cancelled", "data": {"turn_id": turn_id}})
+                    return
+
+                full_response = "".join(full_response_parts) or pipeline_response
+                _bus.llm_output(user_id, target_agent, full_response)
+
+                # 异步保存（_save_turn_async 会检查 _cancelled_turns 再决定是否写入）
+                _sctx = ctx if isinstance(ctx, dict) else {}
+                asyncio.create_task(self._save_turn_async(
+                    user_id=user_id, user_input=user_input,
+                    response=full_response, turn_id=turn_id,
+                    intent=intent, target_agent=target_agent,
+                    tasks=tasks, mode=mode, pipeline=pipeline,
+                    client_type=_sctx.get("_client_type", ""),
+                    client_version=_sctx.get("_client_version", ""),
+                ))
+
+                q.put_nowait({"event": "done", "data": {"turn_id": turn_id}})
+
+            except Exception as e:
+                logger.error("流式处理失败 user=%s: %s", user_id, e, exc_info=True)
+                q.put_nowait({"event": "error", "data": {"message": str(e)}})
+            finally:
+                self._cancel_signals.pop(user_id, None)
+                q.put_nowait(None)  # 哨兵：通知生成器退出
+
+        # 后台任务继承当前 context（含 ContextVar 进度队列）
+        asyncio.create_task(_run())
+
+        # ── 消费进度队列，按序 yield SSE 事件 ─────────────────────────────────
+        while True:
+            item = await q.get()
+            if item is None:
+                break
             yield (
-                f'event: routing\n'
-                f'data: {_json.dumps({"intent": intent, "mode": mode, "agent": target_agent}, ensure_ascii=False)}\n\n'
+                f'event: {item["event"]}\n'
+                f'data: {_json.dumps(item["data"], ensure_ascii=False)}\n\n'
             )
-
-            full_response_parts: List[str] = []
-            scrubber   = StreamingContextScrubber()  # 剔除 LLM 可能回显的 <memory-context> 块
-            stream_gen = self._generate_llm_response_stream(
-                llm=llm, user_id=user_id, user_input=user_input,
-                intent=intent, tasks=tasks, context=context, agent_name=target_agent,
-            )
-            async for chunk in stream_gen:
-                visible = scrubber.feed(chunk)
-                if visible:
-                    full_response_parts.append(visible)
-                    yield f'event: token\ndata: {_json.dumps({"text": visible}, ensure_ascii=False)}\n\n'
-            # 刷出缓冲区尾部
-            trailing = scrubber.flush()
-            if trailing:
-                full_response_parts.append(trailing)
-                yield f'event: token\ndata: {_json.dumps({"text": trailing}, ensure_ascii=False)}\n\n'
-
-            full_response = "".join(full_response_parts)
-            _bus.llm_output(user_id, target_agent, full_response)
-
-            _sctx = context if isinstance(context, dict) else {}
-            # 异步保存到存储层（不阻塞流）
-            asyncio.create_task(self._save_turn_async(
-                user_id=user_id, user_input=user_input,
-                response=full_response, turn_id=turn_id,
-                intent=intent, target_agent=target_agent,
-                tasks=tasks, mode=mode, pipeline=pipeline,
-                client_type=_sctx.get("_client_type", ""),
-                client_version=_sctx.get("_client_version", ""),
-            ))
-
-            yield f'event: done\ndata: {_json.dumps({"turn_id": turn_id}, ensure_ascii=False)}\n\n'
-
-        except Exception as e:
-            logger.error(f"流式处理失败 user={user_id}: {e}", exc_info=True)
-            yield f'event: error\ndata: {_json.dumps({"message": str(e)}, ensure_ascii=False)}\n\n'
 
     async def _save_turn_async(
         self,
@@ -1700,7 +1772,11 @@ class HermesEngine:
         tasks: list, mode: str, pipeline: list,
         client_type: str = "", client_version: str = "",
     ) -> None:
-        """后台保存对话轮次到 ES 和 MemoryManager。"""
+        """后台保存对话轮次到 ES 和 MemoryManager。取消的轮次直接跳过。"""
+        if turn_id in self._cancelled_turns:
+            self._cancelled_turns.discard(turn_id)
+            logger.info("对话已取消，跳过存档 user=%s turn_id=%s", user_id, turn_id)
+            return
         turn_metadata = {
             "intent": intent, "target_agent": target_agent,
             "tasks": tasks, "mode": mode,
@@ -1915,6 +1991,11 @@ class HermesEngine:
         返回: (merged_response, agent_outputs)
           agent_outputs 格式供向量切片使用：[{"agent_name": ..., "output": ...}]
         """
+        from app.utils import progress_bus as _pb
+
+        for step in pipeline:
+            _pb.push("agent_start", {"step": step["step"], "agent_name": step["agent_name"]})
+
         coros = [
             self._execute_agent_instance(step["agent_name"], step["task"], context, llm, user_id)
             for step in pipeline
@@ -1926,6 +2007,11 @@ class HermesEngine:
             if isinstance(r, Exception):
                 r = f"执行出错: {r}"
             result_dicts.append({"agent": step["agent_name"], "result": str(r)})
+            _pb.push("agent_done", {
+                "step":           step["step"],
+                "agent_name":     step["agent_name"],
+                "result_preview": str(r)[:150],
+            })
             is_last = (step["step"] == pipeline[-1]["step"])
             await self._update_dispatch_step(
                 user_id, dispatch_id, step["step"], "done", str(r), is_last
@@ -1961,15 +2047,23 @@ class HermesEngine:
         返回: (last_result, agent_outputs)
           agent_outputs 包含每一步的输出，供向量切片各步独立索引（req 2）。
         """
+        from app.utils import progress_bus as _pb
+
         accumulated   = dict(context)
         last_result   = ""
         agent_outputs: List[Dict[str, str]] = []
 
         for i, step in enumerate(pipeline):
+            _pb.push("agent_start", {"step": step["step"], "agent_name": step["agent_name"]})
             result  = await self._execute_agent_instance(
                 step["agent_name"], step["task"], accumulated, llm, user_id
             )
             is_last = (i == len(pipeline) - 1)
+            _pb.push("agent_done", {
+                "step":           step["step"],
+                "agent_name":     step["agent_name"],
+                "result_preview": result[:150],
+            })
             await self._update_dispatch_step(
                 user_id, dispatch_id, step["step"], "done", result, is_last
             )
@@ -2024,10 +2118,17 @@ class HermesEngine:
         if mode == "serial":
             return await self._execute_serial(pipeline, user_id, llm, context, dispatch_id)
         # single
+        from app.utils import progress_bus as _pb
         step   = pipeline[0]
+        _pb.push("agent_start", {"step": step["step"], "agent_name": step["agent_name"]})
         result = await self._execute_agent_instance(
             step["agent_name"], step["task"], context, llm, user_id
         )
+        _pb.push("agent_done", {
+            "step":           step["step"],
+            "agent_name":     step["agent_name"],
+            "result_preview": result[:150],
+        })
         await self._update_dispatch_step(user_id, dispatch_id, step["step"], "done", result, True)
         return result, [{"agent_name": step["agent_name"], "output": result}]
 
