@@ -20,7 +20,7 @@ from app.core.memory_manager import MemoryManager
 from app.core.vector_store import VectorStore
 from app.rag import RagPipeline
 from app.database.pool import initialize_pools, close_all_pools, get_connection, release_connection
-from app.api import auth, models, chat, agents_api, tools_api, scheduler_api, decision_api, files_api
+from app.api import auth, models, chat, agents_api, tools_api, scheduler_api, decision_api, files_api, skills_api
 from app.api.dependencies import get_current_user
 from app.api.auth import _flush_profile_to_mysql
 from app.core.redis_keys import USER_INIT
@@ -61,8 +61,6 @@ async def _ensure_llms_table_has_embedding_type() -> None:
     conn = None
     try:
         conn = await get_connection("mysql", None)
-        if not conn:
-            return
         # 查询枚举定义
         df = await conn.execute_raw(
             "SELECT COLUMN_TYPE FROM information_schema.COLUMNS "
@@ -91,8 +89,6 @@ async def _get_db_embedding_config(system_user_id: str) -> dict:
     conn = None
     try:
         conn = await get_connection("mysql", None)
-        if not conn:
-            return {}
         # 兼容 llms 和 llm_info 两个可能的表名
         for table in ("llms", "llm_info"):
             try:
@@ -127,8 +123,6 @@ async def _upsert_db_embedding_config(
     conn = None
     try:
         conn = await get_connection("mysql", None)
-        if not conn:
-            return
         # 确保系统用户存在（user_id = "0"）
         await conn.execute_raw(
             "INSERT IGNORE INTO user (user_id, username, password) "
@@ -204,8 +198,10 @@ async def validate_embedding_config(config: dict, vs: VectorStore, rag=None) -> 
 
 async def _flush_all_profiles_on_shutdown() -> None:
     """程序关闭时将 Redis 中所有用户画像批量固化到 MySQL。"""
-    redis_conn = await get_connection("redis", None)
-    if not redis_conn:
+    redis_conn = None
+    try:
+        redis_conn = await get_connection("redis", None)
+    except Exception:
         logger.warning("[shutdown] Redis 不可用，跳过画像固化")
         return
 
@@ -266,6 +262,9 @@ async def lifespan(application: FastAPI):
         await initialize_pools(system_config.get('database', {}))
         logger.info("✅ 数据库连接池初始化成功")
 
+        # 2b. 数据库结构迁移（幂等，仅在枚举不包含时执行）
+        await _ensure_llms_table_has_embedding_type()
+
         # 3. 初始化记忆管理器
         memory_manager = MemoryManager(system_config)
         application.state.memory_manager = memory_manager
@@ -304,22 +303,30 @@ async def lifespan(application: FastAPI):
         else:
             logger.warning("⚠️  embedding.model_name 未配置，向量化功能关闭。")
 
-        # 7. 注册代码 Worker Agent 到 registry
+        # 7. 自动发现并注册 workers/ 目录下所有 Worker Agent 到 registry
         try:
+            import importlib
+            import inspect
+            import pkgutil
+            import app.agents.workers as _workers_pkg
+            from app.agents.base import BaseAgent as _BaseAgent
             from app.agents.registry import registry
-            from app.agents.workers import (
-                GeneralAssistantAgent, DataAnalystAgent,
-                CustomerSupportAgent, CodeAssistantAgent, SummarizerAgent,
-                SkillBuilderAgent,
-            )
-            for AgentCls in (
-                GeneralAssistantAgent, DataAnalystAgent,
-                CustomerSupportAgent, CodeAssistantAgent, SummarizerAgent,
-                SkillBuilderAgent,
-            ):
-                instance = AgentCls()
-                registry.register(instance)
-            logger.info("✅ 已注册 6 个 Worker Agent 到 registry")
+
+            _count = 0
+            for _importer, _modname, _ispkg in pkgutil.iter_modules(_workers_pkg.__path__):
+                try:
+                    _mod = importlib.import_module(f"app.agents.workers.{_modname}")
+                    for _clsname, _cls in inspect.getmembers(_mod, inspect.isclass):
+                        if (
+                            issubclass(_cls, _BaseAgent)
+                            and _cls is not _BaseAgent
+                            and _cls.__module__ == _mod.__name__
+                        ):
+                            registry.register(_cls())
+                            _count += 1
+                except Exception as _mod_err:
+                    logger.warning(f"⚠️  加载 Worker Agent 模块 '{_modname}' 失败: {_mod_err}")
+            logger.info(f"✅ 已自动注册 {_count} 个 Worker Agent 到 registry")
         except Exception as e:
             logger.warning(f"⚠️  注册 Worker Agent 失败（可忽略）: {e}")
 
@@ -414,6 +421,7 @@ app.include_router(tools_api.router)
 app.include_router(scheduler_api.router)
 app.include_router(decision_api.router)
 app.include_router(files_api.router)
+app.include_router(skills_api.router)
 
 
 @app.get("/health")

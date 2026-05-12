@@ -1,4 +1,21 @@
-"""配置加载模块 - 从 YAML 文件加载系统配置，敏感字段通过环境变量注入"""
+"""
+【模块说明】配置加载器 — 读取 YAML 配置文件并自动替换敏感信息
+
+系统的各种配置（数据库地址、API Key 等）存放在 config/system_config.yaml 中。
+但密码、密钥这类敏感信息不能直接写在文件里（防止泄露），
+所以配置文件里用 ${变量名} 占位符代替，实际值存在 .env 文件或系统环境变量里。
+
+本模块负责：
+  1. 读取 YAML 配置文件
+  2. 把配置里的 ${MYSQL_URL}、${REDIS_URL} 等占位符替换为真实的环境变量值
+  3. 提供统一接口让其他模块获取配置
+
+示例：
+  YAML 里写：url: "${MYSQL_URL}"
+  .env  里写：MYSQL_URL=mysql+pymysql://root:password@localhost/agent_db
+  加载后得到：url: "mysql+pymysql://root:password@localhost/agent_db"
+"""
+
 
 import os
 import re
@@ -10,7 +27,11 @@ from dotenv import load_dotenv
 
 
 class ConfigLoader:
-    """配置加载器，支持 ${ENV_VAR} 占位符替换和 .env 文件加载"""
+    """
+    配置加载器。
+    读取 config/ 目录下的 YAML 文件，并自动把 ${变量名} 替换为环境变量的实际值。
+    同时支持加载项目根目录的 .env 文件（不会覆盖系统已有的环境变量）。
+    """
 
     def __init__(self, config_dir: str = "config"):
         self.config_dir = Path(config_dir)

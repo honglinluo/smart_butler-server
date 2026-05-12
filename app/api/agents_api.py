@@ -1,4 +1,25 @@
-"""Agent 管理 API - 创建、查询、评分、重载"""
+"""
+【模块说明】AI 助手（Agent）管理 — 创建、查询、评分、重新加载
+
+这个文件负责管理系统中的 AI 助手（Agent）。Agent 是具备特定能力和职责的 AI 角色，
+例如"数据分析师 Agent"、"客服 Agent"、"代码助手 Agent"等。
+
+Agent 分为两类：
+  - 代码 Agent（source=code）：由开发者在代码中定义，功能稳定，全局共享
+  - 数据库 Agent（source=db）：由用户通过页面/API 创建，灵活自定义
+
+用户可以：
+  - 查看所有可用 Agent 列表（自己创建的 + 公开的）
+  - 创建自己的自定义 Agent（设置名称、职责、背景描述、可用工具）
+  - 修改或删除自己创建的 Agent
+  - 对其他人公开的 Agent 进行 1-5 星评分
+  - 查看自己 Agent 的评分通知（评分过低时提示优化）
+
+【评分告警】
+  当公开 Agent 收到 5 条以上评分且平均分低于 3.0 时，创建者会看到告警通知，
+  并推荐同类高分 Agent 供参考改进。
+"""
+
 
 import glob
 import importlib
@@ -27,6 +48,14 @@ _SCORE_MIN_RATINGS    = 5     # 至少有这么多评分才触发提醒
 # ── 请求 / 响应模型 ──────────────────────────────────────────────────────────
 
 class AgentCreate(BaseModel):
+    """
+    创建新 Agent 时提交的信息。
+    name：全局唯一的英文标识符，用下划线连接单词，如 data_analyst
+    role：职责简述，一句话说明这个 Agent 是做什么的，如"数据分析工程师"
+    background：详细的背景描述，会注入到 AI 的系统提示词中，影响 Agent 的行为风格
+    tools：该 Agent 可以使用的工具 ID 列表（空列表则不绑定特定工具）
+    is_public：是否公开给所有用户使用（默认私有，仅自己可调用）
+    """
     name:       str         = Field(..., description="Agent 唯一名称（英文下划线）")
     role:       str         = Field(..., description="职责简述，如「数据分析工程师」")
     background: str         = Field("", description="详细背景描述，注入系统提示词")
@@ -35,6 +64,7 @@ class AgentCreate(BaseModel):
 
 
 class AgentUpdate(BaseModel):
+    """修改 Agent 信息时提交的字段（不填则保持原值不变）。"""
     role:       Optional[str]       = None
     background: Optional[str]       = None
     tools:      Optional[List[str]] = None
@@ -42,6 +72,7 @@ class AgentUpdate(BaseModel):
 
 
 class AgentRating(BaseModel):
+    """对 Agent 进行评分时提交的信息。score 范围 1-5 星，comment 为可选文字评价。"""
     score:   int            = Field(..., ge=1, le=5, description="评分 1-5")
     comment: Optional[str]  = Field(None, description="评论（可选）")
 
@@ -49,13 +80,15 @@ class AgentRating(BaseModel):
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
 
 async def _load_db_agents_to_registry() -> int:
-    """从 MySQL 加载所有启用的 DB Agent 并注册到 registry，返回加载数量。"""
+    """
+    从数据库读取所有已启用的用户自定义 Agent，并加载到内存注册表中使其可被调用。
+    返回成功加载的 Agent 数量。
+    通常在服务启动或调用"重新加载"接口时执行。
+    """
     from app.agents.base import BaseAgent
     from app.agents.registry import registry
 
     conn = await get_connection("mysql", None)
-    if not conn:
-        return 0
     loaded = 0
     try:
         df = await conn.execute_raw(
@@ -91,10 +124,8 @@ async def _load_db_agents_to_registry() -> int:
 
 
 async def _get_agent_ratings(agent_name: str) -> dict:
-    """查询 Agent 的评分统计（平均分 + 评分数）。"""
+    """查询指定 Agent 的评分汇总：平均分（avg_score）和总评分条数（rating_count）。"""
     conn = await get_connection("mysql", None)
-    if not conn:
-        return {"avg_score": 0.0, "rating_count": 0}
     try:
         df = await conn.execute_raw(
             "SELECT AVG(score) AS avg_score, COUNT(*) AS rating_count "
@@ -118,7 +149,13 @@ async def _get_agent_ratings(agent_name: str) -> dict:
 
 @router.get("", response_model=dict)
 async def list_agents(response: Response, current_user: dict = Depends(get_current_user)):
-    """返回当前用户所有可用的 Agent 列表（代码 Agent + 公有/自有 DB Agent）。"""
+    """
+    获取当前用户可以使用的全部 Agent 列表，包括：
+      - 系统内置的代码 Agent（所有用户共用）
+      - 用户自己创建的私有 Agent
+      - 其他用户公开的 Agent
+    对公开的数据库 Agent 同时附带评分统计信息。
+    """
     ResponseHeaders().apply(response)
     from app.agents.registry import registry
     user_id = current_user["user_id"]
@@ -141,7 +178,10 @@ async def create_agent(
     response: Response,
     current_user: dict = Depends(get_current_user),
 ):
-    """通过 API 创建 DB Agent（支持文字描述方式）。"""
+    """
+    创建一个新的自定义 Agent，保存到数据库并立即在内存中注册（创建后即可使用）。
+    Agent 名称全局唯一，不可重复。
+    """
     ResponseHeaders().apply(response)
     from app.agents.base import BaseAgent
     from app.agents.registry import registry
@@ -156,8 +196,6 @@ async def create_agent(
         )
 
     conn = await get_connection("mysql", None)
-    if not conn:
-        raise HTTPException(status_code=500, detail="数据库连接失败")
 
     try:
         desc_json = json.dumps(
@@ -199,14 +237,12 @@ async def update_agent(
     response: Response,
     current_user: dict = Depends(get_current_user),
 ):
-    """更新 DB Agent（仅创建者可操作）。"""
+    """修改自定义 Agent 的职责、背景描述、工具绑定或公开状态。仅 Agent 的创建者有权修改。"""
     ResponseHeaders().apply(response)
     from app.agents.registry import registry
     user_id = current_user["user_id"]
 
     conn = await get_connection("mysql", None)
-    if not conn:
-        raise HTTPException(status_code=500, detail="数据库连接失败")
     try:
         df = await conn.execute_raw(
             "SELECT id, user_id, job, `desc`, `public` "
@@ -262,14 +298,15 @@ async def delete_agent(
     response: Response,
     current_user: dict = Depends(get_current_user),
 ):
-    """软删除 DB Agent（仅创建者可操作）。"""
+    """
+    删除自定义 Agent（软删除：把数据库中的 state 标记为 -1，数据不真正删除）。
+    同时从内存注册表中移除，立即生效。仅 Agent 的创建者有权删除。
+    """
     ResponseHeaders().apply(response)
     from app.agents.registry import registry
     user_id = current_user["user_id"]
 
     conn = await get_connection("mysql", None)
-    if not conn:
-        raise HTTPException(status_code=500, detail="数据库连接失败")
     try:
         df = await conn.execute_raw(
             "SELECT user_id FROM agents WHERE agent_name = :name AND state = 1",
@@ -297,7 +334,11 @@ async def rate_agent(
     response: Response,
     current_user: dict = Depends(get_current_user),
 ):
-    """对公有 Agent 进行评分（每个用户只能评一次，可覆盖）。"""
+    """
+    对其他人公开的 Agent 进行 1-5 星评分，可附文字评论。
+    每个用户对同一 Agent 只能评一次，重复提交会覆盖之前的评分。
+    创建者不能给自己的 Agent 评分，系统内置代码 Agent 不参与评分。
+    """
     ResponseHeaders().apply(response)
     from app.agents.registry import registry
     user_id = current_user["user_id"]
@@ -311,8 +352,6 @@ async def rate_agent(
         raise HTTPException(status_code=400, detail="创建者不能给自己的 Agent 评分")
 
     conn = await get_connection("mysql", None)
-    if not conn:
-        raise HTTPException(status_code=500, detail="数据库连接失败")
     try:
         await conn.execute_raw(
             "INSERT INTO agent_ratings (agent_name, user_id, score, comment, created_at) "
@@ -334,15 +373,17 @@ async def rate_agent(
 
 @router.get("/notifications/my", response_model=dict)
 async def get_my_notifications(response: Response, current_user: dict = Depends(get_current_user)):
-    """获取当前用户创建的公有 Agent 的低分提醒及同类高分推荐。"""
+    """
+    获取当前用户创建的公开 Agent 的评分告警通知。
+    当某个 Agent 评分数超过 5 且平均分低于 3.0 时，
+    系统会提醒创建者并推荐同类评分较高的 Agent 供参考改进。
+    """
     ResponseHeaders().apply(response)
     from app.agents.registry import registry
     user_id = current_user["user_id"]
 
     notifications = []
     conn = await get_connection("mysql", None)
-    if not conn:
-        return {"notifications": []}
     try:
         # 查询当前用户的公有 DB Agent
         df = await conn.execute_raw(

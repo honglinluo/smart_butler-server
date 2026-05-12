@@ -1,4 +1,15 @@
-"""摘要 Agent — 对话压缩、月度归档、年度归档
+"""
+【模块说明】摘要 Agent（SummarizerAgent）— 把长对话压缩成精华摘要
+
+随着对话越来越长，记忆占用越来越多。这个 Agent 负责把大量历史对话"压缩"成摘要，
+保留关键信息的同时减少存储量。
+
+【三种摘要模式】
+  summarize_conversation() — 日常压缩：把若干轮对话压缩成一段结构化摘要
+  summarize_monthly()      — 月度归档：把一整个月的历史摘要合并成月度总结
+  summarize_yearly()       — 年度归档：把一整年的月度摘要合并成年度总结
+
+摘要 Agent — 对话压缩、月度归档、年度归档
 
 三种摘要模式，均输出固定结构，方便后续检索和处理：
   summarize_conversation()  — 常规压缩：N 轮 → 结构化摘要（不保留上下文）
@@ -210,20 +221,8 @@ def _build_time_range(turns: List[Dict[str, Any]]) -> tuple[str, str]:
     ),
 )
 class SummarizerAgent(BaseAgent):
-
-    async def execute(self, task: dict, context: dict, llm) -> dict:
-        """通用摘要任务执行。"""
-        await self.load_skills()
-        messages = [SystemMessage(content=self._build_system_prompt())]
-        description = task.get("description", "")
-        messages.append(HumanMessage(content=f"请对以下内容进行摘要：\n\n{description}"))
-        try:
-            result  = await llm.ainvoke(messages)
-            summary = result.content if hasattr(result, "content") else str(result)
-            await self.update_skill(description[:50], summary, success=True)
-            return {"result": summary, "success": True, "metadata": {"agent": self.name}}
-        except Exception as e:
-            return {"result": f"摘要失败: {e}", "success": False, "metadata": {}}
+    # 禁止 L2 拆分：任务描述本身就是待摘要的内容，不应被分步执行
+    _L2_DECOMPOSE_THRESHOLD: int = 999_999
 
     # ══════════════════════════════════════════════════════════════
     # 常规压缩（replace-all，不保留原始上下文）
@@ -274,7 +273,7 @@ class SummarizerAgent(BaseAgent):
                 SystemMessage(content=_COMPRESS_SYSTEM),
                 HumanMessage(content=human_content),
             ])
-            body = result.content if hasattr(result, "content") else str(result)
+            body = result.content
             # 在结构化正文前加元数据头，方便后续解析
             header = (
                 f"<!-- summary_meta: turns={len(turns)} "
@@ -329,7 +328,7 @@ class SummarizerAgent(BaseAgent):
                 SystemMessage(content=_MONTHLY_SYSTEM),
                 HumanMessage(content=human_content),
             ])
-            body = result.content if hasattr(result, "content") else str(result)
+            body = result.content
             header = (
                 f"<!-- monthly_meta: year={year} month={month:02d} "
                 f"turn_count={actual_count} -->\n"
@@ -392,7 +391,7 @@ class SummarizerAgent(BaseAgent):
                 SystemMessage(content=_YEARLY_SYSTEM),
                 HumanMessage(content=human_content),
             ])
-            body = result.content if hasattr(result, "content") else str(result)
+            body = result.content
             header = (
                 f"<!-- yearly_meta: year={year} "
                 f"turn_count={actual_count} active_months={actual_months} -->\n"

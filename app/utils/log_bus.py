@@ -1,4 +1,24 @@
-"""Hermes 流水线日志总线
+"""
+【模块说明】流水线日志总线（HermesLogger）— AI 处理过程的结构化彩色日志
+
+这个模块记录 AI 处理每条用户消息的完整过程日志，方便开发者和运维人员观察系统行为。
+
+【记录的内容】
+  从用户发消息到 AI 回复，中间每一步都有专门的日志方法：
+  - user_message()：用户发来什么消息
+  - context_retrieved()：从记忆系统找到了哪些相关历史
+  - routing_decision()：路由到哪个 Agent 处理
+  - llm_input() / llm_output()：发给 AI 模型什么，模型回了什么
+  - tool_call() / tool_result()：AI 调用了哪个工具，结果是什么
+  - conversation_turn()：本轮对话完成的汇总（耗时、调用了哪些 Agent/工具）
+  - consent_decision()：用户对危险操作授权弹窗的决策记录
+
+【彩色终端输出】
+  不同类型的日志用不同颜色标识，方便肉眼快速扫描：
+  青色=用户消息  蓝色=上下文检索  洋红色=路由决策  黄色=LLM输入
+  绿色=LLM输出  白色=工具调用   亮红色=工具失败  亮紫色=轮次完成
+
+Hermes 流水线日志总线
 
 结构化记录 Agent 处理全流程：用户消息 → 上下文组装 → 路由 → LLM 输入/输出 → 工具调用。
 
@@ -37,6 +57,8 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
+from app.utils.progress_bus import push as _pb
+
 # ── ANSI 颜色 ─────────────────────────────────────────────────────────────────
 _RESET = "\033[0m"
 
@@ -49,6 +71,8 @@ _EVENT_COLORS: Dict[str, str] = {
     "tool":     "\033[37m",   # White
     "tool_ok":  "\033[32m",   # Green
     "tool_err": "\033[91m",   # Bright Red
+    "turn":     "\033[95m",   # Bright Magenta
+    "consent":  "\033[93m",   # Bright Yellow
     "system":   "\033[90m",   # Dark Gray
 }
 
@@ -218,7 +242,6 @@ class HermesLogger:
                 "tool_args":  str(args)[:300],
             },
         )
-        from app.utils.progress_bus import push as _pb
         _pb("tool_call", {"agent_name": agent_name, "tool_name": tool_name, "args": str(args)[:200]})
 
     def tool_result(
@@ -243,7 +266,6 @@ class HermesLogger:
                 **({"elapsed_ms": round(elapsed_ms, 1)} if elapsed_ms is not None else {}),
             },
         )
-        from app.utils.progress_bus import push as _pb
         _pb("tool_result", {
             "agent_name": agent_name,
             "tool_name":  tool_name,
@@ -270,8 +292,60 @@ class HermesLogger:
                 "error":      error[:300],
             },
         )
-        from app.utils.progress_bus import push as _pb
         _pb("tool_error", {"agent_name": agent_name, "tool_name": tool_name, "error": error[:300]})
+
+    def conversation_turn(
+        self,
+        user_id:        str,
+        turn_id:        str,
+        user_message:   str,
+        intent:         str,
+        mode:           str,
+        agents_used:    List[str],
+        tools_called:   List[str],
+        response_len:   int,
+        elapsed_ms:     Optional[float] = None,
+        client_type:    str = "api",
+    ) -> None:
+        """一次完整对话轮次的摘要日志（轮次结束时记录）。"""
+        timing = f" ({elapsed_ms:.0f}ms)" if elapsed_ms is not None else ""
+        self._emit(
+            logging.INFO, "turn",
+            f"[轮次完成]{timing} user={user_id} intent={intent} mode={mode} "
+            f"agents={agents_used} tools={tools_called} resp={response_len}chars "
+            f"| {self._clip(user_message, 80)}",
+            {
+                "user_id":      user_id,
+                "turn_id":      turn_id,
+                "client_type":  client_type,
+                "intent":       intent,
+                "mode":         mode,
+                "agents_used":  agents_used,
+                "tools_called": tools_called,
+                "response_len": response_len,
+                "user_message": user_message[:200],
+                **({"elapsed_ms": round(elapsed_ms, 1)} if elapsed_ms is not None else {}),
+            },
+        )
+
+    def consent_decision(
+        self,
+        user_id:    str,
+        tool_name:  str,
+        operation:  str,
+        decision:   str,
+    ) -> None:
+        """用户对危险操作授权弹窗的决策记录。"""
+        self._emit(
+            logging.INFO, "consent",
+            f"[授权] user={user_id} tool={tool_name} op={operation} decision={decision}",
+            {
+                "user_id":   user_id,
+                "tool_name": tool_name,
+                "operation": operation,
+                "decision":  decision,
+            },
+        )
 
 
 # ── 模块级单例 ────────────────────────────────────────────────────────────────
@@ -345,6 +419,10 @@ def init_log_bus(log_cfg: Dict[str, Any]) -> HermesLogger:
                 "JSON 日志初始化失败: %s", e,
                 extra={"event_type": "system"},
             )
+
+    # ── 三级日志文件（system / conv / scheduler）────────────────────────────
+    from app.utils.log_setup import setup_logging
+    setup_logging(log_cfg)
 
     _bus = HermesLogger()
     return _bus

@@ -1,4 +1,19 @@
-"""Hermes CLI - 服务端管理工具
+"""
+【模块说明】Hermes CLI — 服务端管理命令行工具
+
+这个命令行工具让管理员可以在终端直接对运行中的服务器执行管理操作，
+不需要打开浏览器或调用 API。
+
+【可用命令】
+  reload-agents   — 重新加载所有 Agent 配置（在服务器修改了 agents_config.yaml 后使用）
+  revectorize     — 重新向量化历史对话（更换了 Embedding 模型后使用）
+                    可指定 --user-id 只处理某个用户，或 --date 只处理某天数据
+
+【使用方式】
+  python -m app.cli reload-agents  --host http://localhost:8000 --token your_token
+  python -m app.cli revectorize    --user-id u123 --date 2025-01-01
+
+Hermes CLI - 服务端管理工具
 
 用法：
     python -m app.cli reload-agents  [--host ...] [--token ...]

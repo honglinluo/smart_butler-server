@@ -1,4 +1,22 @@
-"""文件读取工具 — 读取任意格式文件，输出模型输入通用内容格式（Content Parts）。
+"""
+【模块说明】文件读取工具（FileReaderTool）— 让 AI 能读取用户提供的文件
+
+这个工具让 AI 能读取各种格式的文件，并把文件内容转换成 AI 可以理解的格式。
+
+【支持的文件格式】
+  文本类    — .txt .md .html .xml .csv 等纯文本文件
+  结构化数据 — .json .yaml .toml .ini 等配置/数据文件
+  办公文档  — .docx .xlsx .pptx .pdf（Word/Excel/PPT/PDF）
+  图片      — .png .jpg .gif .webp 等（直接发给多模态 AI 处理）
+  数据文件  — .parquet .feather .jsonl 等数据分析格式
+
+【输出格式（Content Parts）】
+  系统会把文件内容转换为 AI 消息的"内容块"格式：
+  文本文件 → {"type": "text", "text": "..."}
+  图片文件 → {"type": "image", "source": {"type": "base64", ...}}
+  PDF 文件 → {"type": "document", "source": {...}}
+
+文件读取工具 — 读取任意格式文件，输出模型输入通用内容格式（Content Parts）。
 
 支持格式：
   文本类   : .txt .md .rst .html .xml .log .csv .tsv

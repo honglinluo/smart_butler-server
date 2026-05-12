@@ -1,4 +1,29 @@
-"""系统级定时任务注册 — 月度归档 / 年度归档。
+"""
+【模块说明】系统级定时任务 — 幕后自动维护的"管家任务"
+
+除了用户自己创建的定时任务，系统本身也有几个需要定期自动运行的维护任务。
+这些任务对用户不可见，由系统在服务器后台静默执行。
+
+【四个系统任务】
+  月度记忆归档（每月末 23:00 UTC）
+    — 遍历所有用户，把 1 年前的老对话历史压缩归档，节省存储空间
+
+  年度记忆归档（每年 12 月 31 日 01:00 UTC）
+    — 把 3 年前的月度摘要进一步压缩为年度摘要
+
+  用户文件清理（每天 02:00 UTC）
+    — 删除超过配置天数的用户上传文件，释放磁盘空间
+    — 如果 cleanup_days = -1，则永不清理
+
+  Skill 自演进（每天 03:00 UTC）
+    — 对使用次数达到阈值的 Agent，让 AI 自动优化或生成技能脚本
+
+【注册机制】
+  服务启动时调用 register_system_tasks(scheduler)，该函数：
+  1. 把每个任务的处理函数（handler）注册到调度器的函数表中
+  2. 在数据库中创建任务记录（幂等：已存在则跳过）
+
+系统级定时任务注册 — 月度归档 / 年度归档。
 
 这里的任务对用户不可见（user_id="__system__"，不通过 API 暴露），
 由 main.py 在服务启动后调用 register_system_tasks() 完成注册。
@@ -35,6 +60,8 @@ _YEARLY_TASK_ID     = "__sys_yearly_archive__"
 _YEARLY_HANDLER     = "__yearly_archive__"
 _FILE_CLEANUP_TASK_ID = "__sys_file_cleanup__"
 _FILE_CLEANUP_HANDLER = "__file_cleanup__"
+_SKILL_EVOLUTION_TASK_ID = "__sys_skill_evolution__"
+_SKILL_EVOLUTION_HANDLER = "__skill_evolution__"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -50,8 +77,6 @@ async def _get_all_active_user_ids() -> List[str]:
     conn = None
     try:
         conn = await get_connection("mysql", None)
-        if not conn:
-            return []
 
         # 优先从 memory_references 取有对话记录的用户
         try:
@@ -276,6 +301,47 @@ async def file_cleanup_handler(task: ScheduledTask, hermes_engine) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Handler：Skill 演进
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def skill_evolution_handler(task: ScheduledTask, hermes_engine) -> str:
+    """Skill 自演进系统任务 handler。
+
+    遍历所有 code-type agent，对调用次数满足阈值的 agent 触发 skill 演进。
+    每日 UTC 03:00 触发（低峰期），使用 MemoryManager 的默认 LLM。
+
+    Returns:
+        str: 执行结果摘要（写入 task_run_logs.output）
+    """
+    memory_manager = getattr(hermes_engine, "memory_manager", None)
+    if memory_manager is None:
+        return "memory_manager 未注入，跳过 skill 演进"
+
+    llm = getattr(memory_manager, "_default_llm", None)
+    if llm is None:
+        return "LLM 未配置，跳过 skill 演进"
+
+    from app.skills.evolver import skill_evolver
+    results = await skill_evolver.evolve_all_agents(llm, force=False)
+
+    if not results:
+        return "无 code-type agent，跳过 skill 演进"
+
+    generated = sum(1 for r in results if r.get("action") == "generate" and r.get("success"))
+    optimized = sum(1 for r in results if r.get("action") == "optimize" and r.get("success"))
+    skipped   = sum(1 for r in results if r.get("action") == "skip")
+    failed    = sum(1 for r in results if not r.get("success") and r.get("action") != "skip")
+
+    today_str = date.today().isoformat()
+    summary = (
+        f"Skill 演进 {today_str}：共 {len(results)} 个 agent | "
+        f"新生成 {generated} | 优化 {optimized} | 跳过 {skipped} | 失败 {failed}"
+    )
+    logger.info("[SystemTasks] %s", summary)
+    return summary
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 注册入口
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -292,9 +358,10 @@ async def register_system_tasks(scheduler) -> None:
       — 每年 12 月 31 日 01:00 UTC 触发。
     """
     # ── 1. 注册 handler ───────────────────────────────────────────────────────
-    scheduler.register_system_handler(_MONTHLY_HANDLER,      monthly_archive_handler)
-    scheduler.register_system_handler(_YEARLY_HANDLER,       yearly_archive_handler)
-    scheduler.register_system_handler(_FILE_CLEANUP_HANDLER, file_cleanup_handler)
+    scheduler.register_system_handler(_MONTHLY_HANDLER,        monthly_archive_handler)
+    scheduler.register_system_handler(_YEARLY_HANDLER,         yearly_archive_handler)
+    scheduler.register_system_handler(_FILE_CLEANUP_HANDLER,   file_cleanup_handler)
+    scheduler.register_system_handler(_SKILL_EVOLUTION_HANDLER, skill_evolution_handler)
     logger.info("[SystemTasks] 系统 handler 注册完成")
 
     # ── 2. upsert 系统 cron 任务（幂等，重复启动不重复创建）────────────────────
@@ -336,7 +403,19 @@ async def register_system_tasks(scheduler) -> None:
         max_retries  = 1,
     )
 
-    for sys_task in (monthly_task, yearly_task, file_cleanup_task):
+    skill_evolution_task = ScheduledTask(
+        task_id      = _SKILL_EVOLUTION_TASK_ID,
+        user_id      = _SYS_USER_ID,
+        name         = "Agent Skill 自演进（系统）",
+        task_type    = TaskType.CRON,
+        action_type  = ActionType.SYSTEM,
+        cron_expr    = "0 3 * * *",               # UTC 03:00 每日触发（低峰期）
+        agent_name   = _SKILL_EVOLUTION_HANDLER,
+        notify_on_done = False,
+        max_retries  = 1,
+    )
+
+    for sys_task in (monthly_task, yearly_task, file_cleanup_task, skill_evolution_task):
         try:
             existing = await task_store.get_task(sys_task.task_id)
             if existing is None:

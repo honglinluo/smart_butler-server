@@ -1,4 +1,16 @@
-"""数据库基类 - 定义所有数据库类的通用接口"""
+"""
+【模块说明】数据库基类（DatabaseBase）— 定义所有数据库类必须实现的统一接口
+
+系统使用三种不同的数据库（MySQL、Redis、Elasticsearch），它们的操作方式各不相同。
+这个基类定义了一套"公共接口"，让这三种数据库看起来都有相似的使用方式：
+  - connect() / disconnect()    — 连接和断开
+  - execute()                   — 执行操作
+  - health_check()              — 检查是否正常运行
+
+这样，连接池可以用统一的方式管理所有类型的数据库连接，不需要为每种数据库写不同的逻辑。
+
+数据库基类 - 定义所有数据库类的通用接口
+"""
 
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional

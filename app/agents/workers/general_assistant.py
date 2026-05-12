@@ -1,4 +1,13 @@
-"""通用助手 Agent — 处理一般性问题、文件读写、网页内容分析
+"""
+【模块说明】通用助手 Agent（GeneralAssistantAgent）— 处理日常问答的全能助手
+
+这是系统中最通用的 Agent，负责处理不需要专业领域知识的日常任务：
+  - 回答一般性问题（历史、科学、生活常识等）
+  - 读取并分析文件内容（用户发来的文档、代码等）
+  - 抓取并分析网页内容（用户发来的 URL）
+  - 生成和保存新文件（按用户要求写入指定路径）
+
+通用助手 Agent — 处理一般性问题、文件读写、网页内容分析
 
 执行流程:
   1. 从任务描述中探测文件路径 / URL，主动获取内容注入 LLM 上下文
@@ -77,7 +86,7 @@ class GeneralAssistantAgent(BaseAgent):
         # ── 6. 调用 LLM ───────────────────────────────────────────────
         try:
             result = await llm.ainvoke(messages)
-            answer = result.content if hasattr(result, "content") else str(result)
+            answer = result.content
         except Exception as e:
             return {"result": f"助手处理失败: {e}", "success": False, "metadata": {}}
 

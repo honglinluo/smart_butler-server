@@ -1,4 +1,25 @@
-"""工具装饰器 — @tool 声明式注册服务端工具。
+"""
+【模块说明】工具装饰器（@tool）— 用一行声明注册一个新工具
+
+类似于 @agent 装饰器，@tool 让开发者能用最简洁的方式定义并注册一个工具：
+只需写工具名、描述、参数定义，系统自动完成注册。
+
+【使用方式】
+  @tool(
+      name="web_search",                  # 工具唯一标识
+      description="搜索互联网获取实时信息",  # 给 AI 看的功能描述（AI 据此决定何时使用）
+      exec_location=EXEC_SERVER,          # 在服务器端执行
+      visibility=VIS_PUBLIC,             # 对所有人可见
+      parameters={                        # 参数定义（AI 填写这些参数来调用工具）
+          "query": {"type": "string", "description": "搜索词", "required": True},
+      },
+  )
+  class WebSearchTool(BaseTool):
+      async def execute(self, params, context):
+          ...  # 实现工具的具体逻辑
+
+工具装饰器 — @tool 声明式注册服务端工具。
+"""
 
 示例::
 

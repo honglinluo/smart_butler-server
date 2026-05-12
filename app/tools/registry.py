@@ -1,4 +1,17 @@
-"""工具注册中心 — 统一管理 code / user / agent 三种来源的工具实例。"""
+"""
+【模块说明】工具注册中心（ToolRegistry）— 所有可用工具的"工具箱"
+
+类似 Agent 的注册中心，这里维护一个全局工具列表（进程级单例）。
+系统中所有工具（无论是内置的、用户创建的还是 Agent 动态生成的）都在这里登记。
+
+  - 代码工具：服务启动时自动注册（通过 @tool 装饰器或 register()）
+  - 用户工具：用户创建后立即注册，服务重启时从数据库恢复加载
+  - Agent 工具：Agent 运行时动态创建并立即注册（visibility=exclusive，仅该 Agent 可用）
+
+提供 list_available_for(user_id, agent_name) 方法，
+根据用户身份和调用场景返回该用户有权使用的工具列表。
+"""
+
 
 import json
 import logging
@@ -89,8 +102,6 @@ class ToolRegistry:
         loaded = 0
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return 0
             rows = await conn.execute_raw(
                 """
                 SELECT tool_id, name, description, source, visibility, exec_location,

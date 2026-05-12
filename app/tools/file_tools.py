@@ -1,6 +1,18 @@
-"""Static file tools — read and write local files.
+"""
+【模块说明】静态文件工具（FileTools）— 让 AI 能够读写服务器上的本地文件
 
-Registered in agents_config.yaml and used by general_assistant via LangGraph ReAct.
+这里定义了两个供 AI 使用的基础文件操作工具：
+  tool_file_reader — 读取指定路径的文本文件内容
+  tool_file_writer — 把指定内容写入指定路径的文件
+
+这些工具被注册到配置文件（agents_config.yaml），通用助手 Agent 通过
+LangGraph ReAct 框架调用它们来完成文件读写任务。
+
+【安全限制】
+  - 单文件读取上限 2 MB，防止读取超大文件拖慢系统
+  - 只支持文本格式（不处理二进制文件）
+
+Static file tools — read and write local files.
 """
 import logging
 from pathlib import Path

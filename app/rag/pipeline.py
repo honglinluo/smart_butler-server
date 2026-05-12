@@ -1,4 +1,16 @@
-"""RagPipeline — RAG 系统对外唯一入口类。
+"""
+【模块说明】RAG 流水线（RagPipeline）— RAG 系统的统一入口，外部只与它交互
+
+HermesEngine（AI 引擎）需要在每次对话前"检索相关记忆"、每次对话后"存储新内容"，
+它不直接操作 VectorStore / EmbeddingService 等底层组件，只调用这个类提供的接口。
+
+【四个主要操作】
+  build_context()    — 检索阶段：在 AI 回答前，找到相关历史，组装上下文
+  index_turn()       — 写入阶段：对话结束后，后台把本轮对话异步写入记忆索引
+  revectorize()      — 重建索引：模型更换或管理员手动触发时，重新向量化所有历史
+  queue_prefetch()   — 预取优化：当前对话结束时，提前计算下轮可能需要的记忆，存入 Redis 缓存
+
+RagPipeline — RAG 系统对外唯一入口类。
 
 对外暴露四条路径：
   1. build_context()        — 检索 + 历史加载 + 上下文组装（LLM 推理前调用）

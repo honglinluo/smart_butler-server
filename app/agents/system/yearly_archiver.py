@@ -1,4 +1,15 @@
-"""年度归档智能体 — 将 3 年以上的月度摘要按年汇总。
+"""
+【模块说明】年度归档 Agent（YearlyArchiver）— 把三年前的月度摘要按年打包
+
+每年年末自动运行，把 3 年前的 12 条月度摘要合并成 1 条年度摘要，进一步压缩。
+
+【归档结果格式（固定 4 段结构）】
+  年度主题 — 这一年总体的主要使用方向和关注点
+  重要里程碑 — 这一年中发生的重要事件
+  常用 Agent — 这一年最常调用的 AI 能力
+  年度总结 — 对这一年整体情况的提炼与总结
+
+年度归档智能体 — 将 3 年以上的月度摘要按年汇总。
 
 触发时机：每年最后一天（12 月 31 日），由 MemoryManager.check_and_schedule_periodic_archives() 触发。
 归档对象：创建时间超过 3 年的 monthly_summary turn。
@@ -218,8 +229,6 @@ class YearlyArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return []
 
             cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -277,8 +286,6 @@ class YearlyArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return [], []
 
             result = await es_conn.search(
                 index  = user_id,
@@ -311,8 +318,6 @@ class YearlyArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return False
             await es_conn.create(
                 index    = user_id,
                 doc_id   = turn["turn_id"],
@@ -343,8 +348,6 @@ class YearlyArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return
             for tid in turn_ids:
                 try:
                     await es_conn.delete(index=user_id, doc_id=tid)
@@ -368,8 +371,6 @@ class YearlyArchiverAgent:
         mysql_conn = None
         try:
             mysql_conn = await get_connection("mysql", None)
-            if not mysql_conn:
-                return
             await mysql_conn.execute_raw(
                 """
                 INSERT INTO memory_yearly_jobs
@@ -399,8 +400,6 @@ class YearlyArchiverAgent:
         mysql_conn = None
         try:
             mysql_conn = await get_connection("mysql", None)
-            if not mysql_conn:
-                return
             sets   = ["status = :status", "updated_at = NOW()"]
             params: Dict[str, Any] = {"job_id": job_id, "status": status}
             if turn_count is not None:

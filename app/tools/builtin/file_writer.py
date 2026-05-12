@@ -1,4 +1,21 @@
-"""文件保存工具 — 将各种格式内容写入服务端用户生成文件目录。
+"""
+【模块说明】文件写入工具（FileWriterTool）— 让 AI 能把生成的内容保存为文件
+
+当 AI 生成了报告、代码、表格等内容，用户想要保存到文件时，
+这个工具负责把内容写入服务器上用户专属的 generated/ 目录。
+
+【文件保存路径】
+  {上传根目录}/{用户ID}/generated/{可选子目录}/{文件名}
+
+【支持的格式】
+  文本和代码   — .txt .md .py .js .ts .html .xml .log .svg 等
+  数据文件     — .json .yaml .csv .tsv 等
+  Office 文档  — .docx .xlsx .pptx（使用 python-docx/openpyxl 库生成）
+  二进制文件   — .pdf .png .jpg 等（需传入 base64 编码内容）
+
+【注意】这是需要用户授权的操作，调用前会触发授权检查。
+
+文件保存工具 — 将各种格式内容写入服务端用户生成文件目录。
 
 保存路径规则：{UPLOAD_ROOT}/{user_id}/generated/{subdir?}/{filename}
   UPLOAD_ROOT 由 config/system_config.yaml file_storage.upload_dir 指定（默认 data/uploads）

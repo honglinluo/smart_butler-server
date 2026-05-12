@@ -1,4 +1,25 @@
-"""Agent 注册中心 - 统一管理代码 Agent 与数据库 Agent"""
+"""
+【模块说明】Agent 注册中心（AgentRegistry）— 所有 AI 助手的"花名册"
+
+这个模块维护一个全局的 Agent 列表，系统启动后所有可用的 Agent 都登记在这里。
+它是一个单例（全程序只有一个实例），类似一个"花名册"：
+
+  - 注册（register）：添加一个新 Agent 到名册
+  - 查找（get）：根据名称找到对应 Agent
+  - 注销（unregister）：从名册删除 Agent
+  - 列表（list）：查看某用户有权使用哪些 Agent
+
+【两类 Agent】
+  代码 Agent（source=code）：
+    开发者在 app/agents/workers/ 目录的 Python 文件中定义，
+    加载 @agent 装饰器时自动注册，所有用户都可使用。
+
+  数据库 Agent（source=db）：
+    用户通过网页或 API 创建，存储在 MySQL 中。
+    服务启动时从数据库批量加载，也可通过 /agents/admin/reload 接口热更新。
+    公开（is_public=True）的所有用户可用，私有的仅创建者可用。
+"""
+
 
 import logging
 from typing import Dict, List, Optional, TYPE_CHECKING

@@ -1,4 +1,16 @@
-"""月度归档智能体 — 将 1 年以上的历史对话按月汇总。
+"""
+【模块说明】月度归档 Agent（MonthlyArchiver）— 把一年前的历史对话按月打包
+
+随着时间推移，1 年前的对话记录已经很少被用到，但依然占用存储空间。
+这个 Agent 每月末自动运行，把 1 年前的旧数据按自然月压缩成一条月度摘要。
+
+【归档结果格式（固定 4 段结构）】
+  主要话题 — 这个月主要聊了哪些类型的话题
+  关键事件 — 这个月发生的值得记忆的重要事件
+  使用 Agent — 这个月用了哪些 AI 能力
+  重要结论 — 这个月形成的重要共识或决策
+
+月度归档智能体 — 将 1 年以上的历史对话按月汇总。
 
 触发时机：每月最后一天，由 MemoryManager.check_and_schedule_periodic_archives() 触发。
 归档对象：创建时间超过 1 年的 compression_summary turn（及未被压缩的原始 turn）。
@@ -222,8 +234,6 @@ class MonthlyArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return []
 
             cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -290,8 +300,6 @@ class MonthlyArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return [], []
 
             _, last_day = monthrange(year, month)
             start_str = f"{year}-{month:02d}-01T00:00:00Z"
@@ -331,8 +339,6 @@ class MonthlyArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return False
             await es_conn.create(
                 index    = user_id,
                 doc_id   = turn["turn_id"],
@@ -365,8 +371,6 @@ class MonthlyArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return
             for tid in turn_ids:
                 try:
                     await es_conn.delete(index=user_id, doc_id=tid)
@@ -390,8 +394,6 @@ class MonthlyArchiverAgent:
         mysql_conn = None
         try:
             mysql_conn = await get_connection("mysql", None)
-            if not mysql_conn:
-                return
             await mysql_conn.execute_raw(
                 """
                 INSERT INTO memory_monthly_jobs
@@ -420,8 +422,6 @@ class MonthlyArchiverAgent:
         mysql_conn = None
         try:
             mysql_conn = await get_connection("mysql", None)
-            if not mysql_conn:
-                return
             sets   = ["status = :status", "updated_at = NOW()"]
             params: Dict[str, Any] = {"job_id": job_id, "status": status}
             if turn_count is not None:

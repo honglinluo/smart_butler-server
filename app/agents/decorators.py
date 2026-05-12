@@ -1,4 +1,22 @@
-"""Agent 装饰器 - @agent 声明式注册服务端 Agent"""
+"""
+【模块说明】Agent 装饰器（@agent）— 用一行声明创建一个 AI 专家
+
+通过 @agent 装饰器，开发者可以用极简的方式定义一个新的 AI Agent：
+只需声明它的名字、角色、背景介绍和可用工具，系统会自动完成注册和初始化。
+
+【使用方式】
+  @agent(
+      name="data_analyst",        # Agent 的唯一标识
+      role="数据分析工程师",        # 角色名称（会注入提示词）
+      background="你是一个...",    # 角色背景描述（详细的角色设定）
+      tools=["sql_query"],        # 该 Agent 可使用的工具列表
+      is_public=True,             # 是否对用户可见
+  )
+  class DataAnalystAgent(BaseAgent):
+      pass  # 可选自定义 execute() 方法，不写则用父类默认 LLM 实现
+
+Agent 装饰器 - @agent 声明式注册服务端 Agent
+"""
 
 import logging
 from typing import List, Optional, Type

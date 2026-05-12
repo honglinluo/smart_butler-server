@@ -1,4 +1,20 @@
-"""定时任务 API — 创建、查询、取消定时任务，以及通知推送接口。
+"""
+【模块说明】定时任务 API — 用户管理自己定时任务的所有接口
+
+用户可以通过这些接口设置、管理、查看自己的定时任务，并接收任务完成后的通知。
+
+【可用接口】
+  GET    /scheduler/tasks              — 查看我的所有定时任务列表
+  POST   /scheduler/tasks              — 新建一个定时任务（每天提醒、定期让 AI 做某事等）
+  GET    /scheduler/tasks/{id}         — 查看某条任务的详情
+  DELETE /scheduler/tasks/{id}         — 取消（删除）某条任务
+  GET    /scheduler/tasks/{id}/logs    — 查看某任务的历史执行记录
+
+  GET    /scheduler/notifications          — 获取待读通知（取出后从队列删除）
+  GET    /scheduler/notifications/stream   — 实时接收通知（SSE 长连接，有新消息立即推送）
+  GET    /scheduler/notifications/peek     — 预览通知（不删除，只查看）
+
+定时任务 API — 创建、查询、取消定时任务，以及通知推送接口。
 
 端点概览：
   GET    /scheduler/tasks                  列出当前用户的所有定时任务

@@ -1,4 +1,24 @@
-"""VectorStore - 管理会话向量数据在 ES 中的独立索引。
+"""
+【模块说明】向量存储（VectorStore）— 把对话内容转化为"语义坐标"存入搜索引擎
+
+【什么是向量（Vector）？】
+  文字本身没有"相似度"可以比较，但把文字转换成一组数字（向量）后，
+  数字越接近，代表含义越相近。
+  例如："苹果手机"和"iPhone"转换后的数字会很接近，
+  即使两个词没有共同字符，搜索引擎也能找到它们的关联。
+
+【本模块的作用】
+  1. 把历史对话拆分成小片段（chunks），用 AI 模型（embedding）转成向量数字
+  2. 把这些数字存入 Elasticsearch（ES）的"向量索引"中
+  3. 用户发新消息时，把消息也转成向量，在索引中找最相近的历史片段
+  4. 把找到的历史片段作为"参考记忆"提供给 AI，让回答更准确
+
+【索引命名】
+  聊天历史索引：hermes_chat_{user_id}        （存原始对话文本）
+  向量索引：    hermes_chat_v_{user_id}       （存向量数字）
+  两个索引严格分离，互不干扰。
+
+VectorStore - 管理会话向量数据在 ES 中的独立索引。
 
 索引命名规则（与聊天历史严格分离）：
   聊天历史: {es_prefix}_{user_id}            例: hermes_chat_user123
@@ -105,8 +125,6 @@ class VectorStore:
         deleted = 0
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return 0
             client = getattr(es_conn, "es_client", None)
             if not client:
                 return 0
@@ -135,8 +153,6 @@ class VectorStore:
         deleted = 0
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return 0
             client = getattr(es_conn, "es_client", None)
             if not client:
                 return 0
@@ -189,8 +205,6 @@ class VectorStore:
         stored = 0
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return 0
             await self.ensure_user_index(user_id, es_conn)
 
             for chunk, vec in zip(chunks, embeddings):
@@ -249,8 +263,6 @@ class VectorStore:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return []
             client = getattr(es_conn, "es_client", None)
             if not client:
                 return []
@@ -389,9 +401,6 @@ class VectorStore:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                logger.error("无法获取 ES 连接，重向量化中止")
-                return stats
             client = getattr(es_conn, "es_client", None)
             if not client:
                 return stats

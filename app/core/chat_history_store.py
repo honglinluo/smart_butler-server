@@ -1,4 +1,18 @@
-"""ChatHistoryStore - 封装对 Elasticsearch 的聊天记录操作
+"""
+【模块说明】聊天历史存储（ChatHistoryStore）— 把对话记录存进 Elasticsearch
+
+每次对话结束后，系统需要把这轮对话持久化存储，以便以后检索。
+这个模块封装了所有对 Elasticsearch 聊天记录的读写操作，
+每位用户的对话历史存在 ES 中独立的索引（Index）里，互相隔离。
+
+【主要操作】
+  save_turn()         — 保存一轮对话（用户问题 + AI 回复）
+  get_recent_turns()  — 获取最近几轮对话（组装上下文时使用）
+  search_turns()      — 按关键词全文搜索历史对话
+  delete_turns()      — 删除指定的历史轮次
+  update_vector()     — 更新某条记录的向量（用于 RAG 检索）
+
+ChatHistoryStore - 封装对 Elasticsearch 的聊天记录操作
 
 提供保存、查询、向量更新、向量检索以及简单的时间范围摘要等方法。
 使用项目已有的连接池接口 `get_connection` / `release_connection`。每次操作会独立获取并释放 ES 连接。
@@ -69,10 +83,6 @@ class ChatHistoryStore:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                logger.warning("无法获取 Elasticsearch 连接，跳过保存对话轮次")
-                return ""
-
             turn_id = turn_id or uuid.uuid4().hex
             document: Dict[str, Any] = {
                 "turn_id": turn_id,
@@ -113,8 +123,6 @@ class ChatHistoryStore:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return []
 
             res = await es_conn.search(
                 index=user_id,
@@ -213,8 +221,6 @@ class ChatHistoryStore:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return []
 
             if client_type:
                 query: dict = {"term": {"client_type": client_type}}
@@ -250,6 +256,10 @@ class ChatHistoryStore:
                     "user_input":         src.get("user_input", ""),
                     "assistant_response": src.get("assistant_response", ""),
                     "timestamp":          src.get("timestamp"),
+                    "intent":             src.get("intent", ""),
+                    "mode":               src.get("mode", ""),
+                    "pipeline":           src.get("pipeline", []),
+                    "agent_outputs":      src.get("agent_outputs", []),
                     "client_type":        src.get("client_type", ""),
                 })
 
@@ -267,8 +277,6 @@ class ChatHistoryStore:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return False
             return await es_conn.update(index=user_id, doc_id=doc_id, document={vector_field: embedding})
         except Exception as e:
             logger.warning(f"为文档添加向量失败: {e}")
@@ -282,8 +290,6 @@ class ChatHistoryStore:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return []
             return await es_conn.vector_search(index=user_id, vector=vector, top_k=top_k, filter=filter)
         except Exception as e:
             logger.warning(f"向量检索失败: {e}")
@@ -297,8 +303,6 @@ class ChatHistoryStore:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return []
 
             # 直接使用底层 client 列出索引
             client = getattr(es_conn, "es_client", None)
@@ -322,8 +326,6 @@ class ChatHistoryStore:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return 0
 
             client = getattr(es_conn, "es_client", None)
             if not client:

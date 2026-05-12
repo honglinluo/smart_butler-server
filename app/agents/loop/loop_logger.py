@@ -1,4 +1,16 @@
-"""Agent 事件循环 — 结构化调用日志记录器"""
+"""
+【模块说明】Agent 事件循环日志记录器（LoopLogger）— 记录 Agent 每一步执行过程
+
+当 Agent 执行复杂任务时，需要知道它每一步做了什么、中间发生了什么事。
+这个模块负责把每个执行事件（任务开始、工具被请求、工具构建完成等）记录下来，
+同时推送到 Redis 队列，供前端实时显示进度。
+
+【两路输出】
+  1. Python 标准日志（INFO 级别）：写到服务器日志文件，供运维查看
+  2. Redis List：推送到 Redis，前端通过 SSE 长连接实时读取，展示"AI 正在做什么"
+
+Agent 事件循环 — 结构化调用日志记录器
+"""
 from __future__ import annotations
 
 import asyncio

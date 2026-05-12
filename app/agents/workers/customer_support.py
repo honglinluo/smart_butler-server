@@ -1,4 +1,14 @@
-"""客服 Agent — 处理客户咨询、投诉和售后问题"""
+"""
+【模块说明】客服 Agent（CustomerSupportAgent）— 专业客户服务代表
+
+负责处理一切与客户服务相关的对话：
+  - 回答产品/服务相关的咨询问题
+  - 受理投诉，安抚情绪，提供解决方案
+  - 处理售后问题（退换货、使用教程等）
+  - 收集用户反馈，汇总常见问题
+
+客服 Agent — 处理客户咨询、投诉和售后问题
+"""
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -19,30 +29,11 @@ from app.agents.decorators import agent
     ),
 )
 class CustomerSupportAgent(BaseAgent):
-    async def execute(self, task: dict, context: dict, llm) -> dict:
-        await self.load_skills()
-        messages = [SystemMessage(content=self._build_system_prompt())]
-
-        customer_info = context.get("customer_info", {})
-        if customer_info:
-            messages.append(SystemMessage(content=f"客户信息：{customer_info}"))
-
-        history = context.get("history", [])
-        for turn in history[-3:]:
-            if isinstance(turn, dict):
-                messages.append(HumanMessage(content=turn.get("user_input", "")))
-
-        description = task.get("description", "")
-        messages.append(HumanMessage(content=description))
-
-        try:
-            result = await llm.ainvoke(messages)
-            answer = result.content if hasattr(result, "content") else str(result)
-            await self.update_skill(description, answer, success=True)
-            return {
-                "result": answer,
-                "success": True,
-                "metadata": {"agent": self.name, "task_type": "customer_support"},
-            }
-        except Exception as e:
-            return {"result": f"客服处理失败: {e}", "success": False, "metadata": {}}
+    def _build_context_messages(self, context: dict) -> list:
+        msgs = []
+        if customer_info := context.get("customer_info", {}):
+            msgs.append(SystemMessage(content=f"客户信息：{customer_info}"))
+        for turn in context.get("history", [])[-3:]:
+            if isinstance(turn, dict) and (ui := turn.get("user_input", "")):
+                msgs.append(HumanMessage(content=ui))
+        return msgs

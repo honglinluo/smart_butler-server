@@ -1,4 +1,18 @@
-"""MySQL 数据库类 - 实现 MySQL 的增删改查操作"""
+"""
+【模块说明】MySQL 数据库操作类
+
+封装了对 MySQL 数据库的所有操作（连接、查询、写入、更新、删除等）。
+系统的核心业务数据（用户账号、AI 模型配置、Agent 配置、对话历史统计等）都存在 MySQL 里。
+
+【主要功能】
+  - 建立和关闭数据库连接
+  - 执行原始 SQL 语句（execute_raw），返回 DataFrame 格式方便处理
+  - 标准的增删改查操作（create / read / update / delete）
+  - 连接健康检查
+
+使用 SQLAlchemy 引擎，支持连接池和自动重连（pool_pre_ping=True）。
+"""
+
 
 from typing import Any, Dict, List, Optional, Union
 import pandas as pd

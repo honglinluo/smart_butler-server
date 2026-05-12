@@ -1,7 +1,7 @@
 # Hermes Multi-Agent System — 项目完成说明
 
-**更新日期**: 2026-05-06
-**版本**: 2.7
+**更新日期**: 2026-05-09
+**版本**: 2.8
 **状态**: ✅ 核心系统已就绪，持续迭代中
 
 ---
@@ -91,6 +91,9 @@ Hermes Multi-Agent System 是一套企业级多智能体协作平台，基于 La
 | ConsentManager | ✅ | 授权核查（once/session/project/always） |
 | 工具动态加载 | ✅ | loader.py 支持三来源统一加载 |
 | file_reader 内置工具 | ✅ | 17 类格式，敏感信息自动遮盖 |
+| file_writer 内置工具 | ✅ | 支持 create/append/overwrite 三模式 |
+| cli_exec 内置工具 | ✅ | 命令执行 + expected 断言，status/result/log 三字段输出 |
+| web_smart_extract 专属工具 | ✅ | Scrapling 自适应 CSS 选择器，VIS_EXCLUSIVE（web_agent） |
 | 工具函数实现 | 🔧 | sql_query 等业务工具未实现 |
 
 ### 2.5 安全沙箱 (app/sandbox)
@@ -128,6 +131,14 @@ Hermes Multi-Agent System 是一套企业级多智能体协作平台，基于 La
 ---
 
 ## 三、更新历史
+
+### v2.8 — 2026-05-09：Scrapling 集成 + cli_exec 增强 + 冗余代码审查
+
+- `web_agent.py` 集成 Scrapling（curl_cffi / StealthyFetcher / DynamicFetcher），新增 4 层降级链和 `web_smart_extract` 工具
+- `cli_exec.py` 新增 `expected` 断言参数，输出 `status/result/log` 三字段
+- 全项目冗余代码审查（8 类 REDUNDANT 标注），无破坏性改动
+
+---
 
 ### v2.7 — 2026-05-06：客户端环境追踪 + RAG 模块独立提取
 

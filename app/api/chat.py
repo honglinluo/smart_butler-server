@@ -1,12 +1,38 @@
-"""聊天 API - 消息交互与文件上传"""
+"""
+【模块说明】聊天接口 — 用户与 AI 对话的入口
+
+这个文件是用户和 AI 进行对话的核心通道，提供以下功能：
+
+1. 普通对话（/chat/send）
+   用户发一条消息，AI 处理完后把完整回复一次性返回。
+
+2. 流式对话（/chat/stream）
+   AI 回复像打字机一样逐字实时显示给用户，无需等待全部生成完毕。
+   技术上使用"SSE（Server-Sent Events）"协议实现：服务器主动向浏览器推送数据。
+
+3. 危险操作授权（/chat/consent）
+   当 AI 准备执行"危险动作"（如修改文件、运行命令）时，
+   会先暂停并弹出确认框等待用户批准，此接口用于接收用户的批准/拒绝决定。
+
+4. 取消对话（/chat/cancel）
+   用户可以随时中断正在生成的 AI 回复。
+
+5. 历史记录（/chat/history）
+   查询当前用户的历史聊天记录，支持分页。
+
+6. 文件上传（/chat/upload）
+   上传文件或代码，系统先在沙箱（隔离环境）中安全检验，通过后保存并可附带消息让 AI 处理。
+"""
+
+
 
 import asyncio
 import logging
-from typing import List, Optional, AsyncIterator
+from typing import List, Literal, Optional, AsyncIterator
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Response, UploadFile, status, Depends
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from app.api.dependencies import get_current_user, get_user_model, require_local_or_auth
 from app.utils.headers import RequestHeaders, ResponseHeaders
 from app.core.hermes_engine import LLMInfo
@@ -18,13 +44,22 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 
 
 class ChatMessage(BaseModel):
+    """
+    用户发送消息的数据结构。
+    message：用户输入的文字内容（必填）
+    context：附加上下文信息，如当前环境、设备信息等（可为空）
+    agent_name：指定由哪个 AI 助手来回答，不指定则由系统自动选择最合适的
+    """
     message:    str
     context:    dict          = {}
     agent_name: Optional[str] = None  # 指定 Agent（可选）
 
 
 async def get_hermes_engine(request: Request):
-    """获取全局 Hermes 引擎实例"""
+    """
+    从服务器应用状态中取出"赫尔墨斯引擎"（AI 调度核心）。
+    每个请求都需要先拿到这个引擎才能处理对话，如果引擎未初始化则报错。
+    """
     hermes_engine = getattr(request.app.state, "hermes_engine", None)
     if not hermes_engine:
         raise HTTPException(status_code=500, detail="Hermes engine not initialized")
@@ -41,7 +76,15 @@ async def send_message(
     engine = Depends(get_hermes_engine),
     req_headers: RequestHeaders = Depends(RequestHeaders),
 ):
-    """发送聊天消息"""
+    """
+    【普通对话接口】用户发送一条消息，等 AI 完全处理完后返回完整回复。
+
+    流程：
+      1. 验证用户登录状态
+      2. 准备好 AI 模型配置（用户自己选的模型）
+      3. 把消息交给"赫尔墨斯引擎"处理（它负责理解意图、调度 Agent、生成回复）
+      4. 返回 AI 的完整回复文本
+    """
     ResponseHeaders().apply(response)
     user_id = current_user["user_id"]
     logger.debug("收到聊天请求: user_id=%s message=%r", user_id, chat_data.message)
@@ -156,6 +199,41 @@ async def stream_message(
             logger.debug("SSE 流被客户端断开: user_id=%s", user_id)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+class ConsentResponse(BaseModel):
+    """
+    用户对"危险操作授权"的回复数据结构。
+    request_id：对应哪一次危险操作请求的 ID
+    decision（决策选项）：
+      - allow        → 仅允许这一次，下次同类操作还会再问
+      - deny         → 拒绝，AI 不执行该操作
+      - conversation → 本轮对话内所有危险操作都自动放行，不再弹窗
+    """
+    request_id: str
+    decision:   Literal["allow", "deny", "conversation"] = "deny"
+
+
+@router.post("/consent")
+async def respond_consent(
+    body:         ConsentResponse,
+    request:      Request,
+    response:     Response,
+    current_user: dict = Depends(get_current_user),
+    engine             = Depends(get_hermes_engine),
+):
+    """响应危险操作授权请求。
+
+    前端在收到 `consent_required` SSE 事件后，用户选择后调用此接口。
+    decision 取值：
+      - allow        — 仅本次允许
+      - deny         — 拒绝
+      - conversation — 当前对话（用户消息轮次）内全部允许
+    """
+    ResponseHeaders().apply(response)
+
+    resolved = engine.consent_respond(body.request_id, body.decision)
+    return {"resolved": resolved, "request_id": body.request_id, "decision": body.decision}
 
 
 @router.post("/cancel")
@@ -406,7 +484,10 @@ async def revectorize(
 
 
 def _build_sandbox_summary(processed: list, text_result: Optional[dict]) -> str:
-    """将沙箱处理结果浓缩为 Hermes 可理解的文本摘要。"""
+    """
+    把"沙箱安全检查"的结果整理成一段简洁的文字摘要，
+    方便 AI 引擎了解本次上传了哪些内容、哪些通过了检查、哪些被拒绝了。
+    """
     lines = []
     for f in processed:
         status_str = "✅ 已保存" if f.get("safe") else f"❌ 拒绝（{f.get('error', '未知')}）"

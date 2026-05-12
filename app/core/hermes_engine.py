@@ -1,4 +1,37 @@
-"""Hermes 框架核心 - 基于 LangChain 的多智能体编排引擎"""
+"""
+【模块说明】赫尔墨斯引擎（HermesEngine）— AI 对话调度总控中心
+
+这是整个系统最核心的模块，负责接收用户的消息，然后协调所有 AI 组件来生成回复。
+可以把它理解为一个"智能调度员"：
+
+┌─────────────────────────────────────────────────────────┐
+│                     用户发来消息                          │
+│                         ↓                               │
+│  1. 理解意图（用户想做什么？简单聊天还是需要专业帮助？）       │
+│                         ↓                               │
+│  2. 路由分发（交给哪个 Agent 处理最合适？）                  │
+│                         ↓                               │
+│  3. Agent 执行（Agent 使用工具完成任务，可能触发授权弹窗）     │
+│                         ↓                               │
+│  4. 生成回复（把结果整理成自然语言返回给用户）                 │
+│                         ↓                               │
+│  5. 保存记忆（把这轮对话存入记忆系统，下次会记得）             │
+└─────────────────────────────────────────────────────────┘
+
+【流式输出】
+  支持两种回复模式：
+  - 普通模式：等全部处理完后一次性返回
+  - 流式模式：像打字机一样逐字实时推送（通过 SSE 协议）
+
+【危险操作授权】
+  当 Agent 要执行危险动作时，引擎会暂停并向前端推送授权请求，
+  等用户同意/拒绝后再继续或中止。
+
+【记忆注入】
+  每次对话前，引擎会从记忆系统取出相关的历史记录注入到提示词中，
+  让 AI 能"记住"之前的对话内容。
+"""
+
 
 import asyncio
 import importlib
@@ -61,19 +94,26 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════
 
 class StreamingContextScrubber:
-    """逐 chunk 剔除 <memory-context>…</memory-context> 块。
+    """
+    流式输出"记忆标签过滤器"。
 
-    背景：系统提示中注入了 <memory-context> 标签围栏的历史记忆，
-    部分模型偶尔会将其原样回显给用户。本类通过状态机在流式输出中
-    过滤掉这类块，确保用户不会看到"幕后"记忆内容。
+    【作用】
+    系统提示词中注入了 <memory-context>...</memory-context> 标签包裹的历史记忆，
+    这些内容是给 AI 看的背景信息，不应该被展示给用户。
+    但部分模型偶尔会把这段内容原样"回显"到输出中。
 
-    用法::
+    本类监控流式输出的每一个文字片段，
+    一旦发现开始输出 <memory-context> 就进入"屏蔽模式"，
+    直到 </memory-context> 出现后才恢复正常输出。
+    保证用户永远看不到这些"幕后"内容。
+
+    用法：
         scrubber = StreamingContextScrubber()
         for delta in stream:
-            visible = scrubber.feed(delta)
+            visible = scrubber.feed(delta)    # 过滤后的安全内容
             if visible:
                 emit(visible)
-        trailing = scrubber.flush()
+        trailing = scrubber.flush()           # 处理末尾残留
         if trailing:
             emit(trailing)
     """
@@ -200,6 +240,29 @@ class LangChainToolWrapper(BaseTool):
         return self.tool_func(*args, **kwargs)
 
 
+def _validate_llm_url(url: str) -> str:
+    """校验 LLM API URL 格式，必须为合法的 http/https URL。
+
+    Args:
+        url: 待校验的 URL 字符串
+
+    Returns:
+        校验通过的原始 URL
+
+    Raises:
+        ValueError: URL 格式不合法时
+    """
+    from urllib.parse import urlparse
+    if not url or not url.strip():
+        raise ValueError("LLM URL 不能为空")
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"LLM URL 必须以 http:// 或 https:// 开头，当前值: {url!r}")
+    if not parsed.netloc:
+        raise ValueError(f"LLM URL 缺少主机地址，当前值: {url!r}")
+    return url.strip()
+
+
 @dataclass
 class LLMInfo:
     """LLM 信息数据模型与构建器。"""
@@ -210,6 +273,13 @@ class LLMInfo:
     model_type: str = "chat"
     temperature: float = 0.7
 
+    def __post_init__(self) -> None:
+        if self.url:
+            try:
+                self.url = _validate_llm_url(self.url)
+            except ValueError as e:
+                logger.warning("LLMInfo.url 校验失败: %s", e)
+
     @classmethod
     async def load(
         cls,
@@ -218,41 +288,69 @@ class LLMInfo:
         table_name: str = "llms",
         fallback_user_id: str = "0",
     ) -> Optional["LLMInfo"]:
+        """从数据库加载 LLM 配置。
+
+        加载优先级：
+        1. 若 user_id != '0'，先查 users.current_llm_id；
+           若 current_llm_id 非 NULL，按 id 加载 llms 对应记录；
+        2. 若 current_llm_id 为 NULL 或 user_id = '0'，加载系统默认
+           (llms WHERE user_id='0' AND state=1 AND model_type!='embedding')。
+        """
         connection = None
         try:
             connection = await get_connection("mysql", db_alias)
-            if not connection:
-                logger.error("无法获取数据库连接")
-                return None
 
-            sql = (
+            if user_id != fallback_user_id:
+                # 查询用户选择的模型 ID
+                user_row_df = await connection.execute_raw(
+                    "SELECT current_llm_id FROM users WHERE user_id = :uid LIMIT 1",
+                    {"uid": user_id},
+                )
+                current_llm_id = None
+                if user_row_df is not None and len(user_row_df) > 0:
+                    val = user_row_df.iloc[0].get("current_llm_id")
+                    current_llm_id = int(val) if val is not None else None
+
+                if current_llm_id is not None:
+                    df = await connection.execute_raw(
+                        f"SELECT url, api_key, model_name, model_type, temperature "
+                        f"FROM {table_name} WHERE id = :mid AND state = 1 "
+                        "AND model_type != 'embedding' LIMIT 1",
+                        {"mid": current_llm_id},
+                    )
+                    if df is not None and len(df) > 0:
+                        row = df.iloc[0]
+                        logger.debug(f"通过 current_llm_id={current_llm_id} 加载用户 {user_id} 的 LLM 配置")
+                        return cls(
+                            user_id=user_id,
+                            url=row.get("url") or "",
+                            api_key=row.get("api_key") or "",
+                            model_name=row.get("model_name") or "",
+                            model_type=row.get("model_type") or "chat",
+                            temperature=float(row.get("temperature") or 0.7),
+                        )
+                    logger.info(f"current_llm_id={current_llm_id} 对应的模型不可用，回落到系统默认")
+
+            # 系统默认模型（user_id='0'，state=1）
+            default_df = await connection.execute_raw(
                 f"SELECT url, api_key, model_name, model_type, temperature "
-                f"FROM {table_name} WHERE user_id = :user_id AND state = 1 "
-                f"AND model_type != 'embedding' "
-                "ORDER BY id DESC LIMIT 1"
+                f"FROM {table_name} WHERE user_id = :uid AND state = 1 "
+                "AND model_type != 'embedding' ORDER BY id DESC LIMIT 1",
+                {"uid": fallback_user_id},
             )
-            logger.debug(f"执行SQL查询: {sql}, user_id={user_id}")
-            df = await connection.execute_raw(sql, {"user_id": user_id})
-            if df is None or len(df) == 0:
-                if user_id != fallback_user_id:
-                    logger.info(f"未找到用户 {user_id} 的 LLM 配置，加载默认用户 {fallback_user_id}")
-                    df = await connection.execute_raw(sql, {"user_id": fallback_user_id})
-
-            if df is None or len(df) == 0:
-                logger.warning("未找到任何 LLM 配置")
+            if default_df is None or len(default_df) == 0:
+                logger.warning("未找到任何 LLM 配置（含系统默认）")
                 return None
 
-            # DataFrame的第一行
-            row = df.iloc[0]
-            logger.debug(f"查询到LLM配置: {row.to_dict()}")
-            
+            row = default_df.iloc[0]
+            logger.debug(f"加载系统默认 LLM 配置: {row.to_dict()}")
             return cls(
                 user_id=user_id,
-                url=row.get("url") or row.get(0) or "",
-                api_key=row.get("api_key") or row.get(1) or "",
-                model_name=row.get("model_name") or row.get(2) or "",
-                model_type=row.get("model_type") or row.get(3) or "chat",
-                temperature=float(row.get("temperature") or row.get(4) or 0.7) if row.get("temperature") is not None else 0.7,
+                url=row.get("url") or "",
+                api_key=row.get("api_key") or "",
+                model_name=row.get("model_name") or "",
+                model_type=row.get("model_type") or "chat",
+                temperature=float(row.get("temperature") or 0.7),
             )
         except Exception as e:
             logger.error(f"加载 LLMInfo 失败: {type(e).__name__}: {e}", exc_info=True)
@@ -339,10 +437,6 @@ class AgentExecutorCache:
         connection = None
         try:
             connection = await get_connection("mysql", self.db_alias)
-            if not connection:
-                logger.error("无法获取数据库连接")
-                return []
-
             sql = (
                 f"SELECT agent_name, job, desc FROM {self.agents_table} "
                 "WHERE (user_id = :user_id OR public = 1) AND state = 1 "
@@ -388,7 +482,7 @@ class AgentExecutorCache:
             # 使用 LangGraph 的 create_react_agent 而不是过时的 AgentExecutor
             if HAS_LANGGRAPH and create_react_agent:
                 system_prompt = f"你是 {agent_name} 代理，负责执行: {job}。"
-                executor = create_react_agent(llm, tools, state_modifier=system_prompt)
+                executor = create_react_agent(llm, tools, prompt=system_prompt)
                 return executor
             else:
                 logger.warning(f"LangGraph 不可用，跳过 {agent_name} 的执行器创建")
@@ -480,6 +574,8 @@ class HermesEngine:
         self._cancel_signals: Dict[str, asyncio.Event] = {}
         # 已取消的 turn_id 集合（阻止 _save_turn_async 写入）
         self._cancelled_turns: set = set()
+        # 危险操作授权等待 Future：request_id -> Future[str]
+        self._consent_futures: Dict[str, asyncio.Future] = {}
         # 上下文管理器（兼容保留；主链路已由 RagPipeline 取代）
         self.context_manager: Optional[ContextManager] = None
         # 记忆管理器（由 set_memory_manager() 注入）
@@ -538,7 +634,7 @@ class HermesEngine:
         # 内置兜底模板（与原硬编码内容一致）
         builtin_default = (
             "你是 Hermes 智能体系统中的 {agent_name} 代理。\n"
-            "你是一个强大的多代理协作平台，能够处理复杂的任务、分解问题、调用工具和生成见解。\n"
+            "你能够对复杂的任务进行分解、调用工具完成任务和生成见解。\n"
             "请基于提供的信息产出清晰、有帮助的回复，并提供下一步建议。\n\n"
             "用户 ID: {user_id}\n识别的意图: {intent}\n\n{memory_section}"
         )
@@ -727,6 +823,8 @@ class HermesEngine:
             logger.error(f"无法为用户 {user_id} 获取 LLM")
             return "当前无法调用 LLM，请稍后重试。"
 
+        from app.utils.log_setup import start_turn as _start_turn, end_turn as _end_turn
+        _ns_turn_id = ""
         try:
             from app.utils.log_bus import get_bus as _get_bus
             _bus = _get_bus()
@@ -734,6 +832,8 @@ class HermesEngine:
             _bus.user_message(user_id, user_input, _ctx_pre.get("_client_type", "api"))
 
             turn_id = uuid.uuid4().hex
+            _ns_turn_id = turn_id
+            _start_turn(turn_id)
 
             # 使用 RagPipeline 组装上下文（检索 + 历史加载 + 相关性过滤）
             _rag_source = self.rag_pipeline or self.context_manager
@@ -867,7 +967,14 @@ class HermesEngine:
                 "tool_results":   tool_results,
                 "tool_steps":     tool_steps,
                 "mode":           mode,
-                "pipeline":       [{"step": p["step"], "agent_name": p["agent_name"]} for p in pipeline],
+                "pipeline": [
+                    {
+                        "step":             p["step"],
+                        "agent_name":       p["agent_name"],
+                        "task_description": (p.get("task") or {}).get("description", "")[:200],
+                    }
+                    for p in pipeline
+                ],
                 "agent_outputs":  agent_outputs or [],
                 "client_type":    _ctx_dict.get("_client_type", ""),
                 "client_version": _ctx_dict.get("_client_version", ""),
@@ -917,6 +1024,9 @@ class HermesEngine:
         except Exception as e:
             logger.error(f"处理用户输入失败: {e}")
             return "处理请求时发生错误，请稍后重试。"
+        finally:
+            if _ns_turn_id:
+                _end_turn(_ns_turn_id)
 
     async def _get_user_llm(self, user_id: str) -> Optional[BaseChatModel]:
         """
@@ -1028,6 +1138,24 @@ class HermesEngine:
             ev.set()
             logger.info("已发送取消信号 user=%s", user_id)
             return True
+        return False
+
+    def consent_respond(self, request_id: str, decision: str) -> bool:
+        """处理前端用户对危险操作的授权决策，恢复被暂停的工具执行。
+
+        Args:
+            request_id: ConsentRequiredException.request_id，由 SSE 事件携带
+            decision:   "allow" | "deny" | "conversation"
+
+        Returns:
+            True 表示找到等待中的 Future 并已解决，False 表示 request_id 无效或已超时
+        """
+        fut = self._consent_futures.get(request_id)
+        if fut and not fut.done():
+            fut.set_result(decision)
+            logger.info("consent 已应答: request_id=%s decision=%s", request_id[:8], decision)
+            return True
+        logger.warning("consent_respond: 未找到等待中的请求 request_id=%s", request_id[:8])
         return False
 
     async def call_tool(self, tool_name: str, **kwargs) -> Any:
@@ -1289,7 +1417,7 @@ class HermesEngine:
                             system_prompt += "\n\n" + _env_block
                         if _profile_block:
                             system_prompt += "\n\n" + _profile_block
-                    graph = create_react_agent(llm, langchain_tools, state_modifier=system_prompt)
+                    graph = create_react_agent(llm, langchain_tools, prompt=system_prompt)
                     self.agent_graphs[executor_key] = graph
                     logger.info(
                         "[Engine] 为 %s 构建 LangGraph（工具总数=%d：yaml=%d registry=%d）",
@@ -1586,6 +1714,10 @@ class HermesEngine:
 
         # ── 后台处理任务：执行完整 pipeline 并将所有事件放入队列 ─────────────────
         async def _run() -> None:
+            import time as _time
+            from app.utils.log_setup import start_turn as _start_turn, end_turn as _end_turn
+            _start_turn(turn_id)
+            _turn_start = _time.monotonic()
             try:
                 from app.utils.log_bus import get_bus as _get_bus
                 _bus = _get_bus()
@@ -1675,15 +1807,81 @@ class HermesEngine:
                 dispatch_id = turn_id
                 await self._dispatch_to_redis(user_id, dispatch_id, pipeline, mode, intent, user_input)
 
+                # ── 危险操作授权 Hook ────────────────────────────────────────────
+                from app.tools.permission import (
+                    set_consent_hook, set_consent_turn_id, consent_manager,
+                    _CONSENT_HOOK, _CONSENT_TURN_ID,
+                )
+                from app.tools.base import ConsentRequiredException
+
+                # 每轮请求独立的串行化锁：保证并行 agent 或多工具调用时
+                # 同一时刻只有一个授权弹窗处于等待状态，避免授权冲突。
+                _consent_lock = asyncio.Lock()
+
+                async def _consent_hook(exc: ConsentRequiredException) -> str:
+                    """暂停执行，向前端推送授权请求，等待用户决策。
+
+                    通过 _consent_lock 串行化并发授权请求：
+                    - 并行执行的多个 agent 同时触发危险操作时，依次弹窗而非同时弹出
+                    - 获取锁后先复查授权状态，若已由同一 turn 的其他工具调用授权则跳过弹窗
+                    - 工具执行的超时计时在授权等待期间不计：授权完成后工具才真正开始执行
+                    """
+                    async with _consent_lock:
+                        # 获取锁后复查：并发的其他工具调用可能已通过 conversation 级别授权
+                        already = await consent_manager.check_consented(
+                            exc.tool_name, exc.operation, exc.user_id,
+                            exc.session_id, exc.project_id,
+                        )
+                        if already:
+                            logger.debug(
+                                "consent 已由并发请求授权，跳过弹窗: tool=%s op=%s",
+                                exc.tool_name, exc.operation,
+                            )
+                            return "allow"
+
+                        loop = asyncio.get_event_loop()
+                        fut: asyncio.Future = loop.create_future()
+                        self._consent_futures[exc.request_id] = fut
+                        q.put_nowait({"event": "consent_required", "data": exc.to_dict()})
+                        try:
+                            decision = await asyncio.wait_for(
+                                asyncio.shield(fut), timeout=300
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning("consent 等待超时 request_id=%s", exc.request_id)
+                            decision = "deny"
+                        finally:
+                            self._consent_futures.pop(exc.request_id, None)
+
+                        if decision == "conversation":
+                            # 全量放行本轮所有危险操作，后续弹窗不再出现
+                            consent_manager.grant_conversation_all(turn_id)
+                        # "allow": 一次性允许，工具直接执行，无需持久化
+                        # "deny":  _wrapped_execute 返回拒绝结果，无需任何授权
+
+                        logger.info(
+                            "consent 决策: tool=%s op=%s decision=%s",
+                            exc.tool_name, exc.operation, decision,
+                        )
+                        _bus.consent_decision(exc.user_id, exc.tool_name, exc.operation, decision)
+                        return decision
+
+                _hook_token  = set_consent_hook(_consent_hook)
+                _turn_token  = set_consent_turn_id(turn_id)
+
                 agent_outputs: List[Dict[str, str]] = []
-                if pipeline and target_agent != self.router_agent.name:
-                    pipeline_response, agent_outputs = await self._execute_pipeline(
-                        pipeline=pipeline, mode=mode, intent=intent,
-                        user_id=user_id, llm=llm, context=ctx,
-                        dispatch_id=dispatch_id, user_input=user_input,
-                    )
-                else:
-                    pipeline_response = ""
+                try:
+                    if pipeline and target_agent != self.router_agent.name:
+                        pipeline_response, agent_outputs = await self._execute_pipeline(
+                            pipeline=pipeline, mode=mode, intent=intent,
+                            user_id=user_id, llm=llm, context=ctx,
+                            dispatch_id=dispatch_id, user_input=user_input,
+                        )
+                    else:
+                        pipeline_response = ""
+                finally:
+                    _CONSENT_HOOK.reset(_hook_token)
+                    _CONSENT_TURN_ID.reset(_turn_token)
 
                 # ── 最终 LLM 流式输出 ─────────────────────────────────────────────
                 if cancel_ev.is_set():
@@ -1694,22 +1892,24 @@ class HermesEngine:
                 full_response_parts: List[str] = []
                 scrubber = StreamingContextScrubber()
 
+                ctx_for_stream = dict(ctx) if isinstance(ctx, dict) else {}
                 if pipeline_response:
                     # 有 pipeline 结果：流式综合为最终回复
-                    ctx_with_result = dict(ctx) if isinstance(ctx, dict) else {}
-                    ctx_with_result["_pipeline_result"] = pipeline_response
-                    stream_gen = self._generate_llm_response_stream(
-                        llm=llm, user_id=user_id, user_input=user_input,
-                        intent=intent, tasks=tasks, context=ctx_with_result,
-                        agent_name=target_agent,
+                    ctx_for_stream["_pipeline_result"] = pipeline_response
+                elif agent_outputs:
+                    # Agent 执行了但未产生有效输出 → 告知 LLM 如实报告失败
+                    failed_agents = ", ".join(ao.get("agent_name", "?") for ao in agent_outputs)
+                    ctx_for_stream["_pipeline_result"] = (
+                        f"[执行结果] Agent（{failed_agents}）执行完毕，但未产生有效输出。"
+                        "请如实告知用户任务未能完成，简要说明可能原因，不要虚构完成情况。"
                     )
-                else:
-                    # 无 pipeline（Router 自处理）：直接流式回复
-                    stream_gen = self._generate_llm_response_stream(
-                        llm=llm, user_id=user_id, user_input=user_input,
-                        intent=intent, tasks=tasks, context=ctx,
-                        agent_name=target_agent,
-                    )
+                # else: 无 pipeline（Router 自处理）：不注入 _pipeline_result，直接回复
+
+                stream_gen = self._generate_llm_response_stream(
+                    llm=llm, user_id=user_id, user_input=user_input,
+                    intent=intent, tasks=tasks, context=ctx_for_stream,
+                    agent_name=target_agent,
+                )
 
                 async for chunk in stream_gen:
                     if cancel_ev.is_set():
@@ -1732,13 +1932,35 @@ class HermesEngine:
                 full_response = "".join(full_response_parts) or pipeline_response
                 _bus.llm_output(user_id, target_agent, full_response)
 
-                # 异步保存（_save_turn_async 会检查 _cancelled_turns 再决定是否写入）
+                # ── 对话轮次摘要日志 ──────────────────────────────────────────────
+                _agents_used = [p["agent_name"] for p in pipeline] if pipeline else [target_agent]
+                _tools_called: List[str] = []
+                for _ao in (agent_outputs or []):
+                    for _step in (_ao.get("steps") or []):
+                        _tn = _step.get("tool_name") or _step.get("tool")
+                        if _tn and _tn not in _tools_called:
+                            _tools_called.append(_tn)
                 _sctx = ctx if isinstance(ctx, dict) else {}
+                _bus.conversation_turn(
+                    user_id=user_id,
+                    turn_id=turn_id,
+                    user_message=user_input,
+                    intent=intent,
+                    mode=mode,
+                    agents_used=_agents_used,
+                    tools_called=_tools_called,
+                    response_len=len(full_response),
+                    elapsed_ms=(_time.monotonic() - _turn_start) * 1000,
+                    client_type=_sctx.get("_client_type", "api"),
+                )
+
+                # 异步保存（_save_turn_async 会检查 _cancelled_turns 再决定是否写入）
                 asyncio.create_task(self._save_turn_async(
                     user_id=user_id, user_input=user_input,
                     response=full_response, turn_id=turn_id,
                     intent=intent, target_agent=target_agent,
                     tasks=tasks, mode=mode, pipeline=pipeline,
+                    agent_outputs=agent_outputs,
                     client_type=_sctx.get("_client_type", ""),
                     client_version=_sctx.get("_client_version", ""),
                 ))
@@ -1749,6 +1971,7 @@ class HermesEngine:
                 logger.error("流式处理失败 user=%s: %s", user_id, e, exc_info=True)
                 q.put_nowait({"event": "error", "data": {"message": str(e)}})
             finally:
+                _end_turn(turn_id)
                 self._cancel_signals.pop(user_id, None)
                 q.put_nowait(None)  # 哨兵：通知生成器退出
 
@@ -1770,6 +1993,7 @@ class HermesEngine:
         user_id: str, user_input: str, response: str,
         turn_id: str, intent: str, target_agent: str,
         tasks: list, mode: str, pipeline: list,
+        agent_outputs: Optional[list] = None,
         client_type: str = "", client_version: str = "",
     ) -> None:
         """后台保存对话轮次到 ES 和 MemoryManager。取消的轮次直接跳过。"""
@@ -1780,7 +2004,15 @@ class HermesEngine:
         turn_metadata = {
             "intent": intent, "target_agent": target_agent,
             "tasks": tasks, "mode": mode,
-            "pipeline": [{"step": p["step"], "agent_name": p["agent_name"]} for p in pipeline],
+            "pipeline": [
+                {
+                    "step":             p["step"],
+                    "agent_name":       p["agent_name"],
+                    "task_description": (p.get("task") or {}).get("description", "")[:200],
+                }
+                for p in pipeline
+            ],
+            "agent_outputs":  agent_outputs or [],
             "client_type":    client_type,
             "client_version": client_version,
         }
@@ -1834,8 +2066,6 @@ class HermesEngine:
             return ag
 
         conn = await get_connection("mysql", None)
-        if not conn:
-            return None
         try:
             df = await conn.execute_raw(
                 "SELECT id, agent_name, job, `desc`, `public`, user_id "
@@ -1878,8 +2108,6 @@ class HermesEngine:
         conn = None
         try:
             conn = await get_connection("redis", None)
-            if not conn:
-                return
             payload = {
                 "dispatch_id": dispatch_id,
                 "user_id":     user_id,
@@ -1913,8 +2141,6 @@ class HermesEngine:
         conn = None
         try:
             conn = await get_connection("redis", None)
-            if not conn:
-                return
             key = f"dispatch:{user_id}:{dispatch_id}"
             raw = await conn.read(key)
             if not raw:
@@ -1977,6 +2203,28 @@ class HermesEngine:
         )
         return result_str
 
+    async def _run_agent_tracked(
+        self,
+        agent_name: str,
+        task: Dict[str, Any],
+        context: Dict[str, Any],
+        llm: Any,
+        user_id: str,
+    ) -> Tuple[str, Any]:
+        """Execute agent and collect tool/step events via ContextVar collector.
+
+        Returns (result_str, AgentExecCollector) so callers can attach execution
+        details to agent_outputs without changing _execute_agent_instance's signature.
+        """
+        from app.core.exec_collector import AgentExecCollector, set_collector, reset_collector
+        collector = AgentExecCollector()
+        token = set_collector(collector)
+        try:
+            result = await self._execute_agent_instance(agent_name, task, context, llm, user_id)
+        finally:
+            reset_collector(token)
+        return result, collector
+
     async def _execute_parallel(
         self,
         pipeline: List[Dict[str, Any]],
@@ -1996,38 +2244,47 @@ class HermesEngine:
         for step in pipeline:
             _pb.push("agent_start", {"step": step["step"], "agent_name": step["agent_name"]})
 
-        coros = [
-            self._execute_agent_instance(step["agent_name"], step["task"], context, llm, user_id)
-            for step in pipeline
-        ]
-        raw_results = await asyncio.gather(*coros, return_exceptions=True)
+        async def _tracked(s):
+            try:
+                r, col = await self._run_agent_tracked(s["agent_name"], s["task"], context, llm, user_id)
+                return s, r, col
+            except Exception as exc:
+                from app.core.exec_collector import AgentExecCollector
+                return s, f"执行出错: {exc}", AgentExecCollector()
+
+        raw_results = await asyncio.gather(*[_tracked(s) for s in pipeline], return_exceptions=True)
 
         result_dicts: List[Dict[str, Any]] = []
-        for step, r in zip(pipeline, raw_results):
-            if isinstance(r, Exception):
-                r = f"执行出错: {r}"
-            result_dicts.append({"agent": step["agent_name"], "result": str(r)})
+        agent_outputs: List[Dict[str, Any]] = []
+        for item in raw_results:
+            if isinstance(item, Exception):
+                continue
+            step, r, collector = item
+            r_str = str(r)
+            result_dicts.append({"agent": step["agent_name"], "result": r_str})
+            agent_outputs.append({
+                "agent_name": step["agent_name"],
+                "task_description": step.get("task", {}).get("description", "")[:300],
+                "output": r_str,
+                **collector.to_dict(),
+            })
             _pb.push("agent_done", {
                 "step":           step["step"],
                 "agent_name":     step["agent_name"],
-                "result_preview": str(r)[:150],
+                "result_preview": r_str[:150],
             })
             is_last = (step["step"] == pipeline[-1]["step"])
             await self._update_dispatch_step(
-                user_id, dispatch_id, step["step"], "done", str(r), is_last
+                user_id, dispatch_id, step["step"], "done", r_str, is_last
             )
             if self.memory_manager is not None:
                 asyncio.create_task(self.memory_manager.on_delegation(
                     user_id, step["agent_name"],
-                    step["task"].get("description", ""), str(r),
+                    step["task"].get("description", ""), r_str,
                 ))
 
         await self.router_agent.validate_parallel_completeness(intent, result_dicts, llm=llm)
 
-        agent_outputs = [
-            {"agent_name": r["agent"], "output": r["result"]}
-            for r in result_dicts
-        ]
         merged = "\n\n".join(
             f"【{r['agent']}】\n{r['result']}"
             for r in result_dicts
@@ -2051,11 +2308,11 @@ class HermesEngine:
 
         accumulated   = dict(context)
         last_result   = ""
-        agent_outputs: List[Dict[str, str]] = []
+        agent_outputs: List[Dict[str, Any]] = []
 
         for i, step in enumerate(pipeline):
             _pb.push("agent_start", {"step": step["step"], "agent_name": step["agent_name"]})
-            result  = await self._execute_agent_instance(
+            result, collector = await self._run_agent_tracked(
                 step["agent_name"], step["task"], accumulated, llm, user_id
             )
             is_last = (i == len(pipeline) - 1)
@@ -2067,7 +2324,12 @@ class HermesEngine:
             await self._update_dispatch_step(
                 user_id, dispatch_id, step["step"], "done", result, is_last
             )
-            agent_outputs.append({"agent_name": step["agent_name"], "output": result})
+            agent_outputs.append({
+                "agent_name": step["agent_name"],
+                "task_description": step.get("task", {}).get("description", "")[:300],
+                "output": result,
+                **collector.to_dict(),
+            })
             if self.memory_manager is not None:
                 asyncio.create_task(self.memory_manager.on_delegation(
                     user_id, step["agent_name"],
@@ -2105,7 +2367,20 @@ class HermesEngine:
         dispatch_id: str,
         user_input: str,
     ) -> Tuple[str, List[Dict[str, str]]]:
-        """根据 mode 执行 pipeline，返回 (最终回复文本, per-agent 输出列表)。"""
+        """根据 mode 执行 pipeline，外层 while 循环由 LLM 判断整体结果后退出。
+
+        流程：
+          1. for 遍历当前 pipeline 中每个 Agent 任务并执行
+          2. 所有 Agent 完成后，LLM 判断结果是否满足用户原始请求
+          3. 满足 → 退出循环；不满足 → router 重新规划 pipeline → 推送 router_replan 事件 → 再次执行
+          4. 最多 MAX_ROUTER_ITERATIONS 轮
+        """
+        from app.utils import progress_bus as _pb
+
+        MAX_ROUTER_ITERATIONS = 3
+        result       = ""
+        agent_outputs: List[Dict[str, str]] = []
+
         if not pipeline:
             result = await self._generate_llm_response(
                 llm=llm, user_id=user_id, user_input=user_input,
@@ -2113,24 +2388,107 @@ class HermesEngine:
                 agent_name=self.router_agent.name, tool_results=None,
             )
             return result, []
-        if mode == "parallel":
-            return await self._execute_parallel(pipeline, intent, user_id, llm, context, dispatch_id)
-        if mode == "serial":
-            return await self._execute_serial(pipeline, user_id, llm, context, dispatch_id)
-        # single
-        from app.utils import progress_bus as _pb
-        step   = pipeline[0]
-        _pb.push("agent_start", {"step": step["step"], "agent_name": step["agent_name"]})
-        result = await self._execute_agent_instance(
-            step["agent_name"], step["task"], context, llm, user_id
-        )
-        _pb.push("agent_done", {
-            "step":           step["step"],
-            "agent_name":     step["agent_name"],
-            "result_preview": result[:150],
-        })
-        await self._update_dispatch_step(user_id, dispatch_id, step["step"], "done", result, True)
-        return result, [{"agent_name": step["agent_name"], "output": result}]
+
+        # Make original user request available to every agent via context
+        if isinstance(context, dict):
+            context.setdefault("_user_input", user_input)
+
+        # Safeguard: if a task description doesn't include the user's specifics
+        # (e.g. URL, filename), append the original request as context so agents
+        # aren't left guessing.
+        for step in pipeline:
+            task = step.get("task", {})
+            desc = task.get("description", "")
+            if user_input and user_input not in desc:
+                task["description"] = f"{desc}\n\n[用户原始请求：{user_input}]"
+
+        for router_iteration in range(MAX_ROUTER_ITERATIONS):
+            # ── 单轮执行 ──────────────────────────────────────────────
+            if mode == "parallel":
+                result, agent_outputs = await self._execute_parallel(
+                    pipeline, intent, user_id, llm, context, dispatch_id
+                )
+            elif mode == "serial":
+                result, agent_outputs = await self._execute_serial(
+                    pipeline, user_id, llm, context, dispatch_id
+                )
+            else:
+                step = pipeline[0]
+                _pb.push("agent_start", {"step": step["step"], "agent_name": step["agent_name"]})
+                result, collector = await self._run_agent_tracked(
+                    step["agent_name"], step["task"], context, llm, user_id
+                )
+                _pb.push("agent_done", {
+                    "step":           step["step"],
+                    "agent_name":     step["agent_name"],
+                    "result_preview": result[:150],
+                })
+                await self._update_dispatch_step(user_id, dispatch_id, step["step"], "done", result, True)
+                agent_outputs = [{
+                    "agent_name": step["agent_name"],
+                    "task_description": step.get("task", {}).get("description", "")[:300],
+                    "output": result,
+                    **collector.to_dict(),
+                }]
+
+            # 最后一轮不再判断，直接返回
+            if router_iteration >= MAX_ROUTER_ITERATIONS - 1:
+                break
+
+            # ── 路由级 LLM 判断 ──────────────────────────────────────
+            pipeline_results = [
+                {"agent": ao["agent_name"], "result": ao["output"]}
+                for ao in agent_outputs
+            ]
+            judgment = await self.router_agent.judge_overall_result(
+                user_input, pipeline_results, llm
+            )
+            if judgment.get("satisfied", True):
+                logger.debug(
+                    "[Pipeline] 第 %d 轮结果满足用户期望，退出循环",
+                    router_iteration + 1,
+                )
+                break
+
+            # ── 重新规划 ─────────────────────────────────────────────
+            new_pipeline = await self.router_agent.replan_agents(
+                user_input,
+                judgment["issue"],
+                judgment["suggestion"],
+                pipeline_results,
+                llm,
+            )
+            if not new_pipeline:
+                logger.warning("[Pipeline] 重新规划返回空 pipeline，使用上一轮结果")
+                break
+
+            pipeline = new_pipeline
+            _pb.push("router_replan", {
+                "reason":     judgment["issue"],
+                "iteration":  router_iteration + 1,
+                "new_agents": [p["agent_name"] for p in new_pipeline],
+            })
+            # 推送新一轮 planning 事件，前端可刷新 agent 列表
+            _pb.push("planning", {
+                "intent":   intent,
+                "mode":     mode,
+                "replan":   True,
+                "iteration": router_iteration + 1,
+                "pipeline": [
+                    {
+                        "step":        p["step"],
+                        "agent_name":  p["agent_name"],
+                        "description": (p.get("task") or {}).get("description", "")[:100],
+                    }
+                    for p in new_pipeline
+                ],
+            })
+            logger.info(
+                "[Pipeline] 第 %d 轮结果不满足，原因：%s，重新规划 %d 个 Agent",
+                router_iteration + 1, judgment["issue"], len(new_pipeline),
+            )
+
+        return result, agent_outputs
 
     async def shutdown(self) -> None:
         """

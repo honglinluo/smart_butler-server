@@ -1,4 +1,20 @@
-"""Content Fetcher — 主动探测用户输入中的文件路径和网址并获取内容
+"""
+【模块说明】内容获取器（ContentFetcher）— 自动从用户消息中识别并读取文件和网页
+
+当用户发来"帮我分析这个文件 /home/user/data.csv"或"帮我总结这个网页 https://..."时，
+AI 需要先去把文件内容或网页内容实际读取出来，才能进行分析。
+这个模块负责自动识别并获取这些内容。
+
+【三个主要功能】
+  fetch_context_for_input()  — 扫描用户输入，找出文件路径/URL，获取内容注入上下文
+  detect_output_request()    — 识别用户是否要求"把结果保存为文件"
+  write_output_file()        — 把 AI 生成的内容写入指定文件
+
+【安全限制】
+  - 单个文件最大读取 512 KB
+  - 网页抓取有超时限制，防止等待太久
+
+Content Fetcher — 主动探测用户输入中的文件路径和网址并获取内容
 
 入口函数:
   fetch_context_for_input(text)  → (context_str, input_file_paths)

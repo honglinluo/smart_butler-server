@@ -1,4 +1,15 @@
-"""Skill 生成 Agent — 根据规格生成/优化 Agent 技能记忆文件（Markdown）"""
+"""
+【模块说明】Skill 生成 Agent（SkillBuilderAgent）— 帮 Agent "写下自己的经验"
+
+这是一个专门服务于其他 Agent 的系统 Agent（用户不直接与它交互）。
+它的工作是：根据某个 Agent 的历史成功案例，生成或优化 Skill 文件（Markdown 格式的"经验文档"）。
+
+【调用场景】
+  - 系统每日自动触发 skill 演进时，由 SkillEvolver 调用
+  - 管理员手动触发重建某个 Agent 的 Skill
+
+Skill 生成 Agent — 根据规格生成/优化 Agent 技能记忆文件（Markdown）
+"""
 
 import json
 import logging
@@ -187,6 +198,46 @@ class SkillBuilderAgent(BaseAgent):
         else:  # optimize
             return await self._do_optimize(skill_name, target_path, spec, llm)
 
+    # ── 公共：ainvoke → 写文件 → update_skill → 返回结果 ─────────────
+
+    async def _invoke_and_save(
+        self,
+        skill_name:  str,
+        target_path: str,
+        action:      str,
+        messages:    list,
+        skill_key:   str,
+        skill_note:  str,
+        llm,
+    ) -> dict:
+        """ainvoke LLM，将结果写入文件，记录技能，返回标准结果字典。"""
+        try:
+            resp = await llm.ainvoke(messages)
+            content = resp.content
+            saved_path = self._write_file(target_path, content)
+            await self.update_skill(skill_key, skill_note, success=True)
+            logger.info("技能文件已%s: skill=%s path=%s",
+                        "生成" if action == "generate" else "优化", skill_name, saved_path)
+            return {
+                "result": f"✅ 技能文件已{'生成' if action == 'generate' else '优化'}并保存到 {saved_path}",
+                "success": True,
+                "metadata": {
+                    "agent":           self.name,
+                    "action":          action,
+                    "skill_name":      skill_name,
+                    "saved_path":      str(saved_path),
+                    "content_preview": content[:300],
+                },
+            }
+        except PermissionError as e:
+            logger.error("技能文件写入权限不足: path=%s error=%s", target_path, e)
+            return {"result": f"写入失败（权限不足）: {target_path}", "success": False, "metadata": {}}
+        except Exception as e:
+            logger.error("技能%s失败: skill=%s error=%s",
+                         "生成" if action == "generate" else "优化", skill_name, e)
+            return {"result": f"{'生成' if action == 'generate' else '优化'}失败: {e}",
+                    "success": False, "metadata": {}}
+
     # ── 生成技能文件 ──────────────────────────────────────────────────
 
     async def _do_generate(
@@ -200,48 +251,21 @@ class SkillBuilderAgent(BaseAgent):
             }
 
         spec_json = json.dumps(spec, ensure_ascii=False, indent=2)
-        human_content = (
-            f"技能名称：{skill_name}\n"
-            f"当前日期：{datetime.now().strftime('%Y-%m-%d')}\n\n"
-            f"技能规格（JSON）：\n```json\n{spec_json}\n```\n\n"
-            "请生成完整的技能记忆文件。"
+        messages = [
+            SystemMessage(content=_GENERATE_SYSTEM),
+            HumanMessage(content=(
+                f"技能名称：{skill_name}\n"
+                f"当前日期：{datetime.now().strftime('%Y-%m-%d')}\n\n"
+                f"技能规格（JSON）：\n```json\n{spec_json}\n```\n\n"
+                "请生成完整的技能记忆文件。"
+            )),
+        ]
+        return await self._invoke_and_save(
+            skill_name, target_path, "generate", messages,
+            f"生成技能:{skill_name}",
+            f"target={target_path} steps={len(spec.get('steps', []))}",
+            llm,
         )
-
-        try:
-            resp = await llm.ainvoke([
-                SystemMessage(content=_GENERATE_SYSTEM),
-                HumanMessage(content=human_content),
-            ])
-            content = resp.content if hasattr(resp, "content") else str(resp)
-            saved_path = self._write_file(target_path, content)
-
-            await self.update_skill(
-                f"生成技能:{skill_name}",
-                f"target={target_path} steps={len(spec.get('steps', []))}",
-                success=True,
-            )
-            logger.info("技能文件已生成: skill=%s path=%s", skill_name, saved_path)
-            return {
-                "result": f"✅ 技能文件已生成并保存到 {saved_path}",
-                "success": True,
-                "metadata": {
-                    "agent": self.name,
-                    "action": "generate",
-                    "skill_name": skill_name,
-                    "saved_path": str(saved_path),
-                    "content_preview": content[:300],
-                },
-            }
-        except PermissionError as e:
-            logger.error("技能文件写入权限不足: path=%s error=%s", target_path, e)
-            return {
-                "result": f"写入失败（权限不足）: {target_path}",
-                "success": False,
-                "metadata": {},
-            }
-        except Exception as e:
-            logger.error("技能生成失败: skill=%s error=%s", skill_name, e)
-            return {"result": f"生成失败: {e}", "success": False, "metadata": {}}
 
     # ── 优化技能文件 ──────────────────────────────────────────────────
 
@@ -279,50 +303,23 @@ class SkillBuilderAgent(BaseAgent):
                 "metadata": {},
             }
 
-        human_content = (
-            f"技能名称：{skill_name}\n"
-            f"优化方向：{improvement_notes}\n"
-            f"使用反馈：{spec.get('usage_feedback', '无')}\n"
-            f"当前日期：{datetime.now().strftime('%Y-%m-%d')}\n\n"
-            f"当前技能文件内容：\n```markdown\n{existing_content}\n```\n\n"
-            "请生成改进后的完整技能文件内容。"
+        messages = [
+            SystemMessage(content=_OPTIMIZE_SYSTEM),
+            HumanMessage(content=(
+                f"技能名称：{skill_name}\n"
+                f"优化方向：{improvement_notes}\n"
+                f"使用反馈：{spec.get('usage_feedback', '无')}\n"
+                f"当前日期：{datetime.now().strftime('%Y-%m-%d')}\n\n"
+                f"当前技能文件内容：\n```markdown\n{existing_content}\n```\n\n"
+                "请生成改进后的完整技能文件内容。"
+            )),
+        ]
+        return await self._invoke_and_save(
+            skill_name, target_path, "optimize", messages,
+            f"优化技能:{skill_name}",
+            improvement_notes[:80],
+            llm,
         )
-
-        try:
-            resp = await llm.ainvoke([
-                SystemMessage(content=_OPTIMIZE_SYSTEM),
-                HumanMessage(content=human_content),
-            ])
-            content = resp.content if hasattr(resp, "content") else str(resp)
-            saved_path = self._write_file(target_path, content)
-
-            await self.update_skill(
-                f"优化技能:{skill_name}",
-                improvement_notes[:80],
-                success=True,
-            )
-            logger.info("技能文件已优化: skill=%s path=%s", skill_name, saved_path)
-            return {
-                "result": f"✅ 技能文件已优化并保存到 {saved_path}",
-                "success": True,
-                "metadata": {
-                    "agent": self.name,
-                    "action": "optimize",
-                    "skill_name": skill_name,
-                    "saved_path": str(saved_path),
-                    "content_preview": content[:300],
-                },
-            }
-        except PermissionError as e:
-            logger.error("技能文件写入权限不足: path=%s error=%s", target_path, e)
-            return {
-                "result": f"写入失败（权限不足）: {target_path}",
-                "success": False,
-                "metadata": {},
-            }
-        except Exception as e:
-            logger.error("技能优化失败: skill=%s error=%s", skill_name, e)
-            return {"result": f"优化失败: {e}", "success": False, "metadata": {}}
 
     # ── 输入解析与校验 ────────────────────────────────────────────────
 

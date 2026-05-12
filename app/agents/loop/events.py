@@ -1,4 +1,14 @@
-"""Agent 事件循环 — 数据模型（事件类型、工具请求、构建结果）"""
+"""
+【模块说明】Agent 事件循环数据模型 — 定义执行过程中的事件类型和数据结构
+
+这里定义了 Agent 事件循环中用到的所有"数据格式"：
+  LoopEventType    — 事件类型枚举（任务开始/工具被请求/工具构建完成/需要用户决策等）
+  LoopLogEntry     — 单条日志记录（时间、事件类型、详情）
+  ToolCodeRequest  — Agent 请求构建新工具时发出的请求结构（工具名、功能描述、参数定义）
+  BuiltTool        — 工具构建完成后的结果（生成的代码、函数名、文件路径）
+
+Agent 事件循环 — 数据模型（事件类型、工具请求、构建结果）
+"""
 from __future__ import annotations
 
 import json

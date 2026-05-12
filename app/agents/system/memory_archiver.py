@@ -1,4 +1,23 @@
-"""内置记忆归档智能体 — 仅供 Hermes 引擎调用，不注册到 AgentRegistry。
+"""
+【模块说明】记忆压缩 Agent（MemoryArchiver）— 把"太多对话"压缩成精华摘要
+
+每次对话都会存入记忆，随着时间推移，记忆越积越多会占用大量空间，而且会影响 AI 搜索速度。
+这个 Agent 负责在必要时把多轮对话"压缩"：把 N 条对话记录合并成一条摘要记录。
+
+【工作流程（Saga 模式，确保数据安全）】
+  1. 从 Redis 读取当前对话轮次数据
+  2. 把 Redis 中的数据先保存到 Elasticsearch（确保有备份，之后出错也能恢复）
+  3. 调用 SummarizerAgent 生成摘要内容
+  4. 把摘要写入 Elasticsearch（达到检查点后，才允许删除原始数据）
+  5. 清空 Redis 旧轮次，写入摘要，重置轮次计数器
+  6. 删除 Elasticsearch 中的旧原始数据
+  7. 后台：更新用户画像、向量化摘要、记录 MySQL 统计信息
+
+【为什么用 Saga 模式？】
+  数据跨多个存储系统（Redis / Elasticsearch / MySQL），任何一步出错都要能安全回滚。
+  Saga 模式通过"先写后删"和"检查点确认"保证数据一致性，不会因为中途失败而丢数据。
+
+内置记忆归档智能体 — 仅供 Hermes 引擎调用，不注册到 AgentRegistry。
 
 步骤顺序（Saga 模式，先写后删）：
   1. 从 Redis 读取当前轮次
@@ -236,8 +255,6 @@ class MemoryArchiverAgent:
         mysql_conn = None
         try:
             mysql_conn = await get_connection("mysql", None)
-            if not mysql_conn:
-                return
             rows = await mysql_conn.execute_raw(
                 """
                 SELECT job_id, user_id, status, summary_turn_id, summary_text,
@@ -423,8 +440,6 @@ class MemoryArchiverAgent:
         mysql_conn = None
         try:
             mysql_conn = await get_connection("mysql", None)
-            if not mysql_conn:
-                return
             await mysql_conn.execute_raw(
                 """
                 INSERT INTO memory_compress_jobs (job_id, user_id, status, reason)
@@ -453,8 +468,6 @@ class MemoryArchiverAgent:
         mysql_conn = None
         try:
             mysql_conn = await get_connection("mysql", None)
-            if not mysql_conn:
-                return
             sets   = ["status = :status", "updated_at = NOW()"]
             params: Dict[str, Any] = {"job_id": job_id, "status": status}
             if compressed_turns is not None:
@@ -508,8 +521,6 @@ class MemoryArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return
             flushed = 0
             for turn in turns:
                 tid = turn.get("turn_id")
@@ -547,9 +558,6 @@ class MemoryArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                logger.warning(f"[MemoryArchiver] 无法获取 ES 连接 user={user_id}")
-                return False
             await es_conn.create(
                 index=user_id,
                 doc_id=summary_turn["turn_id"],
@@ -572,8 +580,6 @@ class MemoryArchiverAgent:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return
             await redis_conn.delete_list(_KEY_TURNS.format(user_id=user_id))
             await redis_conn.push_to_list(
                 _KEY_TURNS.format(user_id=user_id),
@@ -622,9 +628,6 @@ class MemoryArchiverAgent:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                logger.warning(f"[MemoryArchiver] 无法获取 ES 连接，旧轮次未删除 user={user_id}")
-                return False
             failed_ids: List[str] = []
             for tid in turn_ids:
                 try:

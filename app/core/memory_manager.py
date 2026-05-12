@@ -1,4 +1,23 @@
-"""记忆管理模块 - 多层记忆存储、同步与检索
+"""
+【模块说明】记忆管理器（MemoryManager）— AI 的"长期记忆"系统
+
+这个模块负责保存和检索用户与 AI 之间的历史对话，让 AI 能够"记住"之前发生的事情。
+
+【三层存储架构】
+  L1  Redis（内存缓存）— 保存最近 10 轮对话，读取速度极快（毫秒级）
+      用途：每次对话前快速加载上下文
+  L2  MySQL（关系数据库）— 保存对话引用统计，用于判断哪些记忆"很少被提起"
+      用途：清理决策依据（长期不被引用的记忆可以归档压缩）
+  L3  Elasticsearch（搜索引擎）— 全量对话存档，支持全文搜索和语义检索
+      用途：从海量历史中找出"与当前话题相关"的记忆片段
+
+【记忆压缩机制】
+  当对话积累太多时，系统会自动把旧对话"压缩"成摘要：
+  - 超过 30 轮 → 挂起任务，30 秒后在后台压缩
+  - 超过 3 天没聊天 → 挂起任务，后台压缩
+  - 当前上下文超过 2 万字 → 立即压缩（不等待）
+
+记忆管理模块 - 多层记忆存储、同步与检索
 
 层级说明:
   L1  Redis      — 最近 N 轮对话列表，快速加载上下文
@@ -42,11 +61,16 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
-    """多层记忆管理器。
+    """
+    多层记忆管理器 — AI 对话记忆的存储、检索和压缩中枢。
 
-    初始化参数 config 为 system_config.yaml 解析后的完整字典，
-    即包含 system / database / agents 等顶层键。
-    VectorStore 通过 set_vector_store() 注入（main.py 在两者初始化后调用）。
+    工作方式：
+      每次对话结束后，把这轮对话保存到 Redis（L1），
+      积累到一定量后自动同步到 Elasticsearch（L3）做长期存档。
+      下次对话前，先检查预取缓存，再从 ES 检索相关历史，注入到 AI 提示词中。
+
+    初始化时需传入 system_config.yaml 的配置字典。
+    向量检索功能通过 set_vector_store() 在主程序初始化完成后注入。
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -224,8 +248,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return []
             if client_type:
                 key = _KEY_SESSION_TURNS.format(user_id=user_id, client_type=client_type)
             else:
@@ -266,8 +288,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return
             client = getattr(redis_conn, "redis_client", None)
             _ttl = 3600 * 24 * 30
 
@@ -295,8 +315,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return 0
             count = await redis_conn.increment(_KEY_TOTAL.format(user_id=user_id))
             return count or 0
         except Exception as e:
@@ -311,8 +329,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return 0
             return await redis_conn.get_list_length(_KEY_TURNS.format(user_id=user_id)) or 0
         except Exception as e:
             logger.warning(f"Redis list length 失败 user={user_id}: {e}")
@@ -331,8 +347,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return
             lock_key = _KEY_LOCK.format(user_id=user_id)
             locked = await redis_conn.create(lock_key, "1", ttl=30)
             if not locked:
@@ -351,8 +365,6 @@ class MemoryManager:
             es_conn = None
             try:
                 es_conn = await get_connection("elasticsearch", None)
-                if not es_conn:
-                    return
                 synced = 0
                 for turn in turns:
                     turn_id = turn.get("turn_id")
@@ -511,8 +523,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return False
             key     = _KEY_LAST_ACTIVITY.format(user_id=user_id)
             last_ts = await redis_conn.read(key)
             triggered = False
@@ -559,8 +569,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return None
             raw = await redis_conn.read(_KEY_COMPRESS_PENDING.format(user_id=user_id))
             if not raw:
                 return None
@@ -590,8 +598,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return 0
             val = await redis_conn.read(_KEY_TOTAL.format(user_id=user_id))
             return int(val) if val else 0
         except Exception:
@@ -614,8 +620,6 @@ class MemoryManager:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return []
             raw = await es_conn.search(
                 index=user_id,
                 query={
@@ -651,8 +655,6 @@ class MemoryManager:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            if not es_conn:
-                return []
             raw_hits = await es_conn.vector_search(
                 index=user_id,
                 vector=embedding,
@@ -750,8 +752,6 @@ class MemoryManager:
         mysql_conn = None
         try:
             mysql_conn = await get_connection("mysql", "agent_db")
-            if not mysql_conn:
-                return
             await mysql_conn.execute_raw(
                 """
                 INSERT IGNORE INTO memory_references (turn_id, user_id, ref_count)
@@ -770,8 +770,6 @@ class MemoryManager:
         mysql_conn = None
         try:
             mysql_conn = await get_connection("mysql", "agent_db")
-            if not mysql_conn:
-                return
             await mysql_conn.execute_raw(
                 """
                 INSERT INTO memory_references (turn_id, user_id, ref_count)
@@ -809,8 +807,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return
             record = {
                 "agent_name":    agent_name,
                 "task_desc":     task_desc[:300],
@@ -840,8 +836,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return []
             key    = _KEY_DELEGATIONS.format(user_id=user_id)
             client = getattr(redis_conn, "redis_client", None)
             if not client:
@@ -945,8 +939,6 @@ class MemoryManager:
             redis_conn = None
             try:
                 redis_conn = await get_connection("redis", None)
-                if not redis_conn:
-                    return
                 key    = _KEY_PREFETCH_RESULT.format(user_id=user_id)
                 client = getattr(redis_conn, "redis_client", None)
                 if client:
@@ -970,8 +962,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return []
             key    = _KEY_PREFETCH_RESULT.format(user_id=user_id)
             client = getattr(redis_conn, "redis_client", None)
             if not client:
@@ -1001,8 +991,6 @@ class MemoryManager:
         redis_conn = None
         try:
             redis_conn = await get_connection("redis", None)
-            if not redis_conn:
-                return ""
             raw = await redis_conn.read(_KEY_USER_INIT.format(user_id=user_id))
             if not raw:
                 return ""

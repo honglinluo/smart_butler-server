@@ -1,4 +1,20 @@
-"""Agent 事件循环 — 用户决策门控
+"""
+【模块说明】用户决策门控（DecisionGate）— AI 构建新工具前的"人工审批"机制
+
+当 Agent 需要临时创建一个新工具时（如写一段代码、调用某个 API），
+为了安全起见，默认需要先暂停，推送一个弹窗给用户："AI 想构建一个工具，是否允许？"
+这个模块负责实现"暂停 → 等待用户回应 → 继续/拒绝"这个流程。
+
+【三种策略（用户可在设置中配置）】
+  allow — 完全信任该 Agent，自动放行所有工具构建请求
+  ask   — 每次构建前暂停等待确认（默认值）
+  deny  — 拒绝该 Agent 的所有工具构建请求
+
+【等待机制】
+  系统使用异步事件（asyncio.Event）挂起协程，等待用户通过 API 接口发来"确认"或"拒绝"信号。
+  如果用户 5 分钟内没有回应，自动按"拒绝"处理。
+
+Agent 事件循环 — 用户决策门控
 
 决策策略（Redis key: user:{user_id}:decision_policy）：
   allow — 所有工具构建自动放行（无需确认）
@@ -21,7 +37,9 @@ logger = logging.getLogger("agent_loop.decision")
 
 _WAIT_TIMEOUT = 300.0  # 5 min
 
-# 进程级挂起决策表（单 worker 进程内有效；多进程需用 Redis pub/sub）
+# REDUNDANT[DG01]: 进程级挂起决策表——单 worker 进程内有效。
+# 多进程部署（gunicorn -w N）或进程重启后所有挂起状态丢失，客户端永久等待超时。
+# 建议：以 Redis pub/sub / Streams 替换，key = "decision:{decision_id}"，TTL = _WAIT_TIMEOUT + 30。
 _pending_events:  Dict[str, asyncio.Event]  = {}
 _pending_results: Dict[str, "DecisionState"] = {}
 

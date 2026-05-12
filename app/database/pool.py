@@ -1,4 +1,23 @@
-"""数据库连接池管理 - 实现连接池、队列、心跳检测等功能"""
+"""
+【模块说明】数据库连接池管理 — 统一管理 MySQL、Redis、Elasticsearch 的数据库连接
+
+【什么是连接池？】
+  数据库连接的建立和销毁很耗时。
+  连接池提前创建一批连接"备用"，需要时直接取用，用完归还，而不是每次都新建。
+  这样可以大幅提升数据库操作的速度，减少资源浪费。
+
+【本模块的作用】
+  统一管理三种数据库的连接池：
+  - MySQL：关系型数据库，存储用户账号、对话记录、模型配置等结构化数据
+  - Redis：内存缓存数据库，存储登录会话、最近对话等需要快速读写的数据
+  - Elasticsearch：搜索引擎，存储全量历史对话并支持全文检索和语义搜索
+
+【连接生命周期管理】
+  - 定期心跳检测：自动检测连接是否仍然有效，失效则重建
+  - 过期回收：使用时间过长的连接自动关闭并替换
+  - 排队等待：所有连接都被占用时，新请求排队等待，超时则报错
+"""
+
 
 import asyncio
 from typing import Any, Dict, List, Optional, Type, Tuple
@@ -206,114 +225,122 @@ class DatabaseConnectionPool:
             logger.error(f"创建连接失败: {str(e)}")
             return None
     
-    async def acquire(self, timeout: Optional[int] = None) -> Optional[DatabaseBase]:
+    async def acquire(self, timeout: Optional[int] = None) -> DatabaseBase:
         """
-        从连接池获取一个连接
-        
+        从连接池获取一个经过健康验证的连接。
+        逐一检查可用连接的健康状态：首个通过即返回；全部失败则强制新建连接。
+        无法获取任何可用连接时抛出 RuntimeError（不返回 None）。
+
         Args:
             timeout: 等待超时时间 (秒)，None 表示使用默认超时
-            
+
         Returns:
-            Optional[DatabaseBase]: 数据库连接实例
+            DatabaseBase: 经健康验证的数据库连接实例
+
+        Raises:
+            RuntimeError: 所有连接均不可用且无法新建连接时
         """
         timeout = timeout or self.connection_timeout
         wait_start = datetime.now()
-        
+
         async with self.lock:
             self.stats["total_requests"] += 1
-        
+
         try:
-            # 1. 尝试从可用连接队列获取
+            # 1. 遍历可用连接队列，找到第一个健康的连接
+            async with self.lock:
+                checked: List[PooledConnection] = []
+                found: Optional[PooledConnection] = None
+
+                while self.available_connections:
+                    candidate = self.available_connections.popleft()
+
+                    # 跳过已过期连接
+                    if candidate.is_expired(self.max_connection_lifetime):
+                        logger.warning(f"连接已过期，丢弃: {candidate.pool_id}")
+                        await candidate.close()
+                        self.all_connections.pop(candidate.pool_id, None)
+                        continue
+
+                    # 快速健康检查
+                    try:
+                        is_healthy = await candidate.connection.health_check()
+                    except Exception:
+                        is_healthy = False
+
+                    if is_healthy:
+                        candidate.update_heartbeat()
+                        found = candidate
+                        break
+                    else:
+                        logger.warning(f"连接健康检查失败，跳过: {candidate.pool_id}")
+                        candidate.mark_as_unhealthy()
+                        await candidate.close()
+                        self.all_connections.pop(candidate.pool_id, None)
+
+                # 将未使用的健康候选归还（不应有，但以防万一）
+                for c in checked:
+                    self.available_connections.appendleft(c)
+
+                if found:
+                    found.mark_as_busy()
+                    self.busy_connections[found.pool_id] = found
+                    self.stats["available_connections"] = len(self.available_connections)
+                    self.stats["busy_connections"] = len(self.busy_connections)
+                    logger.debug(f"从连接池获取健康连接: {found.pool_id}")
+                    return found.connection
+
+            # 2. 没有可用连接 → 尝试创建新连接（不受 max_connections 约束，紧急补位）
+            async with self.lock:
+                pooled_conn = await self._create_connection()
+                if pooled_conn:
+                    pooled_conn.mark_as_busy()
+                    self.busy_connections[pooled_conn.pool_id] = pooled_conn
+                    self.stats["total_connections"] = len(self.all_connections)
+                    self.stats["busy_connections"] = len(self.busy_connections)
+                    logger.info(f"新建连接（池中无可用）: {pooled_conn.pool_id}")
+                    return pooled_conn.connection
+
+            # 3. 连接池已满且无可用连接 → 排队等待
+            logger.debug(f"连接池满，等待可用连接 (超时: {timeout}s)")
+            async with self.lock:
+                self.stats["waiting_requests"] += 1
+
+            wait_event = asyncio.Event()
+            await self.waiting_queue.put(wait_event)
+
+            try:
+                await asyncio.wait_for(wait_event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.error(f"获取连接超时 ({timeout}s)")
+                try:
+                    self.waiting_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                raise RuntimeError(f"获取数据库连接超时（{timeout}s），请稍后重试")
+
             if self.available_connections:
                 async with self.lock:
                     pooled_conn = self.available_connections.popleft()
-                    
-                    # 检查连接健康状态
-                    if pooled_conn.status == ConnectionStatus.UNHEALTHY:
-                        logger.warning(f"连接不健康，重新创建: {pooled_conn.pool_id}")
-                        await pooled_conn.close()
-                        del self.all_connections[pooled_conn.pool_id]
-                        return await self.acquire(timeout)
-                    
-                    # 检查连接是否过期
-                    if pooled_conn.is_expired(self.max_connection_lifetime):
-                        logger.warning(f"连接已过期，重新创建: {pooled_conn.pool_id}")
-                        await pooled_conn.close()
-                        del self.all_connections[pooled_conn.pool_id]
-                        return await self.acquire(timeout)
-                    
                     pooled_conn.mark_as_busy()
                     self.busy_connections[pooled_conn.pool_id] = pooled_conn
-                    
-                    self.stats["available_connections"] = len(self.available_connections)
-                    self.stats["busy_connections"] = len(self.busy_connections)
-                    
-                    logger.debug(f"从连接池获取连接: {pooled_conn.pool_id}")
-                    return pooled_conn.connection
-            
-            # 2. 如果没有可用连接但未达到最大值，创建新连接
-            async with self.lock:
-                if len(self.all_connections) < self.max_connections:
-                    pooled_conn = await self._create_connection()
-                    if pooled_conn:
-                        pooled_conn.mark_as_busy()
-                        self.busy_connections[pooled_conn.pool_id] = pooled_conn
-                        
-                        self.stats["total_connections"] = len(self.all_connections)
-                        self.stats["busy_connections"] = len(self.busy_connections)
-                        
-                        logger.debug(f"创建新连接: {pooled_conn.pool_id}")
-                        return pooled_conn.connection
-            
-            # 3. 等待可用连接
-            logger.debug(f"连接池满，等待可用连接 (超时: {timeout}s)")
-            
-            async with self.lock:
-                self.stats["waiting_requests"] += 1
-            
-            # 使用信号机制等待连接释放
-            acquired = False
-            wait_event = asyncio.Event()
-            
-            # 添加到等待队列
-            await self.waiting_queue.put(wait_event)
-            
-            # 等待信号
-            try:
-                await asyncio.wait_for(wait_event.wait(), timeout=timeout)
-                acquired = True
-            except asyncio.TimeoutError:
-                logger.error(f"获取连接超时 ({timeout}s)")
-                # 从等待队列中移除
-                try:
-                    self.waiting_queue.get_nowait()  # Remove if still there
-                except asyncio.QueueEmpty:
-                    pass
-                return None
-            
-            # 收到信号后再次尝试获取可用连接
-            if acquired and self.available_connections:
-                async with self.lock:
-                    pooled_conn = self.available_connections.popleft()
-                    pooled_conn.mark_as_busy()
-                    self.busy_connections[pooled_conn.pool_id] = pooled_conn
-                    
-                    # 计算等待时间
+
                     wait_time = (datetime.now() - wait_start).total_seconds()
                     old_avg = self.stats["average_wait_time"]
-                    old_waiting = self.stats["waiting_requests"]
+                    old_waiting = max(self.stats["waiting_requests"], 1)
                     self.stats["average_wait_time"] = (
                         (old_avg * (old_waiting - 1) + wait_time) / old_waiting
                     )
-                    
                     logger.debug(f"从等待队列获取连接: {pooled_conn.pool_id}")
                     return pooled_conn.connection
-            
-            return None
-            
+
+            raise RuntimeError("获取数据库连接失败：等待后仍无可用连接")
+
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(f"获取连接出错: {str(e)}")
-            return None
+            raise RuntimeError(f"获取数据库连接出错: {e}") from e
     
     async def release(self, connection: DatabaseBase) -> bool:
         """
@@ -582,21 +609,23 @@ class ConnectionPoolManager:
             logger.error(f"注册连接池失败: {str(e)}")
             return False
     
-    async def acquire(self, pool_name: str, timeout: Optional[int] = None) -> Optional[DatabaseBase]:
+    async def acquire(self, pool_name: str, timeout: Optional[int] = None) -> DatabaseBase:
         """
         从指定的连接池获取连接
-        
+
         Args:
             pool_name: 连接池名称
             timeout: 超时时间
-            
+
         Returns:
-            Optional[DatabaseBase]: 数据库连接
+            DatabaseBase: 数据库连接（保证健康可用）
+
+        Raises:
+            RuntimeError: 连接池不存在或无法获取连接时
         """
         if pool_name not in self.pools:
-            logger.error(f"连接池不存在: {pool_name}")
-            return None
-        
+            raise RuntimeError(f"连接池不存在: {pool_name}")
+
         return await self.pools[pool_name].acquire(timeout)
     
     async def release(self, pool_name: str, connection: DatabaseBase) -> bool:
@@ -722,40 +751,33 @@ async def initialize_pools(database_config: Dict[str, Any]) -> bool:
         return False
 
 
-async def get_connection(db_type: str, db_name: Optional[str], timeout: Optional[int] = None) -> Optional[DatabaseBase]:
+async def get_connection(db_type: str, db_name: Optional[str], timeout: Optional[int] = None) -> DatabaseBase:
     """
-    获取数据库连接
-    
+    获取数据库连接。保证返回一个健康可用的连接对象，失败时抛出异常。
+
     Args:
         db_type: 数据库类型 ('mysql', 'redis', 'elasticsearch')
         db_name: 数据库名或索引名，None 表示保持当前连接数据库
         timeout: 超时时间 (秒)
-        
+
     Returns:
-        Optional[DatabaseBase]: 数据库连接实例
+        DatabaseBase: 健康可用的数据库连接实例
+
+    Raises:
+        RuntimeError: 无法获取连接或切换数据库失败时
     """
-    try:
-        # 获取连接
-        connection = await pool_manager.acquire(db_type, timeout)
-        if not connection:
-            logger.error(f"获取 {db_type} 连接失败")
-            return None
+    connection = await pool_manager.acquire(db_type, timeout)
 
-        # 只有当 db_name 不为空时才进行切换
-        if db_name and db_name.strip():
-            if await connection.switch_db(db_name):
-                logger.debug(f"成功获取 {db_type} 连接并切换到 {db_name}")
-                return connection
-            else:
-                logger.error(f"切换 {db_type} 到 {db_name} 失败")
-                await pool_manager.release(db_type, connection)
-                return None
+    if db_name and db_name.strip():
+        if await connection.switch_db(db_name):
+            logger.debug(f"成功获取 {db_type} 连接并切换到 {db_name}")
+            return connection
+        else:
+            await pool_manager.release(db_type, connection)
+            raise RuntimeError(f"切换 {db_type} 数据库到 '{db_name}' 失败")
 
-        logger.debug(f"成功获取 {db_type} 连接，未切换数据库")
-        return connection
-    except Exception as e:
-        logger.error(f"获取连接失败: {str(e)}")
-        return None
+    logger.debug(f"成功获取 {db_type} 连接，未切换数据库")
+    return connection
 
 
 async def release_connection(db_type: str, connection: DatabaseBase) -> bool:

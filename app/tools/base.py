@@ -1,4 +1,29 @@
-"""Tool 基础类 — 工具权限控制、执行路由与调用统计。
+"""
+【模块说明】工具基础类（BaseTool）— 所有工具的公共能力和接口
+
+"工具"（Tool）是 AI 执行具体操作的能力单元，例如：搜索网页、读取文件、执行命令。
+所有工具都从 BaseTool 继承，框架会自动处理权限检查、执行路由和调用统计。
+
+【工具三种来源（source）】
+  code  — 开发者写在代码里的工具，导入模块时自动注册，最稳定
+  user  — 用户通过前端上传代码或文字描述后动态创建，存在 MySQL 中
+  agent — 某个 Agent 运行时临时创建的专用工具，仅该 Agent 可用
+
+【工具可见性（visibility）】
+  public    — 所有人都可以使用
+  private   — 仅创建者自己可用
+  exclusive — 仅指定的某个 Agent 可用（Agent 内部专用工具）
+
+【执行位置（exec_location）】
+  server — 在服务器上执行（网络请求、数据库查询等）
+  client — 需要在用户本地设备上执行（操作本地文件、调用本地命令等）
+
+【危险操作与权限控制】
+  工具需要在 dangerous_ops 中声明它会执行哪些危险操作。
+  每次执行前，框架自动检查用户是否已授权，
+  未授权则抛出 ConsentRequiredException，引擎会弹出授权确认框。
+
+Tool 基础类 — 工具权限控制、执行路由与调用统计。
 
 三种创建来源（source）：
   code  — 开发人员通过继承基类或 @tool 装饰器实现，模块导入时自动注册。
@@ -52,10 +77,11 @@ SRC_CODE  = "code"
 SRC_USER  = "user"
 SRC_AGENT = "agent"
 
-CONSENT_ONCE    = "once"
-CONSENT_SESSION = "session"
-CONSENT_PROJECT = "project"
-CONSENT_ALWAYS  = "always"
+CONSENT_ONCE         = "once"
+CONSENT_SESSION      = "session"
+CONSENT_PROJECT      = "project"
+CONSENT_ALWAYS       = "always"
+CONSENT_CONVERSATION = "conversation"  # 当前用户消息轮次内全部允许
 
 # 需要用户同意才能执行的操作类型
 DANGEROUS_OPS: FrozenSet[str] = frozenset({
@@ -66,7 +92,7 @@ DANGEROUS_OPS: FrozenSet[str] = frozenset({
     "admin",         # 管理员操作
     "sudo",         # 提权操作
     "execute_code",  # 执行任意代码
-    "network",       # 外发网络请求（隐私相关）
+    # "network",       # 外发网络请求（隐私相关）
 })
 
 
@@ -180,7 +206,7 @@ class BaseTool:
             ) -> Dict[str, Any]:
                 # ── 1. 危险操作同意核查 ─────────────────────────
                 if self.dangerous_ops:
-                    from app.tools.permission import consent_manager
+                    from app.tools.permission import consent_manager, get_consent_hook
                     user_id    = context.get("user_id", "")
                     session_id = context.get("session_id", "")
                     project_id = context.get("project_id", "")
@@ -188,13 +214,31 @@ class BaseTool:
                         if not await consent_manager.check_consented(
                             self.name, op, user_id, session_id, project_id
                         ):
-                            raise ConsentRequiredException(
-                                tool_name  = self.name,
-                                operation  = op,
-                                user_id    = user_id,
-                                session_id = session_id,
-                                project_id = project_id,
-                            )
+                            hook = get_consent_hook()
+                            if hook is not None:
+                                exc = ConsentRequiredException(
+                                    tool_name  = self.name,
+                                    operation  = op,
+                                    user_id    = user_id,
+                                    session_id = session_id,
+                                    project_id = project_id,
+                                )
+                                decision = await hook(exc)
+                                if decision == "deny":
+                                    return {
+                                        "result":   f"用户拒绝了危险操作 '{op}'",
+                                        "success":  False,
+                                        "metadata": {"denied": True, "op": op},
+                                    }
+                                # allow / conversation：consent 已由 hook 授予，继续
+                            else:
+                                raise ConsentRequiredException(
+                                    tool_name  = self.name,
+                                    operation  = op,
+                                    user_id    = user_id,
+                                    session_id = session_id,
+                                    project_id = project_id,
+                                )
 
                 # ── 2. 参数验证 ──────────────────────────────────
                 if self.parameters_schema:
@@ -321,8 +365,6 @@ class BaseTool:
         conn = None
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return
             await conn.execute_raw(
                 """
                 INSERT INTO tool_call_stats
@@ -355,8 +397,6 @@ class BaseTool:
         conn = None
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return False
             await conn.execute_raw(
                 """
                 INSERT INTO tools

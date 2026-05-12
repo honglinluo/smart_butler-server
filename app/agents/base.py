@@ -1,4 +1,28 @@
-"""Agent 基础类 - 所有 Agent 的公共接口与技能记忆实现"""
+"""
+【模块说明】Agent 基础类 — 所有 AI 助手（Agent）的公共能力和接口
+
+每个 Agent 都是一个专职的 AI 角色，例如"代码助手"、"数据分析师"等。
+所有 Agent 都从这里的 BaseAgent 类继承，共享以下能力：
+
+1. 身份信息
+   - 名称（name）、职责描述（role）、背景系统提示（background）
+   - 可以使用的工具列表（tools）
+   - 来源标识：code（代码定义）/ db（用户通过页面创建）
+
+2. 技能记忆（Skill Memory）
+   Agent 会自动记录自己成功完成任务的"工作模式"。
+   下次遇到类似任务时，把这些成功经验注入提示词，提高完成质量。
+   技能按成功率加权排序，最多保留 10 条，存在 MySQL 中持久化。
+
+3. 工具绑定
+   把工具转换成 LangChain 格式，供 LangGraph ReAct Agent 调用。
+   支持动态参数 schema 构建，确保 AI 能正确传递参数。
+
+4. 背景模板
+   背景描述优先从 config/templates/{agent_name}.txt 加载（外置文件），
+   文件不存在时回退到代码中定义的默认值。
+"""
+
 
 import asyncio
 import inspect
@@ -13,6 +37,7 @@ from typing import Any, ClassVar, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool as LCBaseTool
+from pydantic import PrivateAttr, Field, create_model
 
 from app.database.pool import get_connection, release_connection
 from app.core.paths import PROJECT_ROOT
@@ -29,15 +54,57 @@ except ImportError:
     _HAS_LANGGRAPH = False
 
 
+# ── Registry 工具参数 schema 构建器 ────────────────────────────────────────────
+
+_JSON_TYPE_MAP = {
+    "string": str, "str": str,
+    "integer": int, "int": int,
+    "number": float, "float": float,
+    "boolean": bool, "bool": bool,
+    "array": list,
+    "object": dict,
+}
+
+def _build_args_schema(tool_name: str, parameters_schema: Dict[str, Any]):
+    """Build a Pydantic model from a tool's parameters_schema dict so LangChain
+    sends properly-named kwargs to _arun instead of a generic args/kwargs blob."""
+    if not parameters_schema:
+        return None
+    fields: Dict[str, Any] = {}
+    for fname, finfo in parameters_schema.items():
+        if not isinstance(finfo, dict):
+            continue
+        py_type = _JSON_TYPE_MAP.get(str(finfo.get("type", "string")).lower(), Any)
+        desc    = finfo.get("description", "")
+        if finfo.get("required"):
+            fields[fname] = (py_type, Field(..., description=desc))
+        else:
+            default = finfo.get("default", None)
+            fields[fname] = (Optional[py_type], Field(default, description=desc))
+    if not fields:
+        return None
+    return create_model(f"_{tool_name}_Input", **fields)
+
+
 # ── Registry 工具 → LangChain Tool 适配器 ─────────────────────────────────────
 
 class _RegistryToolAdapter(LCBaseTool):
     """将 app.tools.base.BaseTool 适配为 LangChain Tool，供 ReAct agent 使用。"""
 
+    # Pydantic v2: private attrs must be declared before __init__
+    _rt:         Any = PrivateAttr()
+    _user_id:    str = PrivateAttr()
+    _agent_name: str = PrivateAttr(default="")
+
     def __init__(self, registry_tool: Any, user_id: str, agent_name: str = ""):
-        super().__init__()
-        self.name        = registry_tool.name
-        self.description = (registry_tool.description or f"Tool: {registry_tool.name}")
+        schema = _build_args_schema(registry_tool.name, getattr(registry_tool, "parameters_schema", {}))
+        init_kwargs: Dict[str, Any] = {
+            "name":        registry_tool.name,
+            "description": registry_tool.description or f"Tool: {registry_tool.name}",
+        }
+        if schema is not None:
+            init_kwargs["args_schema"] = schema
+        super().__init__(**init_kwargs)
         self._rt         = registry_tool
         self._user_id    = user_id
         self._agent_name = agent_name
@@ -49,18 +116,19 @@ class _RegistryToolAdapter(LCBaseTool):
         from app.utils.log_bus import get_bus
         bus = get_bus()
 
-        # LangGraph 以 kwargs 传入；无 schema 时 LangChain 可能以单字符串传入
+        # With args_schema LangGraph passes named kwargs; fallback handles legacy string input
         if args and isinstance(args[0], str) and not kwargs:
             try:
                 params = json.loads(args[0])
             except Exception:
                 params = {"input": args[0]}
         else:
-            params = dict(kwargs)
+            params = {k: v for k, v in kwargs.items() if v is not None}
 
         context = {"user_id": self._user_id, "agent_name": self._agent_name}
         bus.tool_call(self._user_id, self._agent_name, self.name, params)
         t0 = time.monotonic()
+        _has_dangerous = bool(getattr(self._rt, "dangerous_ops", None))
         try:
             result = await self._rt.execute(params, context)
             result_str = (
@@ -68,14 +136,49 @@ class _RegistryToolAdapter(LCBaseTool):
                 if isinstance(result, dict)
                 else str(result)
             )
-            bus.tool_result(
-                self._user_id, self._agent_name, self.name,
-                result_str, (time.monotonic() - t0) * 1000,
-            )
+            elapsed = (time.monotonic() - t0) * 1000
+            bus.tool_result(self._user_id, self._agent_name, self.name, result_str, elapsed)
+            from app.core.exec_collector import get_collector as _get_ec
+            _ec = _get_ec()
+            if _ec is not None:
+                _ec.add_tool_call(
+                    self.name, str(params)[:150], result_str[:200],
+                    "无需授权" if not _has_dangerous else "已授权",
+                    True, elapsed,
+                )
             return result_str
         except Exception as e:
+            from app.tools.base import ConsentRequiredException as _ConsentExc
+            if isinstance(e, _ConsentExc):
+                # 非流式上下文（未设置 consent_hook）：工具需要授权但无法弹窗。
+                # 返回明确的终止消息，让 LLM 停止重试而不是反复调用触发循环。
+                consent_msg = json.dumps({
+                    "success": False,
+                    "error": (
+                        f"工具 '{self.name}' 的危险操作 '{e.operation}' 需要用户授权，"
+                        "当前上下文不支持弹出授权请求。请告知用户需要在支持授权的界面中重试。"
+                    ),
+                    "consent_required": True,
+                }, ensure_ascii=False)
+                bus.tool_error(self._user_id, self._agent_name, self.name, str(e))
+                from app.core.exec_collector import get_collector as _get_ec
+                _ec = _get_ec()
+                if _ec is not None:
+                    _ec.add_tool_call(
+                        self.name, str(params)[:150], consent_msg[:200],
+                        "需要授权（未授权）", False, (time.monotonic() - t0) * 1000,
+                    )
+                return consent_msg
             error_msg = f"工具 {self.name} 执行失败: {e}"
             bus.tool_error(self._user_id, self._agent_name, self.name, str(e))
+            from app.core.exec_collector import get_collector as _get_ec
+            _ec = _get_ec()
+            if _ec is not None:
+                _ec.add_tool_call(
+                    self.name, str(params)[:150], str(e)[:200],
+                    "无需授权" if not _has_dangerous else "已授权",
+                    False, (time.monotonic() - t0) * 1000,
+                )
             # 将错误作为 ToolMessage 内容反馈给 LLM，不静默忽略
             return error_msg
 
@@ -336,6 +439,58 @@ class BaseAgent:
         finally:
             self._record_call()
 
+    async def _ask_llm_fix_step(
+        self,
+        step_content: str,
+        error: str,
+        llm: Any,
+        system_prompt: str,
+    ) -> str:
+        """步骤失败时向 LLM 询问修复方案并直接给出修复后结果。"""
+        fix_prompt = (
+            f"以下执行步骤出错，请分析原因并给出修复后的执行结果：\n"
+            f"步骤：{step_content}\n"
+            f"错误：{error}\n\n"
+            f"请直接给出修复后的执行结果。"
+        )
+        try:
+            msgs = [SystemMessage(content=system_prompt), HumanMessage(content=fix_prompt)]
+            resp = await llm.ainvoke(msgs)
+            return resp.content
+        except Exception as e:
+            return f"[修复失败: {e}]"
+
+    async def _judge_task_result(
+        self,
+        task_desc: str,
+        result: str,
+        llm: Any,
+        system_prompt: str,
+    ) -> Dict[str, Any]:
+        """判断当前任务的执行结果是否满足任务要求。"""
+        import json as _json
+        judge_prompt = (
+            f"请判断以下任务执行结果是否完整满足了任务要求：\n"
+            f"任务：{task_desc[:200]}\n"
+            f"结果：{result[:400]}\n\n"
+            f'只返回 JSON：{{"satisfied": true, "issue": "", "suggestion": ""}}'
+        )
+        try:
+            msgs = [SystemMessage(content=system_prompt), HumanMessage(content=judge_prompt)]
+            resp = await llm.ainvoke(msgs)
+            raw = resp.content.strip()
+            if "```" in raw:
+                raw = raw.split("```")[1].lstrip("json").strip()
+            data = _json.loads(raw)
+            return {
+                "satisfied": bool(data.get("satisfied", True)),
+                "issue": str(data.get("issue", "")),
+                "suggestion": str(data.get("suggestion", "")),
+            }
+        except Exception as e:
+            logger.debug("[L2] 任务结果判断失败: %s，默认通过", e)
+            return {"satisfied": True, "issue": "", "suggestion": ""}
+
     async def _execute_with_l2(
         self,
         task_desc:      str,
@@ -347,128 +502,172 @@ class BaseAgent:
         context:        Dict[str, Any],
         extra_messages: Optional[list] = None,
     ) -> tuple:
-        """L2 拆分后逐步执行，返回 (最终结果文字, l2 元数据字典)。
+        """L2 拆分后逐步执行，外层 while 循环由 LLM 判断结果是否满足后退出。
 
         执行策略
         ────────
-        - 按 priority 顺序执行步骤
-        - blocked 步骤等待前置完成后自动解锁
-        - on_fail=terminate 的步骤失败时立即终止并返回错误
-        - on_fail=skip 的步骤失败时跳过并继续
-        - on_fail=retry:N 的步骤失败时最多重试 N 次
+        - 外层循环：最多 MAX_AGENT_ITERATIONS 轮，每轮重新分解+执行，LLM 判断通过后退出
+        - 内层循环：for 遍历当前轮所有步骤
+        - on_fail=terminate 的步骤失败时立即终止
+        - on_fail=skip 的步骤失败后询问 LLM 修复并继续
+        - step 失败 → _ask_llm_fix_step 给出修复结果
         """
         from app.core.task_planner import make_l2_store, TaskStatus
         import uuid as _uuid
-
-        exec_id = _uuid.uuid4().hex[:8]
-        store, decomposer = make_l2_store(user_id, self.name, exec_id)
-        store._cache = []   # 绕过 Redis（无连接时降级为内存）
-
-        # 工具名称摘要，供 L2 提示词参考粒度
-        tools_info = ", ".join(t.name for t in lc_tools) if lc_tools else "（无专用工具）"
-
-        steps = await decomposer.decompose(task_desc, llm, tools_info=tools_info)
-        if not steps:
-            # 拆分失败，降级为整体执行
-            logger.warning("[L2] 步骤拆分失败，降级整体执行 agent=%s", self.name)
-            human_content = task_desc
-            if history_lines:
-                human_content = "历史对话:\n" + "\n".join(history_lines) + "\n\n当前任务:\n" + task_desc
-            result = await self._invoke_with_tools(
-                llm, system_prompt, human_content, lc_tools, extra_messages=extra_messages,
-            )
-            return result, {"l2_steps": 0, "l2_fallback": True}
-
-        logger.info("[L2] agent=%s 任务已拆分为 %d 步", self.name, len(steps))
-
-        step_results: List[str] = []
-        completed_ids: List[str] = []
-        failed_ids:    List[str] = []
-
         from app.utils import progress_bus as _pb
 
-        for step in steps:
-            if step.status == TaskStatus.BLOCKED:
-                # 依赖未完成，跳过（不应发生，_recompute_blocked 已处理）
-                logger.debug("[L2] 步骤 %s 仍被阻塞，跳过", step.task_id)
-                continue
+        tools_info = ", ".join(t.name for t in lc_tools) if lc_tools else "（无专用工具）"
+        MAX_AGENT_ITERATIONS = 3
+        current_task_desc = task_desc
 
-            await store.set_status(step.task_id, TaskStatus.IN_PROGRESS)
-            _pb.push("step_start", {
-                "agent_name":  self.name,
-                "step_id":     step.task_id,
-                "description": step.content[:120],
-            })
+        steps: list = []
+        completed_ids: List[str] = []
+        failed_ids:    List[str] = []
+        final_result = ""
+        agent_iteration = 0
 
-            # 构建单步输入
-            prev_context = "\n".join(step_results[-3:])   # 最近 3 步结果作为上下文
-            step_input = step.content
-            if prev_context:
-                step_input = f"前序执行结果：\n{prev_context}\n\n当前步骤：{step.content}"
-            if history_lines:
-                step_input = "历史对话:\n" + "\n".join(history_lines) + "\n\n" + step_input
+        for agent_iteration in range(MAX_AGENT_ITERATIONS):
+            exec_id = _uuid.uuid4().hex[:8]
+            store, decomposer = make_l2_store(user_id, self.name, exec_id)
+            store._cache = []
 
-            on_fail     = decomposer.get_on_fail(step)
-            retry_count = decomposer.get_retry_count(step)
-            attempts    = max(1, retry_count + 1)
-            step_ok     = False
-            step_result = ""
+            steps = await decomposer.decompose(current_task_desc, llm, tools_info=tools_info)
+            if not steps:
+                logger.warning("[L2] 第 %d 轮步骤拆分失败，降级整体执行 agent=%s", agent_iteration + 1, self.name)
+                human_content = current_task_desc
+                if history_lines:
+                    human_content = "历史对话:\n" + "\n".join(history_lines) + "\n\n当前任务:\n" + current_task_desc
+                result = await self._invoke_with_tools(
+                    llm, system_prompt, human_content, lc_tools, extra_messages=extra_messages,
+                )
+                return result, {"l2_steps": 0, "l2_fallback": True}
 
-            for attempt in range(attempts):
-                try:
-                    step_result = await self._invoke_with_tools(
-                        llm, system_prompt, step_input, lc_tools, user_id=user_id,
-                        extra_messages=extra_messages,
+            logger.info("[L2] agent=%s 第 %d 轮任务已拆分为 %d 步", self.name, agent_iteration + 1, len(steps))
+
+            step_results: List[str] = []
+            completed_ids = []
+            failed_ids = []
+
+            for step in steps:
+                if step.status == TaskStatus.BLOCKED:
+                    logger.debug("[L2] 步骤 %s 仍被阻塞，跳过", step.task_id)
+                    continue
+
+                await store.set_status(step.task_id, TaskStatus.IN_PROGRESS)
+                _pb.push("step_start", {
+                    "agent_name":  self.name,
+                    "step_id":     step.task_id,
+                    "description": step.content[:120],
+                })
+
+                prev_context = "\n".join(step_results[-3:])
+                step_input = step.content
+                if prev_context:
+                    step_input = f"前序执行结果：\n{prev_context}\n\n当前步骤：{step.content}"
+                if history_lines:
+                    step_input = "历史对话:\n" + "\n".join(history_lines) + "\n\n" + step_input
+
+                on_fail     = decomposer.get_on_fail(step)
+                retry_count = decomposer.get_retry_count(step)
+                attempts    = max(1, retry_count + 1)
+                step_ok     = False
+                step_result = ""
+                step_error  = ""
+
+                for attempt in range(attempts):
+                    try:
+                        step_result = await self._invoke_with_tools(
+                            llm, system_prompt, step_input, lc_tools, user_id=user_id,
+                            extra_messages=extra_messages,
+                        )
+                        step_ok = True
+                        break
+                    except Exception as exc:
+                        step_error = str(exc)
+                        logger.warning(
+                            "[L2] 步骤 %s 第 %d/%d 次执行失败 agent=%s: %s",
+                            step.task_id, attempt + 1, attempts, self.name, exc,
+                        )
+                        if attempt + 1 == attempts:
+                            # 向 LLM 寻求修复方案
+                            step_result = await self._ask_llm_fix_step(
+                                step.content, step_error, llm, system_prompt
+                            )
+
+                _pb.push("step_done", {
+                    "agent_name": self.name,
+                    "step_id":    step.task_id,
+                    "success":    step_ok,
+                    "result":     step_result[:150] if step_ok else "",
+                })
+                from app.core.exec_collector import get_collector as _get_ec
+                _ec = _get_ec()
+                if _ec is not None:
+                    _ec.add_step(
+                        step.task_id, step.content[:80], step_ok,
+                        step_result[:150] if step_ok else step_error[:150],
                     )
-                    step_ok = True
-                    break
-                except Exception as exc:
-                    logger.warning(
-                        "[L2] 步骤 %s 第 %d/%d 次执行失败 agent=%s: %s",
-                        step.task_id, attempt + 1, attempts, self.name, exc,
-                    )
-                    if attempt + 1 == attempts:
-                        step_result = f"[步骤失败: {exc}]"
 
-            _pb.push("step_done", {
+                if step_ok:
+                    await store.set_status(step.task_id, TaskStatus.COMPLETED)
+                    completed_ids.append(step.task_id)
+                    step_results.append(f"步骤「{step.content[:40]}」结果：{step_result[:200]}")
+                else:
+                    await store.set_status(step.task_id, TaskStatus.CANCELLED)
+                    failed_ids.append(step.task_id)
+
+                    if on_fail == "terminate" or decomposer.should_terminate(step):
+                        logger.warning("[L2] 步骤 %s 失败策略 terminate，中止 agent=%s", step.task_id, self.name)
+                        partial = "\n".join(step_results) if step_results else "（无已完成步骤）"
+                        return (
+                            f"任务执行中止（步骤「{step.content[:40]}」失败）。\n已完成部分：\n{partial}",
+                            {"l2_steps": len(steps), "l2_completed": len(completed_ids), "l2_terminated": True},
+                        )
+                    step_results.append(f"步骤「{step.content[:40]}」已修复处理：{step_result[:200]}")
+
+            # 汇总步骤结果
+            summary_input = (
+                f"以下是任务「{current_task_desc[:100]}」各步骤的执行结果，请综合整理为完整的最终回答：\n\n"
+                + "\n".join(step_results)
+            )
+            final_result = await self._invoke_with_tools(
+                llm, system_prompt, summary_input, lc_tools, user_id=user_id,
+                extra_messages=extra_messages,
+            )
+
+            # 最后一轮不再判断，直接退出
+            if agent_iteration >= MAX_AGENT_ITERATIONS - 1:
+                break
+
+            # LLM 判断结果是否满足任务要求
+            judgment = await self._judge_task_result(
+                task_desc, final_result, llm, system_prompt
+            )
+            if judgment["satisfied"]:
+                logger.debug("[L2] agent=%s 第 %d 轮结果满足要求，退出循环", self.name, agent_iteration + 1)
+                break
+
+            # 不满足：推送 agent_replan 事件，重构任务描述后进入下一轮
+            _pb.push("agent_replan", {
                 "agent_name": self.name,
-                "step_id":    step.task_id,
-                "success":    step_ok,
-                "result":     step_result[:150] if step_ok else "",
+                "reason":     judgment["issue"],
+                "iteration":  agent_iteration + 1,
             })
-
-            if step_ok:
-                await store.set_status(step.task_id, TaskStatus.COMPLETED)
-                completed_ids.append(step.task_id)
-                step_results.append(f"步骤「{step.content[:40]}」结果：{step_result[:200]}")
-            else:
-                await store.set_status(step.task_id, TaskStatus.CANCELLED)
-                failed_ids.append(step.task_id)
-
-                if on_fail == "terminate" or decomposer.should_terminate(step):
-                    logger.warning("[L2] 步骤 %s 失败且策略为 terminate，中止任务 agent=%s", step.task_id, self.name)
-                    partial = "\n".join(step_results) if step_results else "（无已完成步骤）"
-                    return (
-                        f"任务执行中止（步骤「{step.content[:40]}」失败）。\n已完成部分：\n{partial}",
-                        {"l2_steps": len(steps), "l2_completed": len(completed_ids), "l2_terminated": True},
-                    )
-                # skip：记录并继续
-                step_results.append(f"步骤「{step.content[:40]}」已跳过（失败）")
-
-        # 汇总所有步骤结果，交给 LLM 生成最终输出
-        summary_input = (
-            f"以下是任务「{task_desc[:100]}」各步骤的执行结果，请综合整理为完整的最终回答：\n\n"
-            + "\n".join(step_results)
-        )
-        final_result = await self._invoke_with_tools(
-            llm, system_prompt, summary_input, lc_tools, user_id=user_id,
-            extra_messages=extra_messages,
-        )
+            logger.info(
+                "[L2] agent=%s 第 %d 轮结果不满足，原因：%s，进入下一轮",
+                self.name, agent_iteration + 1, judgment["issue"],
+            )
+            current_task_desc = (
+                f"{task_desc}\n\n"
+                f"[第 {agent_iteration + 1} 轮执行不满足要求，原因：{judgment['issue']}，"
+                f"建议：{judgment['suggestion']}，请重新分析并改进执行方案]"
+            )
 
         return final_result, {
-            "l2_steps":     len(steps),
-            "l2_completed": len(completed_ids),
-            "l2_failed":    len(failed_ids),
+            "l2_steps":      len(steps),
+            "l2_completed":  len(completed_ids),
+            "l2_failed":     len(failed_ids),
+            "l2_iterations": agent_iteration + 1,
         }
 
     async def _invoke_with_tools(
@@ -520,7 +719,7 @@ class BaseAgent:
 
         工具调用日志由 _RegistryToolAdapter._arun 自动发射，无需在此重复。
         """
-        graph  = _create_react_agent(llm, lc_tools, state_modifier=system_prompt)
+        graph  = _create_react_agent(llm, lc_tools, prompt=system_prompt)
         output = await graph.ainvoke({"messages": [HumanMessage(content=human_content)]})
         msgs   = output.get("messages", [])
         final  = msgs[-1] if msgs else None
@@ -712,9 +911,6 @@ class BaseAgent:
                 break
 
         conn = await get_connection("mysql", None)
-        if not conn:
-            return
-
         try:
             now = datetime.now()
             if matched:
@@ -781,8 +977,10 @@ class BaseAgent:
         asyncio.create_task(self._do_record_call())
 
     async def _do_record_call(self) -> None:
-        conn = await get_connection("mysql", None)
-        if not conn:
+        conn = None
+        try:
+            conn = await get_connection("mysql", None)
+        except Exception:
             return
         try:
             await conn.execute_raw(

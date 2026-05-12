@@ -61,4 +61,12 @@ chardet                    # 文本文件编码自动检测
 pillow                     # 图片读取与 base64 转换
 
 # ── 可选：本地向量嵌入模型 ─────────────────────────────────────
-# sentence-transformers    # 本地 Embedding（MemoryManager 降级路径）
+sentence-transformers    # 本地 Embedding（MemoryManager 降级路径）
+
+# ── 网页爬虫（WebAgent + Scrapling）───────────────────────────
+beautifulsoup4             # HTML 解析（web_parse 工具必选）
+lxml                       # bs4 快速解析器后端（必选）
+httpx[http2]               # HTTP/2 支持（Scrapling 不可用时的 L1 回退）
+scrapling[all]             # 核心爬虫框架：curl_cffi TLS指纹 + Chromium反指纹 + 自适应选择器
+# cloudscraper             # Scrapling 不可用时的 L2 回退（pip install cloudscraper）
+# playwright               # Scrapling 不可用时的 L3 回退（pip install playwright && playwright install chromium）

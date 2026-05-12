@@ -1,8 +1,16 @@
-"""项目根目录路径常量 — 统一来源，避免各模块重复推导 parent 链。
+"""
+【模块说明】项目根目录路径常量
 
-入口文件（main.py / create_tables.py / scripts / tests）在最顶部设置
-``PROJECT_ROOT`` 环境变量；所有内部模块从此处导入。
-未设置环境变量时兜底使用 __file__ 计算（适合单独运行子模块的场景）。
+提供统一的 PROJECT_ROOT 常量，指向项目的根目录。
+全项目所有模块都从这里导入路径，而不是各自去计算，避免在不同启动方式下路径出错。
+
+使用方式：
+  from app.core.paths import PROJECT_ROOT
+  config_file = PROJECT_ROOT / "config" / "system_config.yaml"
+
+路径来源优先级：
+  1. 环境变量 PROJECT_ROOT（推荐生产环境设置）
+  2. 根据当前文件位置自动推算（开发/测试场景回退方案）
 """
 import os
 from pathlib import Path

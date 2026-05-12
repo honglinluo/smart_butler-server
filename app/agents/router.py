@@ -1,4 +1,26 @@
-"""路由智能体 - 意图识别、任务分解、流水线规划与串行结果校验"""
+"""
+【模块说明】路由智能体（RouterAgent）— 决定"谁来干这件事"的调度大脑
+
+当用户发来一条消息时，RouterAgent 负责分析这条消息，
+制定整个多 Agent 执行计划。它依次完成三步工作：
+
+第一步：意图识别（Identify）
+  读取用户消息，判断用户想干什么（如：数据查询、代码生成、普通聊天等），
+  结果是一个意图标签，如 "data_analysis" 或 "general_question"。
+
+第二步：任务分解（Decompose）
+  把用户的请求拆成具体可执行的子任务列表。
+  简单请求只有一个任务，复杂请求可能有多个。
+
+第三步：流水线规划（Plan）
+  根据任务和可用 Agent，决定执行模式：
+  - single（单 Agent）：一个 Agent 处理所有事
+  - parallel（并行）：多个 Agent 同时处理，结果互不依赖
+  - serial（串行）：多个 Agent 按顺序处理，后一个要用前一个的结果
+
+完成规划后，HermesEngine 按照这个计划驱动各 Agent 逐步执行。
+"""
+
 
 import json
 import logging
@@ -60,24 +82,58 @@ _VALIDATE_STEP_SYSTEM = """你是一个质量检验员。
 
 只返回 JSON：{{"can_proceed": true, "issue": "", "suggestion": ""}}"""
 
+_JUDGE_OVERALL_SYSTEM = """\
+你是质量审核员，负责评估多智能体执行结果是否满足用户期望。
+
+用户原始请求：{user_input}
+
+各 Agent 执行结果摘要：
+{results_text}
+
+判断这些结果是否完整、准确地满足了用户的原始请求。
+只返回 JSON：{{"satisfied": true, "issue": "", "suggestion": ""}}\
+"""
+
+_REPLAN_AGENTS_SYSTEM = """\
+你是多智能体系统的重新规划器。
+
+用户原始请求：{user_input}
+上次执行问题：{issue}
+改进建议：{suggestion}
+
+各 Agent 上次执行结果：
+{results_text}
+
+可用 Agent（格式：name | role | 职责描述）：
+{agents_info}
+
+请重新规划 Agent 任务分工以解决上述问题。只返回 JSON 数组：
+[{{"step": 0, "agent_name": "<name>", "task": {{"task_id": "task_1", "type": "<name>", "description": "清晰的任务描述（中文）"}}}}]\
+"""
+
 _ROUTE_AND_DECOMPOSE_SYSTEM = """\
-你是多智能体系统的路由器。一次性完成两件事：选出最合适的 Agent，并将用户请求拆解为子任务。
+你是多智能体系统的路由器和任务规划器。根据用户请求，将任务拆解为若干步骤，并为每步选择最合适的 Agent。
 
 可用 Agent（格式：name | role | 职责描述摘要）：
 {agents_info}
 
-规则：
-- 优先选职责最匹配的 Agent，无法判断时选 general_assistant
-- 若任务简单无需拆分，tasks 只含一个元素
-- agent 字段必须来自上面的 name 列表
+任务拆分原则：
+1. 单一职责：若任务可由单个 Agent 独立完成，只输出一条任务
+2. 多 Agent 协作：若任务包含"获取信息 + 处理信息"的组合，应拆分给不同 Agent
+   典型模式：
+   - 访问/抓取网页内容 → web_agent
+   - 总结文本 / 生成报告 / 保存文件到本地 → summarizer
+   - 数据查询与统计分析 → data_analyst
+   - 编写/调试代码 → code_assistant
+3. 任务描述必须包含用户提供的所有具体信息（URL、文件路径、数值等），不得省略
+4. 后续步骤在 description 中可引用"上一步提取的内容"或"前序步骤的输出结果"
+5. agent_name 必须来自上方 name 列表，无法判断时选 general_assistant
 
-只返回 JSON，格式如下：
-{{
-  "agent": "<agent_name>",
-  "tasks": [
-    {{"task_id": "task_1", "type": "<agent_name>", "description": "清晰的任务描述（中文）"}}
-  ]
-}}\
+只返回 JSON 数组（不含其他文字）：
+[
+  {{"step": 0, "agent_name": "<name>", "task": {{"task_id": "task_1", "type": "<name>", "description": "清晰的任务描述，含所有具体参数"}}}},
+  {{"step": 1, "agent_name": "<name>", "task": {{"task_id": "task_2", "type": "<name>", "description": "基于上一步的输出，..."}}}}
+]\
 """
 
 _IDENTIFY_AND_DECOMPOSE_SYSTEM = """\
@@ -89,12 +145,13 @@ _IDENTIFY_AND_DECOMPOSE_SYSTEM = """\
 规则：
 - 识别最匹配的意图，无法判断时用 general_question
 - 若任务简单无需拆分，tasks 只含一个元素
+- description 必须保留用户请求中的所有具体信息（URL、文件名、数值、关键词等），不得泛化或省略
 
 只返回 JSON，格式如下：
 {{
   "intent": "<intent_name>",
   "tasks": [
-    {{"task_id": "task_1", "type": "<intent_name>", "description": "清晰的任务描述（中文）"}}
+    {{"task_id": "task_1", "type": "<intent_name>", "description": "清晰的任务描述，含用户提供的所有具体参数"}}
   ]
 }}\
 """
@@ -158,6 +215,34 @@ class RouterAgent:
     def _active(self, llm: Optional[BaseChatModel]) -> Optional[BaseChatModel]:
         return llm or self.llm
 
+    async def _invoke_json(
+        self,
+        messages: list,
+        fallback: Any,
+        llm: Optional[BaseChatModel] = None,
+    ) -> Any:
+        """ainvoke → _strip_fence → json.loads；失败时用正则从响应中提取 JSON，再失败则返回 fallback。"""
+        active = self._active(llm)
+        if active is None:
+            return fallback
+        resp = await active.ainvoke(messages)
+        text = resp.content.strip()
+        raw = self._strip_fence(text)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+        # 正则兜底：提取第一个 JSON 对象或数组
+        for pattern in (r"\[[\s\S]*\]", r"\{[\s\S]*\}"):
+            m = re.search(pattern, text)
+            if m:
+                try:
+                    return json.loads(m.group())
+                except json.JSONDecodeError:
+                    continue
+        logger.warning("_invoke_json: 无法从 LLM 响应中提取 JSON，返回 fallback；响应片段: %r", text[:200])
+        return fallback
+
     # ── 意图识别 ──────────────────────────────────────────────────
 
     async def identify_intent(
@@ -166,8 +251,7 @@ class RouterAgent:
         context: Dict[str, Any],
         llm: Optional[BaseChatModel] = None,
     ) -> str:
-        active = self._active(llm)
-        if active is None:
+        if self._active(llm) is None:
             logger.warning("RouterAgent: LLM 未配置，意图识别回退为 general_question")
             return "general_question"
         messages = [
@@ -176,9 +260,7 @@ class RouterAgent:
             HumanMessage(content=f"用户输入：{user_input}"),
         ]
         try:
-            resp = await active.ainvoke(messages)
-            raw = self._strip_fence(getattr(resp, "content", str(resp)).strip())
-            data = json.loads(raw)
+            data = await self._invoke_json(messages, {}, llm)
             intent = str(data.get("intent", "general_question")).strip()
             if intent not in self.intent_agent_mapping:
                 logger.warning("LLM 返回未知意图 '%s'，使用 general_question", intent)
@@ -206,9 +288,7 @@ class RouterAgent:
             HumanMessage(content=f"意图：{intent}\n用户请求：{user_input}"),
         ]
         try:
-            resp = await active.ainvoke(messages)
-            raw = self._strip_fence(getattr(resp, "content", str(resp)).strip())
-            tasks = json.loads(raw)
+            tasks = await self._invoke_json(messages, [], llm)
             if not isinstance(tasks, list) or not tasks:
                 return default
             validated = [
@@ -250,10 +330,6 @@ class RouterAgent:
         if len(agent_names) <= 1:
             return "single"
 
-        active = self._active(llm)
-        if active is None:
-            return "serial"
-
         from app.agents.registry import registry
         agents_info = "\n".join(
             f"  [{n}]: {(registry.get(n).role if registry.get(n) else '未知角色')}"
@@ -276,9 +352,7 @@ class RouterAgent:
             )),
         ]
         try:
-            resp = await active.ainvoke(messages)
-            raw = self._strip_fence(getattr(resp, "content", str(resp)).strip())
-            data = json.loads(raw)
+            data = await self._invoke_json(messages, {}, llm)
             mode = str(data.get("mode", "serial")).strip()
             if mode not in ("single", "serial", "parallel"):
                 mode = "serial"
@@ -330,9 +404,6 @@ class RouterAgent:
             {"can_proceed": bool, "issue": str, "suggestion": str}
         """
         default = {"can_proceed": True, "issue": "", "suggestion": ""}
-        active = self._active(llm)
-        if active is None:
-            return default
         messages = [
             SystemMessage(content=_VALIDATE_STEP_SYSTEM.format(
                 agent_name=agent_name,
@@ -342,9 +413,7 @@ class RouterAgent:
             )),
         ]
         try:
-            resp = await active.ainvoke(messages)
-            raw = self._strip_fence(getattr(resp, "content", str(resp)).strip())
-            data = json.loads(raw)
+            data = await self._invoke_json(messages, {}, llm)
             logger.debug(
                 "串行校验: agent=%s can_proceed=%s issue=%s",
                 agent_name, data.get("can_proceed"), data.get("issue", ""),
@@ -367,9 +436,6 @@ class RouterAgent:
         llm: Optional[BaseChatModel] = None,
     ) -> bool:
         """并行多 Agent 结果合并后是否完整。"""
-        active = self._active(llm)
-        if active is None:
-            return True
         results_text = "\n".join(
             f"  [{r.get('agent', '?')}] {str(r.get('result', ''))[:200]}"
             for r in results
@@ -380,9 +446,7 @@ class RouterAgent:
             '只返回 JSON：{"complete": true, "missing": ""}'
         )
         try:
-            resp = await active.ainvoke([HumanMessage(content=prompt)])
-            raw = self._strip_fence(getattr(resp, "content", str(resp)).strip())
-            data = json.loads(raw)
+            data = await self._invoke_json([HumanMessage(content=prompt)], {}, llm)
             complete = bool(data.get("complete", True))
             if not complete:
                 logger.warning(
@@ -400,16 +464,16 @@ class RouterAgent:
         self,
         user_input: str,
         llm: Optional[BaseChatModel],
-    ) -> tuple:
-        """动态模式：1 次 LLM 调用同时完成 agent 选择 + 任务分解。"""
+    ) -> List[Dict[str, Any]]:
+        """动态模式：1 次 LLM 调用完成多 Agent 路由 + 任务拆分，返回 pipeline 列表。"""
         from app.agents.registry import registry
-        candidates = [a for a in registry.list_all() if a.name != self.name]
         default_agent = "general_assistant"
-        default_tasks = [{"task_id": "task_1", "type": default_agent, "description": user_input}]
+        default_pipeline = [{"step": 0, "agent_name": default_agent, "task": {"task_id": "task_1", "type": default_agent, "description": user_input}}]
 
         active = self._active(llm)
+        candidates = [a for a in registry.list_all() if a.name != self.name]
         if active is None or not candidates:
-            return default_agent, default_tasks
+            return default_pipeline
 
         agents_info = "\n".join(
             f"  {a.name} | {a.role} | {(a.background or '')[:80].replace(chr(10), ' ')}"
@@ -420,33 +484,35 @@ class RouterAgent:
             HumanMessage(content=f"用户请求：{user_input}"),
         ]
         try:
-            resp = await active.ainvoke(messages)
-            raw = self._strip_fence(getattr(resp, "content", str(resp)).strip())
-            data = json.loads(raw)
+            data = await self._invoke_json(messages, [], llm)
+            if not isinstance(data, list) or not data:
+                return default_pipeline
 
-            chosen = str(data.get("agent", default_agent)).strip()
-            if registry.get(chosen) is None:
-                logger.warning("动态路由: LLM 选 '%s' 不存在，回退 %s", chosen, default_agent)
-                chosen = default_agent
+            pipeline: List[Dict[str, Any]] = []
+            for i, item in enumerate(data):
+                ag = str(item.get("agent_name", default_agent)).strip()
+                if registry.get(ag) is None:
+                    logger.warning("动态路由: LLM 选 '%s' 不存在，回退 %s", ag, default_agent)
+                    ag = default_agent
+                task_raw = item.get("task") or {}
+                pipeline.append({
+                    "step": i,
+                    "agent_name": ag,
+                    "task": {
+                        "task_id": task_raw.get("task_id", f"task_{i+1}"),
+                        "type": task_raw.get("type", ag),
+                        "description": task_raw.get("description", user_input),
+                    },
+                })
 
-            raw_tasks = data.get("tasks", [])
-            tasks = (
-                [
-                    {
-                        "task_id": t.get("task_id", f"task_{i+1}"),
-                        "type": t.get("type", chosen),
-                        "description": t.get("description", user_input),
-                    }
-                    for i, t in enumerate(raw_tasks)
-                ]
-                if isinstance(raw_tasks, list) and raw_tasks
-                else default_tasks
+            logger.debug(
+                "多Agent路由: '%s' → steps=%d agents=%s",
+                user_input[:60], len(pipeline), [p["agent_name"] for p in pipeline],
             )
-            logger.debug("动态路由+分解: '%s' → agent=%s tasks=%d", user_input[:60], chosen, len(tasks))
-            return chosen, tasks
+            return pipeline
         except Exception as e:
-            logger.warning("动态路由+分解失败: %s，使用默认", e)
-            return default_agent, default_tasks
+            logger.warning("多Agent路由失败: %s，使用默认", e)
+            return default_pipeline
 
     async def _route_static(
         self,
@@ -469,10 +535,7 @@ class RouterAgent:
             HumanMessage(content=f"用户请求：{user_input}"),
         ]
         try:
-            resp = await active.ainvoke(messages)
-            raw = self._strip_fence(getattr(resp, "content", str(resp)).strip())
-            data = json.loads(raw)
-
+            data = await self._invoke_json(messages, {}, llm)
             intent = str(data.get("intent", default_intent)).strip()
             if intent not in self.intent_agent_mapping:
                 logger.warning("LLM 返回未知意图 '%s'，使用 %s", intent, default_intent)
@@ -531,10 +594,11 @@ class RouterAgent:
                 ag = await self.decide_next_agent(task.get("type", intent))
                 tasks_with_agents.append({**task, "agent_name": ag})
         else:
-            # ── 动态模式：1 次调用完成 agent 选择 + 分解 ──
-            chosen, tasks = await self._route_dynamic(user_input, llm=llm)
-            intent = chosen
-            tasks_with_agents = [{**t, "agent_name": chosen} for t in tasks]
+            # ── 动态模式：1 次调用完成多 Agent 路由 + 分解 ──
+            dyn_pipeline = await self._route_dynamic(user_input, llm=llm)
+            intent = dyn_pipeline[0]["agent_name"] if dyn_pipeline else "general_assistant"
+            tasks = [p["task"] for p in dyn_pipeline]
+            tasks_with_agents = [{"agent_name": p["agent_name"], **p["task"]} for p in dyn_pipeline]
 
         mode = await self._plan_mode(intent, tasks_with_agents, llm=llm)
 
@@ -569,6 +633,104 @@ class RouterAgent:
             "tasks": tasks,
             "turn_id": turn_id or "",
         }
+
+    async def judge_overall_result(
+        self,
+        user_input: str,
+        pipeline_results: List[Dict[str, Any]],
+        llm: Optional[BaseChatModel] = None,
+    ) -> Dict[str, Any]:
+        """判断所有 Agent 执行结果是否满足用户的原始请求。
+
+        Returns:
+            {"satisfied": bool, "issue": str, "suggestion": str}
+        """
+        default = {"satisfied": True, "issue": "", "suggestion": ""}
+        results_text = "\n".join(
+            f"  [{r.get('agent', '?')}]: {str(r.get('result', ''))[:300]}"
+            for r in pipeline_results
+        )
+        messages = [
+            SystemMessage(content=_JUDGE_OVERALL_SYSTEM.format(
+                user_input=user_input,
+                results_text=results_text,
+            )),
+        ]
+        try:
+            data = await self._invoke_json(messages, {}, llm)
+            satisfied = bool(data.get("satisfied", True))
+            logger.debug(
+                "整体结果判断: satisfied=%s issue=%s",
+                satisfied, data.get("issue", ""),
+            )
+            return {
+                "satisfied": satisfied,
+                "issue": str(data.get("issue", "")),
+                "suggestion": str(data.get("suggestion", "")),
+            }
+        except Exception as e:
+            logger.warning("整体结果判断失败: %s，默认通过", e)
+            return default
+
+    async def replan_agents(
+        self,
+        user_input: str,
+        issue: str,
+        suggestion: str,
+        prev_results: List[Dict[str, Any]],
+        llm: Optional[BaseChatModel] = None,
+    ) -> List[Dict[str, Any]]:
+        """根据问题重新规划 Agent 任务分工，返回新 pipeline 列表。
+
+        Returns:
+            新 pipeline 列表，格式同 process() 返回的 pipeline 字段；失败时返回空列表。
+        """
+        from app.agents.registry import registry
+        candidates = [a for a in registry.list_all() if a.name != self.name]
+        agents_info = "\n".join(
+            f"  {a.name} | {a.role} | {(a.background or '')[:60].replace(chr(10), ' ')}"
+            for a in candidates
+        ) or "  general_assistant | 通用助手 | 处理各类任务"
+
+        results_text = "\n".join(
+            f"  [{r.get('agent', '?')}]: {str(r.get('result', ''))[:200]}"
+            for r in prev_results
+        )
+        messages = [
+            SystemMessage(content=_REPLAN_AGENTS_SYSTEM.format(
+                user_input=user_input,
+                issue=issue,
+                suggestion=suggestion,
+                results_text=results_text,
+                agents_info=agents_info,
+            )),
+        ]
+        try:
+            data = await self._invoke_json(messages, [], llm)
+            if not isinstance(data, list) or not data:
+                return []
+            pipeline = []
+            for i, item in enumerate(data):
+                if not isinstance(item, dict):
+                    continue
+                ag = str(item.get("agent_name", "general_assistant")).strip()
+                if registry.get(ag) is None:
+                    logger.warning("重新规划: LLM 选 '%s' 不存在，回退 general_assistant", ag)
+                    ag = "general_assistant"
+                raw_task = item.get("task", {})
+                if not isinstance(raw_task, dict):
+                    raw_task = {}
+                task = {
+                    "task_id": raw_task.get("task_id", f"task_{i+1}"),
+                    "type": raw_task.get("type", ag),
+                    "description": raw_task.get("description", user_input),
+                }
+                pipeline.append({"step": i, "agent_name": ag, "task": task})
+            logger.info("重新规划完成: %d 个 Agent tasks", len(pipeline))
+            return pipeline
+        except Exception as e:
+            logger.warning("重新规划失败: %s", e)
+            return []
 
     async def _write_l1_tasks(
         self,

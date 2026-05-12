@@ -1,4 +1,19 @@
-"""FastAPI 依赖注入 - 鉴权、会话管理等"""
+"""
+【模块说明】公共依赖 — 登录验证与模型加载
+
+这个文件提供两个核心"前置检查"，在处理每个请求前先执行：
+
+1. 验证用户是否已登录（get_current_user）
+   检查请求携带的 Token 是否有效，有效则继续处理，无效则拒绝并返回"请重新登录"。
+
+2. 加载用户当前使用的 AI 模型（get_user_model）
+   从数据库中查询该用户当前激活的模型配置（模型地址、API Key 等），
+   找不到时提示用户先去添加模型。
+
+其他 API 文件通过 `Depends(get_current_user)` 等方式引用这里的函数，
+相当于给每个接口自动加上了"登录门禁"和"模型准备"步骤。
+"""
+
 
 import asyncio
 import json
@@ -16,21 +31,14 @@ async def get_current_user(
     token: Optional[str] = Query(None)
 ) -> dict:
     """
-    验证当前用户身份 - 支持多种方式传递 token
-    
-    支持两种方式传递 token：
-    1. HTTP Header: Authorization: Bearer <token>
-    2. Query 参数: ?token=<token>
-    
-    Args:
-        authorization: HTTP Authorization 头 (Bearer token)
-        token: Query 参数中的 token (备用方式)
-        
-    Returns:
-        dict: 用户信息，包含 user_id 等字段
-        
-    Raises:
-        HTTPException: 认证失败
+    【登录验证】检查当前请求是否携带有效的登录令牌（Token）。
+
+    Token 可以通过两种方式传入：
+      方式1 — 请求头：Authorization: Bearer <token>
+      方式2 — URL 参数：?token=<token>
+
+    验证过程：去 Redis 缓存中查找该 Token 对应的用户信息，
+    找到则返回用户信息（包含 user_id、用户名等），找不到则报错"请重新登录"。
     """
     # 优先使用 Authorization header
     if authorization:
@@ -49,12 +57,6 @@ async def get_current_user(
     
     # 从 Redis 验证 token
     redis_conn = await get_connection("redis", None)
-    if not redis_conn:
-        logger.error("Redis 连接失败，无法验证 token")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="认证服务暂时不可用，请稍后重试"
-        )
 
     try:
         # 从 Redis 读取用户数据
@@ -108,10 +110,12 @@ async def require_local_or_auth(
     authorization: Optional[str] = Header(None),
     token:         Optional[str] = Query(None),
 ) -> Optional[dict]:
-    """本机请求无需鉴权直接放行；远程请求必须携带有效 Token。
+    """
+    【管理接口门禁】本机访问免登录，远程访问必须登录。
 
-    用于服务端 CLI 命令对应的管理接口，CLI 在本机执行时天然通过，
-    前端或远程调用仍走完整 Token 验证。
+    用于后台管理命令（如重新构建向量索引等），
+    在服务器本地运行时可以直接调用，无需 Token；
+    从外网或前端调用时仍需登录验证。
     """
     client_host = request.client.host if request.client else ""
     has_token   = bool(authorization or token)
@@ -126,16 +130,14 @@ async def require_local_or_auth(
 
 async def get_user_model(user: dict = Depends(get_current_user)):
     """
-    获取或初始化用户的模型（从数据库或使用默认配置）
-    
-    Args:
-        user: 当前用户信息
-        
-    Returns:
-        dict: 模型配置信息或从 MySQL 加载的 LLM 配置
-        
-    Raises:
-        HTTPException: 如果模型加载失败
+    【模型加载】从数据库中取出当前用户正在使用的 AI 模型配置。
+
+    查找逻辑：
+      1. 先查用户自己添加并激活的模型
+      2. 找不到则自动回退到系统预置的默认模型
+      3. 两者都没有则提示用户去"模型管理"页面添加一个
+
+    同时检查用户缓存剩余时间，即将过期时在后台悄悄把用户画像存回数据库。
     """
     user_id = user.get("user_id", "test_user")
 

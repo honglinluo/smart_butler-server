@@ -1,14 +1,20 @@
-"""上下文管理器（向后兼容封装层）。
-
-RAG 核心逻辑已迁移至 app.rag 模块：
-  - 检索与评分过滤 → app.rag.retriever.HybridRetriever
-  - 记忆文本格式化 → app.rag.formatter
-  - 上下文组装     → app.rag.pipeline.RagPipeline.build_context()
-  - 数据类型       → app.rag.types.RagContext
-
-本模块保留 ContextBundle 和 ContextManager 供尚未迁移的代码使用。
-HermesEngine 已直接调用 RagPipeline，此类不再参与主链路。
 """
+【模块说明】上下文管理器 — 已被 RagPipeline 取代，保留兼容
+
+【历史背景】
+  这个模块原来负责在 AI 回答之前，从记忆系统中取出相关的历史对话，
+  组装成 AI 需要的"上下文包"（ContextBundle）。
+
+【现状】
+  核心逻辑已迁移到更完善的 `app/rag/` 模块：
+  - 记忆检索和相关性打分 → app.rag.retriever.HybridRetriever
+  - 记忆文本格式化       → app.rag.formatter
+  - 最终上下文组装       → app.rag.pipeline.RagPipeline.build_context()
+
+  本模块仅作为过渡层保留，供老代码使用。
+  新开发的功能请直接使用 `app.rag.RagPipeline`。
+"""
+
 
 import logging
 from typing import Any, Dict, List, Optional
@@ -28,9 +34,13 @@ ContextBundle = RagContext
 
 
 class ContextManager:
-    """上下文管理器（已被 RagPipeline 取代，保留向后兼容）。
+    """
+    上下文管理器（已被 RagPipeline 取代，保留向后兼容）。
 
-    新代码请使用 app.rag.RagPipeline.build_context()。
+    功能：在 AI 处理用户消息之前，从记忆系统取出相关历史，
+    组装成供 AI 使用的上下文信息包（ContextBundle）。
+
+    注意：新代码请直接使用 app.rag.RagPipeline.build_context()。
     """
 
     def __init__(self, memory_manager, config: Dict[str, Any]) -> None:

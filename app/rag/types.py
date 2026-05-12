@@ -1,4 +1,13 @@
-"""RAG 核心数据类型。"""
+"""
+【模块说明】RAG 数据类型定义 — 描述"检索到的上下文"长什么样
+
+RagContext 是 RAG 检索流程的输出结果，包含：
+  - 最近几轮对话历史（让 AI 知道这次对话之前聊了什么）
+  - 从长期记忆中检索到的相关片段（让 AI 知道更久以前的相关内容）
+  - 格式化后的记忆文本（已处理成 AI 提示词格式，可直接使用）
+
+RAG 核心数据类型。
+"""
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List

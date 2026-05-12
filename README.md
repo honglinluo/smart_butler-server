@@ -106,9 +106,9 @@ open http://localhost:8000/docs
 | --- | --- | --- |
 | `/auth` | auth.py | 注册、登录、Token 校验、登出 |
 | `/models` | models.py | LLM 模型配置 CRUD + 切换 |
-| `/chat` | chat.py | 消息发送（同步/SSE流式）、历史查询、文件上传、重向量化 |
+| `/chat` | chat.py | 消息发送（同步/SSE流式）、历史查询、文件上传、重向量化、危险操作授权响应 |
 | `/agents` | agents_api.py | Agent CRUD + 评分 + 热重载 |
-| `/tools` | tools_api.py | 工具查询与创建 |
+| `/tools` | tools_api.py | 工具查询与创建、危险操作类型开关管理 |
 | `/scheduler` | scheduler_api.py | 定时任务管理 + 通知 SSE |
 | `/decisions` | decision_api.py | 工具构建决策门控 + 策略配置 |
 
@@ -172,6 +172,17 @@ ES 未就绪时自动降级到 Redis 近期对话。
 可见性：`public`（全局）/ `private`（仅创建者）/ `exclusive`（仅归属 Agent）
 
 `dangerous_ops` 声明危险操作类型，框架自动通过 `ConsentManager` 核查授权。
+
+### 危险操作授权系统
+
+工具声明 `dangerous_ops`（如 `["modify", "delete"]`）后，执行时自动触发授权流程：
+
+- **SSE 流式场景**：通过 `asyncio.Future` 原地暂停工具执行，向前端推送 `consent_required` 事件，用户选择后调用 `POST /chat/consent` 恢复执行
+- **三种决策**：允许（仅此次）/ 拒绝 / 当前对话允许（本轮 `turn_id` 全量放行）
+- **并发串行化**：`_consent_lock` 确保并行 agent 同时触发时依次弹窗，获取锁后自动复查已授权状态避免重复弹窗
+- **用户级开关**：`dangerous_op_configs` 表允许用户关闭特定操作类型的授权要求（关闭后自动放行）
+- **授权优先级**：op_disabled > once > conversation（blanket） > session > project/always
+- **性能**：`_is_op_enabled()` 结果按 60s TTL 缓存；设置页切换后立即失效
 
 ### 向量语义检索
 
@@ -248,10 +259,10 @@ smart_butler-server/
 │   │   ├── scanner.py         # 静态高危模式扫描
 │   │   └── file_handler.py    # 沙箱文件管理
 │   ├── tools/                 # 工具框架
-│   │   ├── base.py            # BaseTool + 权限/可见性/危险操作
+│   │   ├── base.py            # BaseTool + 权限/可见性/危险操作 + ConsentRequiredException
 │   │   ├── registry.py        # 工具注册表
 │   │   ├── loader.py          # 动态加载（code/user/agent 三来源）
-│   │   ├── permission.py      # ConsentManager 授权核查
+│   │   ├── permission.py      # ConsentManager（授权核查/缓存/blanket 放行）
 │   │   ├── decorators.py      # @tool 装饰器
 │   │   ├── file_tools.py      # 文件操作工具
 │   │   └── builtin/
@@ -346,7 +357,7 @@ python tests/run_demo.py
 
 | 服务 | 版本要求 | 用途 |
 | --- | --- | --- |
-| MySQL | 5.7+ / 8.0+ | 用户、模型、Agent、技能、调度任务 |
+| MySQL | 5.7+ / 8.0+ | 用户、模型、Agent、技能、调度任务、危险操作配置（`dangerous_op_configs`）、工具授权记录（`tool_consent_records`） |
 | Redis | 6.0+ | 近期对话、预取缓存、分布式锁、通知队列 |
 | Elasticsearch | 8.x | 聊天历史、向量索引 |
 | Ollama（可选）| 0.1.24+ | 本地 Embedding 模型服务 |

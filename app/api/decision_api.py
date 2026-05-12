@@ -1,4 +1,18 @@
-"""用户决策 API — 管理工具构建的用户授权与策略配置
+"""
+【模块说明】用户决策 API — 处理 AI 构建新工具时需要用户确认的授权机制
+
+当 AI 需要临时创建一个新工具（如写代码去调用某个 API），系统会暂停等待用户确认。
+这些接口让前端能够展示"待审批请求"弹窗，并接收用户的确认或拒绝操作。
+
+【可用接口】
+  GET  /decisions/pending              — 查询当前所有等待确认的决策请求（展示弹窗用）
+  POST /decisions/{id}/resolve         — 确认或拒绝某个决策（用户点击"允许"或"拒绝"）
+  GET  /decisions/logs/{session_id}    — 查看某次 Agent 执行的完整调用日志
+
+  GET  /users/{user_id}/decision-policy  — 查看用户的工具构建授权策略
+  PUT  /users/{user_id}/decision-policy  — 修改策略（allow/ask/deny 三选一）
+
+用户决策 API — 管理工具构建的用户授权与策略配置
 
 端点列表：
   GET  /decisions/pending              — 查询所有挂起等待的决策

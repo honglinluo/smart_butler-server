@@ -1,17 +1,27 @@
-"""数据库表创建脚本 - 创建用户表和LLM信息表"""
+"""数据库 DDL 执行脚本
+
+扫描 dataset/ 目录下的所有 .sql 文件，提取 CREATE / ALTER / DROP
+TABLE|DATABASE|INDEX 语句，依次在配置的 MySQL 数据库中执行。
+
+用法：
+    python create_tables.py
+"""
 
 import os
+import re
+import sys
+import logging
 from pathlib import Path
 
 os.environ.setdefault("PROJECT_ROOT", str(Path(__file__).parent.resolve()))
 
-import asyncio
-import logging
-
 import yaml
-from sqlalchemy import text
-from app.database.pool import get_connection, release_connection
+from sqlalchemy import create_engine, text
 
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 def _read_log_cfg() -> dict:
     try:
@@ -23,123 +33,182 @@ def _read_log_cfg() -> dict:
         pass
     return {}
 
+
 _log_cfg = _read_log_cfg()
 logging.basicConfig(
     level=getattr(logging, _log_cfg.get("level", "INFO").upper(), logging.INFO),
-    format=_log_cfg.get("format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"),
+    format=_log_cfg.get(
+        "format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    ),
 )
 logger = logging.getLogger(__name__)
 
 
-async def create_tables():
-    """创建数据库表"""
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
+PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
+DATASET_DIR = PROJECT_ROOT / "dataset"
+
+# 匹配需要执行的 DDL 语句类型
+_DDL_RE = re.compile(
+    r"^\s*("
+    r"CREATE\s+(?:DATABASE|TABLE|UNIQUE\s+INDEX|INDEX)\b"
+    r"|ALTER\s+TABLE\b"
+    r"|DROP\s+(?:TABLE|DATABASE|INDEX)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def _load_mysql_url() -> str:
+    """从 system_config.yaml 读取 MySQL URL；占位符则退回环境变量 MYSQL_URL。"""
     try:
-        # 先连接到MySQL服务器（不指定数据库），创建数据库
-        logger.info("创建数据库...")
-        # 临时修改配置以连接到默认数据库
-        import app.database.pool as pool_module
-        original_config = pool_module.pool_manager.pools['mysql'].config.copy()
-        temp_config = original_config.copy()
-        # 移除数据库名，只连接到服务器
-        temp_url = temp_config['url'].replace('/agent_db', '')
-        temp_config['url'] = temp_url
-        
-        # 创建临时连接
-        from app.database.mysql import MySQLDatabase
-        temp_conn = MySQLDatabase(temp_config)
-        if await temp_conn.connect():
-            # 创建数据库（如果不存在）
-            create_db_sql = "CREATE DATABASE IF NOT EXISTS agent_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-            with temp_conn.engine.connect() as connection:
-                connection.execute(text(create_db_sql))
-                connection.commit()
-            logger.info("数据库创建成功")
-            await temp_conn.disconnect()
-        else:
-            logger.error("连接到MySQL服务器失败")
-            return
+        p = PROJECT_ROOT / "config" / "system_config.yaml"
+        if p.exists():
+            with open(p, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            url: str = cfg.get("database", {}).get("mysql", {}).get("url", "")
+            if url and not url.startswith("${"):
+                return url
+    except Exception as exc:
+        logger.warning("读取配置文件失败: %s", exc)
+    return os.environ.get("MYSQL_URL", "")
 
-        # 现在连接到agent_db数据库
-        logger.info("获取MySQL连接...")
-        conn = await get_connection('mysql', 'agent_db')
-        if not conn:
-            logger.error("获取MySQL连接失败")
-            return
 
-        try:
-            # 创建用户表
-            logger.info("创建用户表...")
-            create_user_table_sql = """
-            CREATE TABLE IF NOT EXISTS user (
-                user_id VARCHAR(50) PRIMARY KEY COMMENT '用户ID',
-                username VARCHAR(100) UNIQUE NOT NULL COMMENT '用户名',
-                password VARCHAR(255) NOT NULL COMMENT '密码哈希',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-                last_login_at TIMESTAMP NULL COMMENT '最近登录时间',
-                INDEX idx_user_id (user_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
-            """
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
 
-            # 直接使用SQLAlchemy执行SQL
-            with conn.engine.connect() as connection:
-                connection.execute(text(create_user_table_sql))
-                connection.commit()
+def _split_url(url: str) -> tuple[str, str]:
+    """
+    将 mysql+pymysql://user:pass@host:port/db_name[?...] 拆分为
+    (server_url, db_name)，其中 server_url 不含数据库路径段。
+    """
+    m = re.match(r"^(mysql[^:]*://[^/]+)/([^?#]+)((?:\?[^#]*)?)$", url)
+    if not m:
+        return url, ""
+    server_url = m.group(1) + "/" + m.group(3)  # scheme+authority + query, no db
+    return server_url, m.group(2)
 
-            logger.info("用户表创建成功")
 
-            # 创建LLM信息表
-            logger.info("创建LLM信息表...")
-            create_llm_table_sql = """
-            CREATE TABLE IF NOT EXISTS llm_info (
-                id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
-                url VARCHAR(500) NOT NULL COMMENT 'LLM API URL',
-                api_key VARCHAR(500) NOT NULL COMMENT 'API密钥',
-                user_id VARCHAR(50) NOT NULL COMMENT '用户ID',
-                model_name VARCHAR(100) NOT NULL COMMENT '模型名称',
-                model_type ENUM('text', 'image', 'multimodal') NOT NULL COMMENT '模型类型',
-                state TINYINT(1) DEFAULT 1 COMMENT '是否启用模型',
-                is_deleted TINYINT(1) DEFAULT 0 COMMENT '是否删除',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-                INDEX idx_user_id (user_id),
-                FOREIGN KEY (user_id) REFERENCES user(user_id) ON DELETE CASCADE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='LLM信息表';
-            """
+def _ensure_database(server_url: str, db_name: str) -> None:
+    """连接 MySQL 服务器（不指定数据库），确保目标数据库存在。"""
+    logger.info("确保数据库 `%s` 存在...", db_name)
+    engine = create_engine(server_url, pool_pre_ping=True)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(
+                f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
+                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            ))
+            conn.commit()
+        logger.info("数据库 `%s` 就绪", db_name)
+    finally:
+        engine.dispose()
 
-            # 直接使用SQLAlchemy执行SQL
-            with conn.engine.connect() as connection:
-                connection.execute(text(create_llm_table_sql))
-                connection.commit()
 
-            logger.info("LLM信息表创建成功")
+# ---------------------------------------------------------------------------
+# SQL parsing
+# ---------------------------------------------------------------------------
 
-            # 创建用户画像表
-            logger.info("创建用户画像表...")
-            create_profile_table_sql = """
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                user_id    VARCHAR(50)  NOT NULL COMMENT '用户ID',
-                profile    JSON         NOT NULL COMMENT '用户画像 JSON，含 preferences/personal_info/work_content',
-                updated_at TIMESTAMP    NULL DEFAULT CURRENT_TIMESTAMP
-                           ON UPDATE CURRENT_TIMESTAMP COMMENT '最近更新时间',
-                PRIMARY KEY (user_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-              COMMENT='用户画像表';
-            """
-            with conn.engine.connect() as connection:
-                connection.execute(text(create_profile_table_sql))
-                connection.commit()
-            logger.info("用户画像表创建成功")
+def _strip_comments(sql: str) -> str:
+    """去除 /* ... */ 块注释和 -- 行注释。"""
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    sql = re.sub(r"--[^\n]*", "", sql)
+    return sql
 
-            logger.info("所有表创建完成！")
 
-        finally:
-            # 释放连接
-            await release_connection('mysql', conn)
+def _parse_ddl(content: str) -> list[str]:
+    """从 SQL 文件内容中提取所有 DDL 语句。"""
+    clean = _strip_comments(content)
+    stmts = []
+    for raw in clean.split(";"):
+        s = raw.strip()
+        if s and _DDL_RE.match(s):
+            stmts.append(s)
+    return stmts
 
-    except Exception as e:
-        logger.error(f"创建表失败: {str(e)}")
+
+# ---------------------------------------------------------------------------
+# File collection
+# ---------------------------------------------------------------------------
+
+def _collect_files() -> list[Path]:
+    """按路径排序收集 dataset/ 下所有 .sql 文件（递归）。"""
+    if not DATASET_DIR.exists():
+        logger.error("dataset/ 目录不存在: %s", DATASET_DIR)
+        return []
+    files = sorted(DATASET_DIR.rglob("*.sql"))
+    logger.info("找到 %d 个 SQL 文件", len(files))
+    return files
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    # 1. 获取连接 URL
+    url = _load_mysql_url()
+    if not url:
+        logger.error(
+            "未找到 MySQL URL。请设置环境变量 MYSQL_URL，"
+            "或在 config/system_config.yaml 的 database.mysql.url 中配置。"
+        )
+        sys.exit(1)
+
+    # 2. 确保数据库存在
+    server_url, db_name = _split_url(url)
+    if db_name:
+        _ensure_database(server_url, db_name)
+
+    # 3. 收集 SQL 文件
+    files = _collect_files()
+    if not files:
+        logger.error("dataset/ 中没有 .sql 文件，退出")
+        sys.exit(1)
+
+    # 4. 解析 DDL 语句
+    all_stmts: list[tuple[str, str]] = []  # (文件名, 语句)
+    for f in files:
+        content = f.read_text(encoding="utf-8")
+        stmts = _parse_ddl(content)
+        logger.info("  %-35s → %d 条 DDL", f.name, len(stmts))
+        all_stmts.extend((f.name, s) for s in stmts)
+
+    if not all_stmts:
+        logger.warning("所有文件中未解析到任何 DDL 语句，退出")
+        return
+
+    # 5. 执行
+    logger.info("共 %d 条 DDL 语句，开始执行...", len(all_stmts))
+    engine = create_engine(url, pool_pre_ping=True)
+    ok = fail = 0
+    try:
+        with engine.connect() as conn:
+            for filename, stmt in all_stmts:
+                preview = stmt[:80].replace("\n", " ")
+                try:
+                    conn.execute(text(stmt))
+                    conn.commit()
+                    logger.info("  ✓  [%s] %s", filename, preview)
+                    ok += 1
+                except Exception as exc:
+                    logger.error("  ✗  [%s] %s\n      %s", filename, preview, exc)
+                    fail += 1
+    finally:
+        engine.dispose()
+
+    logger.info("执行完成：成功 %d 条 / 失败 %d 条", ok, fail)
+    if fail:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(create_tables())
+    main()

@@ -1,12 +1,86 @@
 # Hermes 多智能体系统 — 优化与迭代总结
 
-**最后更新**: 2026-05-05
-**版本**: 2.6
+**最后更新**: 2026-05-12
+**版本**: 2.10
 **状态**: ✅ 核心系统就绪，持续迭代中
 
 ---
 
 ## 优化记录（按时间倒序）
+
+---
+
+### v2.10 — 2026-05-12：工程质量优化
+
+#### 1. Bug 修复：授权弹窗重复弹出（permission.py）
+
+用户选择「当前对话允许」后，同轮后续危险操作仍弹窗。
+
+**根因**：`grant_conversation()` 以 `(tool_name, op, turn_id)` 粒度授权，无法覆盖本轮全部操作。
+
+**修复**：新增 `_conversation_blanket: Set[str]`（turn_id 集合）和 `grant_conversation_all(turn_id)` 方法；`check_consented()` 优先检测 blanket 命中；`hermes_engine._consent_hook` 改为调用 `grant_conversation_all`。
+
+#### 2. Bug 修复：对话结束后执行过程不可见（chat.ts）
+
+消息提交后 Pipeline 展开面板为空。
+
+**根因**：`commitStream()` 浅拷贝 `{ ...this.pipeline }`，Pinia 响应式嵌套数组在 `reset` 后与拷贝共享引用丢失。
+
+**修复**：改用 `JSON.parse(JSON.stringify(...))` 深拷贝，`commitCancelled()` 同步处理。
+
+#### 3. Import 优化
+
+- `log_bus.py`：3 个方法内各自独立的 `progress_bus` 导入合并为文件顶部单条
+- `hermes_engine.py`：`finally` 块重复导入 `_CONSENT_HOOK/_CONSENT_TURN_ID` 删除
+
+#### 4. 性能优化：_is_op_enabled 缓存
+
+每次工具调用都查询 `dangerous_op_configs`，高频工具链压力大。
+
+新增 `_op_enabled_cache` 模块级 TTL 缓存（60s）；`PATCH /tools/dangerous-ops/{op_type}` 成功后调用 `_invalidate_op_cache()` 立即失效，无需等待 TTL。
+
+#### 5. 日志增强
+
+新增两个日志方法并接入引擎：
+
+| 方法 | 颜色 | 触发时机 |
+| --- | --- | --- |
+| `conversation_turn()` | 亮紫 | 每轮完成后；记录 intent/mode/agents/tools/耗时 |
+| `consent_decision()` | 亮黄 | 用户授权决策后；记录 tool/op/decision |
+
+---
+
+### v2.9 — 2026-05-12：危险操作授权系统
+
+#### 核心设计
+
+工具声明 `dangerous_ops` 后，执行时自动触发授权检查。流式场景下通过 `asyncio.Future` **原地暂停**工具执行（不重跑 pipeline），用户决策后原地恢复，对 Agent 调用链透明。
+
+#### 三种授权决策
+
+| 决策 | 效果 |
+| --- | --- |
+| 拒绝 | 工具返回拒绝结果，LLM 收到错误信息 |
+| 允许（仅此次） | 本次工具调用放行，下次同操作仍弹窗 |
+| 当前对话允许 | 本轮 `turn_id` 内所有危险操作全部放行，不再弹窗 |
+
+#### 关键实现细节
+
+- **并发串行化**：`_consent_lock` 确保并行 agent 同时触发时依次弹窗
+- **复查机制**：获取锁后调用 `check_consented()` 复查，若已被其他并发调用授权则跳过弹窗
+- **超时保护**：`asyncio.wait_for(..., timeout=300)`，5 分钟无响应自动拒绝
+- **用户级开关**：`dangerous_op_configs` 表，用户可关闭某类操作的授权要求（关闭后自动放行）
+
+#### 前后端数据流
+
+```
+前端发消息
+→ 后端 SSE 开始
+→ 工具触发危险操作 → SSE 推送 consent_required
+→ 前端弹出 ConsentDialog → 用户选择 → POST /chat/consent
+→ Future.set_result(decision) → 工具恢复执行
+→ SSE 继续输出
+```
 
 ---
 
@@ -186,6 +260,7 @@ fallback 到 `get_recent_turns()` 取 Redis 近期对话写入预取缓存。
 | FastAPI 应用启动 | ✅（需数据库） | 健康检查 /health 响应正常 |
 | 端到端聊天流程 | 需全服务 | 需 MySQL + Redis + ES |
 | 月度/年度归档 | 待集成测试 | 需建表后验证 |
+| 危险操作授权弹窗 | 待集成测试 | 需建表 dangerous_op_configs 后验证 |
 
 ---
 
@@ -193,8 +268,8 @@ fallback 到 `get_recent_turns()` 取 Redis 近期对话写入预取缓存。
 
 ### 立即可做
 
-1. **建表**：在 `create_tables.py` 添加 `memory_monthly_jobs` / `memory_yearly_jobs` DDL
-2. **启动验证**：修改 `logging.level: "DEBUG"` 重启，确认 DEBUG 日志输出
+1. **建表**：在 `create_tables.py` 添加 `memory_monthly_jobs` / `memory_yearly_jobs` / `dangerous_op_configs` DDL
+2. **启动验证**：修改 `logging.level: "DEBUG"` 重启，观察新增 `[轮次完成]` / `[授权]` 彩色日志输出
 3. **Embedding 初始化**：运行 `python scripts/setup_embedding.py`
 
 ### 近期工程
@@ -207,3 +282,4 @@ fallback 到 `get_recent_turns()` 取 Redis 近期对话写入预取缓存。
 1. **revectorize 保留 agent 结构**：全量重建时从 ES 读取 turn 后重构 agent_outputs
 2. **PII 脱敏接入**：`vector_store._desensitize()` 接入正式脱敏库
 3. **API 速率限制**：FastAPI 中间件层添加 slowapi
+4. **WA01 冗余重构**：Worker Agent `execute()` 骨架统一提取到 `BaseAgent`（见 v2.8 标注）

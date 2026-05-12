@@ -1,4 +1,23 @@
-"""定时任务通知器 — Redis 消息队列 + SSE/轮询推送。
+"""
+【模块说明】定时任务通知器（Notifier）— 把任务结果"推送给用户"
+
+定时任务执行完后，用户需要知道结果（"你的周报已生成完毕"或"该开会了"）。
+这个模块负责把通知消息放入队列，再通过两种方式送达用户：
+
+【两种获取通知的方式】
+  1. 轮询（polling）：前端每隔几秒主动来问"有新消息吗？" → pop_notifications()
+  2. SSE 长连接：前端保持一个持续连接，服务器有消息就实时推送 → sse_notification_stream()
+
+【消息队列机制（Redis List）】
+  任务执行完 → 消息写入 Redis → 用户下次来取时弹出
+  - 消息存活 24 小时，过期自动清除
+  - FIFO 顺序（先进先出）：按执行完成顺序排队
+
+【两种通知消息格式】
+  make_reminder_payload()    — 提醒类通知（"该做某事了"）
+  make_agent_done_payload()  — AI 任务完成通知（附带执行结果摘要）
+
+定时任务通知器 — Redis 消息队列 + SSE/轮询推送。
 
 架构：
   runner 执行完任务 → push_notification() 将消息 RPUSH 到 Redis List（FIFO 队列尾）
@@ -31,9 +50,6 @@ async def push_notification(user_id: str, payload: Dict[str, Any]) -> None:
     redis_conn = None
     try:
         redis_conn = await get_connection("redis", None)
-        if not redis_conn:
-            logger.warning("Redis 不可用，通知未推送 user=%s", user_id)
-            return
         key  = _key(user_id)
         data = json.dumps(payload, ensure_ascii=False, default=str)
         # 直接使用底层 redis_client（同步 redis-py）
@@ -51,8 +67,6 @@ async def pop_notifications(user_id: str, max_count: int = 20) -> List[Dict[str,
     redis_conn = None
     try:
         redis_conn = await get_connection("redis", None)
-        if not redis_conn:
-            return []
         key    = _key(user_id)
         client = redis_conn.redis_client
         result = []
@@ -78,8 +92,6 @@ async def peek_notifications(user_id: str, count: int = 20) -> List[Dict[str, An
     redis_conn = None
     try:
         redis_conn = await get_connection("redis", None)
-        if not redis_conn:
-            return []
         key    = _key(user_id)
         items  = redis_conn.redis_client.lrange(key, 0, count - 1)
         result = []

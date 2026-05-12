@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS `users` (
   `password` varchar(255) NOT NULL COMMENT '密码哈希',
   `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `last_login_at` timestamp NULL DEFAULT NULL COMMENT '最近登录时间',
+  `current_llm_id` int DEFAULT NULL COMMENT '当前使用的模型ID，NULL=使用系统默认模型，关联llms.id',
   PRIMARY KEY (`user_id`),
   UNIQUE KEY `username` (`username`),
   KEY `idx_user_id` (`user_id`)
@@ -19,7 +20,7 @@ CREATE TABLE IF NOT EXISTS `llms` (
   `api_key` varchar(500) NOT NULL COMMENT 'API密钥',
   `user_id` varchar(50) NOT NULL COMMENT '用户ID',
   `model_name` varchar(100) NOT NULL COMMENT '模型名称',
-  `model_type` enum('text','image','multimodal') NOT NULL COMMENT '模型类型',
+  `model_type` enum('text','image','multimodal','embedding') NOT NULL COMMENT '模型类型',
   `is_deleted` tinyint(1) DEFAULT '0' COMMENT '是否删除',
   `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
@@ -29,6 +30,12 @@ CREATE TABLE IF NOT EXISTS `llms` (
   KEY `idx_user_id` (`user_id`),
   CONSTRAINT `llms_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`user_id`) ON DELETE CASCADE
 ) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='LLM信息表';
+
+-- users.current_llm_id → llms.id 外键（须在 llms 建表后添加，避免循环依赖）
+ALTER TABLE `users`
+  ADD CONSTRAINT `fk_users_current_llm_id`
+  FOREIGN KEY (`current_llm_id`) REFERENCES `llms` (`id`)
+  ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- 会话引用统计表（MemoryManager 使用）
 CREATE TABLE IF NOT EXISTS `memory_references` (
@@ -167,3 +174,14 @@ CREATE TABLE IF NOT EXISTS `tool_consent_records` (
   INDEX idx_session    (`session_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='tools 授权记录';
+
+-- 危险操作类型用户级别开关（无记录 = 默认开启，需授权）
+CREATE TABLE IF NOT EXISTS `dangerous_op_configs` (
+  `id`          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `user_id`     VARCHAR(36)  NOT NULL,
+  `op_type`     VARCHAR(50)  NOT NULL,
+  `is_enabled`  TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '1=开启需授权 0=关闭跳过授权',
+  `created_at`  DATETIME     DEFAULT NOW(),
+  UNIQUE KEY uq_user_op (`user_id`, `op_type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='危险操作类型用户级别开关';

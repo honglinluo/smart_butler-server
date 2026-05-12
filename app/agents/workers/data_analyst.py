@@ -1,8 +1,18 @@
-"""数据分析 Agent — 处理数据查询、统计分析和洞察生成"""
+"""
+【模块说明】数据分析 Agent（DataAnalystAgent）— 专业数据分析师
+
+负责处理一切跟数据打交道的任务：
+  - 查询数据库（SQL）、分析电子表格（CSV/Excel）
+  - 统计计算、趋势分析、异常检测
+  - 生成数据洞察报告，提炼关键发现
+  - 辅助做数据决策建议
+
+数据分析 Agent — 处理数据查询、统计分析和洞察生成
+"""
 
 import json
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import SystemMessage
 
 from app.agents.base import BaseAgent
 from app.agents.decorators import agent
@@ -21,27 +31,10 @@ from app.agents.decorators import agent
     ),
 )
 class DataAnalystAgent(BaseAgent):
-    async def execute(self, task: dict, context: dict, llm) -> dict:
-        await self.load_skills()
-        messages = [SystemMessage(content=self._build_system_prompt())]
-
+    def _build_context_messages(self, context: dict) -> list:
         data_context = context.get("data", {})
-        if data_context:
-            messages.append(SystemMessage(
-                content=f"当前数据上下文：\n{json.dumps(data_context, ensure_ascii=False, indent=2)}"
-            ))
-
-        description = task.get("description", "")
-        messages.append(HumanMessage(content=f"请分析以下数据需求：{description}"))
-
-        try:
-            result = await llm.ainvoke(messages)
-            answer = result.content if hasattr(result, "content") else str(result)
-            await self.update_skill(description, answer, success=True)
-            return {
-                "result": answer,
-                "success": True,
-                "metadata": {"agent": self.name, "task_type": "data_analysis"},
-            }
-        except Exception as e:
-            return {"result": f"数据分析失败: {e}", "success": False, "metadata": {}}
+        if not data_context:
+            return []
+        return [SystemMessage(
+            content=f"当前数据上下文：\n{json.dumps(data_context, ensure_ascii=False, indent=2)}"
+        )]

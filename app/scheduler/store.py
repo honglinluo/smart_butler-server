@@ -1,4 +1,24 @@
-"""定时任务持久化 — MySQL CRUD。
+"""
+【模块说明】定时任务存储层（Store）— 把任务信息"存进"和"取出"数据库
+
+调度器运行时需要知道：哪些任务到时间了要执行？执行完后怎么更新状态？
+这个模块就负责对接 MySQL 数据库，完成这些"读写账本"的操作。
+
+【两张数据库表】
+  scheduled_tasks  — 存所有定时任务的配置和状态
+  task_run_logs    — 存每次执行的结果记录（什么时候跑的、成功了没有、输出了什么）
+
+【主要操作】
+  save_task()        — 创建或更新一条任务（新建 + 编辑都用这个）
+  get_task()         — 按 ID 查询一条任务
+  list_user_tasks()  — 查询某用户的所有任务
+  list_due_tasks()   — 查询"当前时间到期"的待执行任务（调度器每 30 秒调一次）
+  update_task_status() — 执行完任务后更新状态（next_run_at、run_count等）
+  delete_task()      — 取消任务（软删除，改状态为 cancelled）
+  save_run_log()     — 记录一次执行结果
+  list_run_logs()    — 查询某任务的历史执行记录
+
+定时任务持久化 — MySQL CRUD。
 
 建表 DDL（首次启动自动执行）：
 
@@ -170,8 +190,6 @@ class TaskStore:
         conn = None
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return False
             await conn.execute_raw(
                 """
                 INSERT INTO scheduled_tasks
@@ -230,8 +248,6 @@ class TaskStore:
         conn = None
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return None
             rows = await conn.execute_raw(
                 "SELECT * FROM scheduled_tasks WHERE task_id = :tid",
                 {"tid": task_id},
@@ -254,8 +270,6 @@ class TaskStore:
         conn = None
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return []
             if status:
                 rows = await conn.execute_raw(
                     "SELECT * FROM scheduled_tasks WHERE user_id=:uid AND status=:st ORDER BY created_at DESC",
@@ -281,8 +295,6 @@ class TaskStore:
         conn = None
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return []
             rows = await conn.execute_raw(
                 """
                 SELECT * FROM scheduled_tasks
@@ -314,8 +326,6 @@ class TaskStore:
         conn = None
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return
             await conn.execute_raw(
                 """
                 UPDATE scheduled_tasks
@@ -345,8 +355,6 @@ class TaskStore:
         conn = None
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return False
             await conn.execute_raw(
                 "UPDATE scheduled_tasks SET status='cancelled', updated_at=:now WHERE task_id=:tid AND user_id=:uid",
                 {"now": datetime.utcnow(), "tid": task_id, "uid": user_id},
@@ -365,8 +373,6 @@ class TaskStore:
         conn = None
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return
             await conn.execute_raw(
                 """
                 INSERT INTO task_run_logs
@@ -399,8 +405,6 @@ class TaskStore:
         conn = None
         try:
             conn = await get_connection("mysql", None)
-            if not conn:
-                return []
             rows = await conn.execute_raw(
                 "SELECT * FROM task_run_logs WHERE task_id=:tid ORDER BY started_at DESC LIMIT :lim",
                 {"tid": task_id, "lim": limit},

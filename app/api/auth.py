@@ -1,4 +1,23 @@
-"""用户认证 API — 登录、注册、密码修改
+"""
+【模块说明】用户账号系统 — 注册、登录、退出、修改密码
+
+这个文件负责用户账号的全部操作：
+  - 注册新账号（手机号或邮箱）
+  - 登录并获取访问令牌（Token）
+  - 退出登录（同时把用户数据保存回数据库）
+  - 修改密码
+
+【安全机制 - 密码为何要加密传输？】
+  用户的密码绝对不能以明文（原文）在网络上传输，否则一旦被拦截就泄露了。
+  本系统使用"RSA-OAEP-SHA256"加密方案：服务器先给浏览器一把"公钥"（相当于一把锁），
+  浏览器用这把锁把密码锁住再发过来，服务器用只有自己才有的"私钥"才能打开。
+  这样即使数据在途中被截获，也无法读出原始密码。
+
+【nonce（一次性码）是什么？】
+  每次加密密码时，服务器还会附带一个 nonce（随机字符串，5 分钟有效，用完即失效）。
+  目的是防止"重放攻击"：有人截获了加密后的数据包再发一遍，nonce 已消耗所以不会生效。
+
+用户认证 API — 登录、注册、密码修改
 
 密码传输安全：
   所有密码字段一律通过 RSA-OAEP-SHA256 加密传输，服务端不接受明文密码。
@@ -64,7 +83,11 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 # ═══════════════════════════════════════════════════════════════
 
 class PhoneStr:
-    """中国大陆手机号类型（支持 11 位纯数字或 +86 前缀）。"""
+    """
+    手机号格式校验器。
+    接受中国大陆 11 位手机号（如 13812345678）或带 +86 前缀的格式。
+    格式不合法时会直接报错，阻止后续操作。
+    """
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -105,7 +128,11 @@ _EMAIL_RE = re.compile(
 
 
 class EmailStr:
-    """邮箱地址类型（RFC 5321 简化校验，存储时转为小写）。"""
+    """
+    邮箱格式校验器。
+    检查输入是否是合法的邮箱地址（如 user@example.com），存储前统一转为小写。
+    格式不合法时报错拒绝。
+    """
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -134,6 +161,7 @@ class EmailStr:
 
 
 # ── 密码安全规则 ─────────────────────────────────────────────────────────────
+# 密码必须同时满足以下 4 条规则，任一不满足都会拒绝注册/修改
 _PASSWORD_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"[A-Z]"),  "至少包含一个大写字母（A-Z）"),
     (re.compile(r"[a-z]"),  "至少包含一个小写字母（a-z）"),
@@ -145,7 +173,11 @@ _PASSWORD_MIN_LEN = 8
 
 
 def _validate_password_strength(password: str) -> str:
-    """校验明文密码强度，不符合则抛出 ValueError。"""
+    """
+    检查密码是否足够安全。
+    密码需至少 8 位，且同时包含大写字母、小写字母、数字和特殊符号。
+    不达标时抛出错误并告知具体缺少什么。
+    """
     if len(password) < _PASSWORD_MIN_LEN:
         raise ValueError(f"密码长度至少 {_PASSWORD_MIN_LEN} 位")
     errors = [msg for pattern, msg in _PASSWORD_RULES if not pattern.search(password)]
@@ -155,7 +187,11 @@ def _validate_password_strength(password: str) -> str:
 
 
 class UsernameStr:
-    """登录用户名类型：接受手机号或邮箱地址（自动识别）。"""
+    """
+    用户名格式校验器。
+    本系统用手机号或邮箱作为登录账号，此处自动判断输入的是哪种格式并分别校验。
+    两种格式都不符合时报错。
+    """
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -227,10 +263,19 @@ class ChangePassword(BaseModel):
 # ═══════════════════════════════════════════════════════════════
 
 def hash_password(password: str) -> str:
+    """
+    把明文密码"加盐哈希"后存入数据库。
+    哈希是单向运算：只能验证"是否匹配"，无法反推出原始密码，
+    即使数据库被盗也不会泄露用户真实密码。
+    """
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
 def verify_password(password: str, hashed: str) -> bool:
+    """
+    验证用户输入的密码是否与数据库中存储的哈希值匹配。
+    返回 True 表示密码正确，False 表示密码错误。
+    """
     try:
         return bcrypt.checkpw(password.encode(), hashed.encode())
     except ValueError:
@@ -239,6 +284,7 @@ def verify_password(password: str, hashed: str) -> bool:
 
 
 def generate_token() -> str:
+    """生成一个 64 位的随机登录令牌（Token），用于标识用户的登录状态。"""
     return secrets.token_hex(32)
 
 
@@ -268,10 +314,11 @@ async def _consume_nonce(nonce: str, redis_conn) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 async def _load_user_init_data(user_id: str, redis_conn) -> None:
-    """登录成功后将用户画像写入 Redis 缓存。"""
+    """
+    用户登录成功后，把用户画像（偏好、个人信息等）从数据库预加载到内存缓存（Redis）中。
+    这样后续对话中 AI 可以快速读取用户信息，无需每次都查询数据库，加快响应速度。
+    """
     mysql_conn = await get_connection("mysql", "agent_db")
-    if not mysql_conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
 
     try:
         profile: dict = {}
@@ -293,10 +340,11 @@ async def _load_user_init_data(user_id: str, redis_conn) -> None:
 
 
 async def _flush_profile_to_mysql(user_id: str, profile: dict) -> None:
-    """将用户画像固化到 MySQL（退出登录或 TTL 告警时调用）。"""
+    """
+    把内存缓存（Redis）中的用户画像持久化保存到数据库（MySQL）。
+    在用户退出登录或缓存即将过期时调用，确保用户数据不丢失。
+    """
     mysql_conn = await get_connection("mysql", "agent_db")
-    if not mysql_conn:
-        return
     try:
         await mysql_conn.execute_raw(
             """
@@ -328,8 +376,6 @@ async def get_public_key(response: Response):
     """
     ResponseHeaders().apply(response)
     redis_conn = await get_connection("redis", None)
-    if not redis_conn:
-        raise HTTPException(status_code=503, detail="Redis 不可用，无法签发 nonce")
 
     try:
         nonce = generate_nonce()
@@ -357,9 +403,6 @@ async def register(user: UserRegister, response: Response):
     ResponseHeaders().apply(response)
     redis_conn = await get_connection("redis", None)
     mysql_conn = await get_connection("mysql", "agent_db")
-    if not redis_conn or not mysql_conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     try:
         # 1. 验证并消费 nonce（防重放）
         await _consume_nonce(user.key_nonce, redis_conn)
@@ -415,9 +458,6 @@ async def login(user: UserLogin, response: Response, req_headers: RequestHeaders
     ResponseHeaders().apply(response)
     redis_conn = await get_connection("redis", None)
     mysql_conn = await get_connection("mysql", "agent_db")
-    if not redis_conn or not mysql_conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     try:
         # 1. 验证并消费 nonce
         await _consume_nonce(user.key_nonce, redis_conn)
@@ -514,8 +554,6 @@ async def logout(request: Request, response: Response, current_user: dict = Depe
     token   = current_user.get("token", "")
 
     redis_conn = await get_connection("redis", None)
-    if not redis_conn:
-        return {"message": "退出成功"}
 
     try:
         # 1. 删除当前平台 session token
@@ -581,9 +619,6 @@ async def change_password(
     ResponseHeaders().apply(response)
     redis_conn = await get_connection("redis", None)
     mysql_conn = await get_connection("mysql", "agent_db")
-    if not redis_conn or not mysql_conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     try:
         # 1. 验证并消费 nonce
         await _consume_nonce(password_data.key_nonce, redis_conn)

@@ -1,4 +1,20 @@
-"""Elasticsearch 数据库类 - 实现 ES 的增删改查操作"""
+"""
+【模块说明】Elasticsearch 搜索引擎操作类
+
+封装了对 Elasticsearch（ES）的操作。
+ES 是一个强大的搜索引擎，支持全文搜索和向量（语义）搜索，
+在本系统中用于存储和检索用户的全量历史对话。
+
+【在本系统中的用途】
+  - 存档全量历史对话（MySQL 只保留统计，ES 保留完整内容）
+  - 全文检索：根据关键词从历史中找出相关对话
+  - 向量语义搜索：根据含义相似度找出相关历史（需配合向量化服务）
+  - 对话历史分页查询（/chat/history 接口）
+
+每个用户有独立的 ES 索引（index），索引名格式：hermes_chat_{user_id}，
+确保用户数据完全隔离。
+"""
+
 
 from typing import Any, Dict, List, Optional
 from elasticsearch import Elasticsearch

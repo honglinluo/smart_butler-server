@@ -1,1095 +1,987 @@
-# 🏗️ 综合智能体系统架构设计方案 (Hermes Multi-Agent System)
+# Hermes Multi-Agent System — 详细设计文档
 
-## 总体架构概览
+**版本**：v2.10
+**最后更新**：2026-05-12
+**状态**：生产就绪（持续迭代）
 
-系统采用 分层微服务架构，核心由 接入层 (FastAPI)、编排层 (Hermes + LangChain)、数据层 (MySQL/Redis/ES) 和 配置中心 组成。
+> 本文档描述系统的**实际实现**，而非规划草稿。每章内容与代码保持一致。
 
-graph TD
-    User[多用户终端] --> LB[负载均衡/Nginx]
-    LB --> API[FastAPI 后端服务]
-    
-    subgraph "应用核心层 (Python)"
-        API --> Auth[认证与会话管理]
-        API --> Dispatcher[请求分发器]
-        Dispatcher --> HermesCore[Hermes 主框架/编排引擎]
-        
-        subgraph "多智能体协作 (Multi-Agent)"
-            HermesCore --> Router[路由智能体 (Router)]
-            Router --> AgentA[专业智能体 A]
-            Router --> AgentB[专业智能体 B]
-            Router --> AgentC[专业智能体 C]
-        end
-        
-        HermesCore --> MemoryMgr[记忆管理器 (Memory Manager)]
-        HermesCore --> Retriever[ES 向量检索器]
-    end
-    
-    subgraph "数据存储层"
-        MySQL[(MySQL: 用户/配置/元数据)]
-        Redis[(Redis: 临时会话/热点缓存/锁)]
-        ES[(Elasticsearch: 聊天历史/向量索引)]
-    end
-    
-    MemoryMgr --> MySQL
-    MemoryMgr --> Redis
-    MemoryMgr --> ES
-    Retriever --> ES
-    Dispatcher --> Redis
-    
-    subgraph "配置中心"
-        ConfigFile[YAML/JSON 配置文件]
-        ConfigFile -.->|动态加载 | HermesCore
-        ConfigFile -.-> |动态加载 | MemoryMgr
-    end
+---
 
-## 技术栈选型与职责
+## 目录
 
-| 模块        | 技术选型                          | 职责描述                                                     |
-| ----------- | --------------------------------- | ------------------------------------------------------------ |
-| 主框架      | Hermes (基于 LangChain/LangGraph) | 负责多智能体的生命周期管理、任务拆解、工具调用编排。         |
-| LLM 交互    | LangChain                         | 统一模型接口，处理 Prompt 模板、Output Parser。              |
-| Web 框架    | FastAPI                           | 提供 RESTful API，处理异步请求、WebSocket (可选)、鉴权。     |
-| 关系数据库  | MySQL                             | 存储用户信息、Agent 配置、工具定义、总结后的归档记录。       |
-| 缓存数据库  | Redis                             | 存储短期会话状态、分布式锁、高频访问的配置缓存。             |
-| 搜索/向量库 | Elasticsearch (ES)                | 存储原始聊天明细、作为向量数据库进行语义检索、执行摘要策略。 |
-| 配置管理    | Pydantic + YAML                   | 实现代码中提到的“文档配置化”，支持热加载                     |
+1. [系统架构概览](#1-系统架构概览)
+2. [核心编排引擎 HermesEngine](#2-核心编排引擎-hermesengine)
+3. [路由与 Pipeline 编排](#3-路由与-pipeline-编排)
+4. [RAG 检索增强管道](#4-rag-检索增强管道)
+5. [工具系统](#5-工具系统)
+6. [危险操作授权系统](#6-危险操作授权系统)
+7. [记忆管理系统](#7-记忆管理系统)
+8. [定时任务调度系统](#8-定时任务调度系统)
+9. [安全沙箱](#9-安全沙箱)
+10. [日志系统](#10-日志系统)
+11. [数据库设计](#11-数据库设计)
+12. [API 接口设计](#12-api-接口设计)
+13. [配置管理](#13-配置管理)
+14. [关键流程时序图](#14-关键流程时序图)
 
+---
 
+## 1. 系统架构概览
 
-## 核心功能模块设计
+### 1.1 分层架构
 
-### 3.1 数据存储策略 (重点解决要求 2, 3, 4, 5)
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  接入层 (FastAPI)                                │
+│  /auth  /models  /chat  /agents  /tools  /scheduler             │
+│  /decisions  /files                                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────────┐
+│                编排层 (HermesEngine)                             │
+│  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│  │ RouterAgent │  │AgentEventLoop│  │   RagPipeline        │  │
+│  │ 意图识别    │  │ 工具构建门控 │  │ 三层检索+预取缓存     │  │
+│  │ 任务分解    │  │ ReAct Agent  │  └──────────────────────┘  │
+│  │ 模式规划    │  └──────────────┘                             │
+│  └─────────────┘                                               │
+│  ┌──────────────────────┐  ┌──────────────────────────────┐   │
+│  │   工具系统 (Tools)   │  │   ConsentManager             │   │
+│  │ registry/loader      │  │ 危险操作授权 (v2.9)           │   │
+│  │ dangerous_ops 声明   │  │ asyncio.Future 暂停/恢复      │   │
+│  └──────────────────────┘  └──────────────────────────────┘   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────────┐
+│                   数据存储层                                      │
+│  Redis  — L1 近期对话 / 预取缓存 / 委托链 / 通知队列 / 锁       │
+│  MySQL  — 用户/模型/Agent/工具/记忆事实/调度任务/授权配置        │
+│  ES     — 聊天历史（全文）+ 向量索引（KNN/script_score）         │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-这是本系统的核心难点，需要设计一套分级存储与自动压缩机制。
+### 1.2 技术栈
 
-A. 数据库表结构设计 (MySQL)
-*   users: 用户基础信息。
-*   agent_configs: 存储 Agent 类型、Prompt 模板、绑定的工具列表（支持文档配置映射）。
-*   chat_summaries: 归档表。存储压缩后的摘要。
-    *   字段：user_id, summary_date, summary_content (格式：用户提问 -> 最终解决办法), original_count (原消息数)。
+| 层次 | 技术 | 说明 |
+|------|------|------|
+| Web 框架 | FastAPI 0.111 | 异步路由 + SSE 流式响应 |
+| Agent 编排 | LangGraph `create_react_agent` | ReAct 模式，支持工具调用循环 |
+| LLM 接口 | LangChain `init_chat_model` | 统一多 Provider（OpenAI/Anthropic/Ollama） |
+| 数据库 ORM | 原生 aiomysql + 自建异步连接池 | 支持 PooledConnection 状态机 |
+| 向量索引 | Elasticsearch 7/8/9 自动适配 | BM25 全文 + KNN 向量混合检索 |
+| 缓存/锁 | Redis 6+ | asyncio-compatible aioredis |
+| Embedding | Ollama bge-m3 / OpenAI 兼容 | 支持切换，三层 NaN 容错 |
+| 任务调度 | 自研 30s tick 异步调度 | 7 种类型 + cron 5 字段解析器 |
+| 安全沙箱 | subprocess + resource 限制 | Linux CPU/内存隔离 |
+| 前端 | Vue 3 + TypeScript + Pinia | SSE over fetch（非 WebSocket） |
 
-B. Elasticsearch 索引设计
-*   Index Name: chat_history_{user_id} 或 chat_history_global (通过 user_id 字段过滤)。
-*   Mapping:
-    *   message_content: Text (分词) + Keyword.
-    *   message_vector: Dense Vector (使用 Hermes 配置的 Embedding 模型生成).
-    *   timestamp: Date.
-    *   role: Keyword (user/assistant/system).
-    *   is_summary: Boolean (标记是否为摘要记录).
+### 1.3 设计原则
 
-C. 记忆压缩策略 (要求 4 的实现逻辑)
-在 Memory Manager 模块中实现以下逻辑：
+- **多租户隔离**：所有数据库查询强制注入 `user_id` 过滤器
+- **原地暂停/恢复**：危险操作授权通过 `asyncio.Future` 实现，不重跑 pipeline
+- **三层降级**：关键路径（LLM 加载、记忆检索、授权查询）均有降级策略
+- **彩色结构化日志**：`log_bus.py` 按事件类型着色，便于扫描；可接 ELK/Loki
+- **配置外置**：Prompt 模板全在 `config/templates/`，Agent 行为无需改代码
 
-1.  触发条件：每次写入新消息前，检查该用户的消息总量。
-2.  判断逻辑：
-    *   若 总条数 > 30 且 最早消息时间  阈值 (可配置)。
-3.  执行动作 (Compression Job)：
-    *   Step 1 (检索)：从 ES 中查询出需要被压缩的旧消息（例如最早的 10-20 条）。
-    *   Step 2 (LLM 总结)：调用一个专用的 "Summarizer Agent"。
-        *   Prompt: "请阅读以下对话片段，仅提取'用户核心提问'和'最终解决办法'，忽略寒暄和中间过程。输出格式为 JSON 列表。"
-    *   Step 3 (存储归档)：
-        *   将总结结果写入 MySQL chat_summaries 表。
-        *   将总结结果作为一条特殊的 System Message 写入 ES (标记 is_summary=true)，以便后续检索上下文时能读到。
-    *   Step 4 (清理)：从 ES 中物理删除那些已被总结的原始明细消息，只保留最新的 30 条或 7 天内的数据。
+---
 
-注意：要求中提到“其余消息进行总结后保存...其余信息不要”，这意味着物理删除旧明细是必须的，以节省 ES 空间并提高检索精度。
+## 2. 核心编排引擎 HermesEngine
 
-### 3.2 多智能体编排 (Hermes + LangChain)
+### 2.1 职责
 
-*   Router Agent (大脑)：
-    *   接收用户输入。
-    *   结合 ES 检索结果 (RAG) 和 Redis 中的短期记忆。
-    *   根据配置文档中的“意图 -Agent 映射表”，决定调用哪个子 Agent 或工具。
-*   Worker Agents (手脚)：
-    *   具体执行任务（如查询天气、计算数据、写代码）。
-    *   工具列表动态加载自配置文件。
-*   工具注册机制：
-    *   使用装饰器或配置加载器，读取 YAML 中的工具定义，动态实例化 LangChain Tools。
+`app/core/hermes_engine.py` — 系统唯一入口，接收用户消息后协调所有子系统完成一次对话轮次。
 
-### 3.3 配置化系统设计 (要求 6, 7)
+### 2.2 两条处理路径
 
-创建一个 config/ 目录，所有可变参数均在此定义，代码中通过 Pydantic 模型加载。
+#### 同步路径（`process_user_input`）
 
-config/system_config.yaml 示例:
-system:
-  max_recent_messages: 30
-  retention_days: 7
-  embedding_model: "bge-large-zh-v1.5"
+```
+process_user_input(user_id, user_input, context)
+  → LLMInfo.load()      # 加载用户 LLM 配置
+  → _get_or_build_rag() # RAG 上下文组装
+  → RouterAgent.route() # 意图识别 + 任务分解 + 模式规划
+  → _execute_pipeline() # 执行 Agent 流水线
+  → _generate_llm_response_stream() # 最终 LLM 汇总
+  → _save_turn_async()  # 后台异步保存 ES + MemoryManager
+```
+
+#### 流式路径（`process_user_input_stream`）
+
+流式路径在后台任务 `_run()` 中执行，通过 `asyncio.Queue` 与 SSE 生成器解耦：
+
+```
+process_user_input_stream(user_id, user_input, context)
+  → 创建 asyncio.Queue
+  → asyncio.create_task(_run())   # 后台异步执行
+  → yield SSE events from queue   # 前台消费队列
+```
+
+`_run()` 内部流程：
+
+```
+_start_turn(turn_id)
+→ bus.user_message()              # 日志
+→ RagPipeline.build_context()     # RAG 上下文
+→ RouterAgent                     # 路由，推送 routing/planning 事件
+→ 注入 consent_hook + turn_id    # 危险操作授权 Hook（v2.9）
+→ _execute_pipeline()             # 执行 Agent 流水线
+→ 最终 LLM stream_aiter           # 推送 token 事件
+→ bus.conversation_turn()         # 轮次摘要日志（v2.10）
+→ _save_turn_async()              # 后台保存
+→ q.put_nowait(done/error)
+→ _end_turn(turn_id)
+```
+
+### 2.3 LLM 加载机制
+
+每用户独立 LLM 配置，按 `user_id` 缓存实例：
+
+```python
+# _llm_cache: Dict[str, BaseChatModel]
+
+LLMInfo (dataclass):
+  url        → str
+  api_key    → str
+  model_name → str
+  model_type → str   # "chat" / "embedding"
+  temperature→ float
+
+load(user_id) → 查 MySQL llms 表 → 找不到时 fallback user_id="0"
+```
+
+`/models/change` 成功后调用 `clear_llm_cache(user_id)` 使缓存立即失效。
+
+### 2.4 取消机制
+
+每个用户维护一个 `asyncio.Event`（`_cancel_signals[user_id]`），`POST /chat/cancel` 置位后：
+
+- `_run()` 在 pipeline 执行前后的关键检查点检测到信号
+- 推送 `cancelled` SSE 事件并返回
+- `_save_turn_async()` 检测到 `turn_id in _cancelled_turns` 则跳过保存
+
+---
+
+## 3. 路由与 Pipeline 编排
+
+### 3.1 RouterAgent 三步 LLM 推理
+
+`app/agents/router.py` — 每次请求执行三次 LLM 调用：
+
+| 步骤 | 输出 | 用途 |
+|------|------|------|
+| `identify_intent()` | intent 字符串 | 语义分类，如 "数据分析" / "代码调试" |
+| `decompose_tasks()` | `[{step, agent_name, description}]` | 任务分解，形成 pipeline 步骤列表 |
+| `plan_execution()` | mode + target_agent | 执行模式选择 |
+
+### 3.2 三种执行模式
+
+| 模式 | 触发条件 | 实现 |
+|------|----------|------|
+| `single` | 单 agent，无需流水线 | 直接调用目标 agent |
+| `serial` | 多 agent 顺序依赖 | 前步 `prev_result` 传给后步 context |
+| `parallel` | 多 agent 独立任务 | `asyncio.gather()` 并行执行 |
+
+### 3.3 重规划（Replan）
+
+执行失败或结果不满足质量检查时，`RouterAgent` 可触发 replan：
+
+- 推送 `router_replan` SSE 事件
+- 已完成 agents 状态保留，重新规划剩余步骤
+- `routerIteration` 计数器递增，最多 3 次
+
+### 3.4 SSE Pipeline 事件序列
+
+```
+routing → planning → agent_start → step_start → tool_call →
+tool_result → step_done → agent_done → token(×N) → done
+```
+
+`consent_required` 事件可在 `tool_call` 前插入，暂停整个序列。
+
+---
+
+## 4. RAG 检索增强管道
+
+### 4.1 模块结构（`app/rag/`）
+
+| 文件 | 职责 |
+|------|------|
+| `pipeline.py` | `RagPipeline` 门面类，统一入口 |
+| `retriever.py` | `HybridRetriever`：预取 → 向量 → 全文 三步检索 |
+| `indexer.py` | `TurnIndexer`：ES 向量写入、全量重建 |
+| `chunker.py` | `TurnChunker`：对话切片（question/answer/agent_output 独立块） |
+| `formatter.py` | 记忆内容格式化，构建 `<memory-context>` XML 块 |
+| `types.py` | `RagContext` 数据类，`to_prompt_context()` 转换 |
+
+### 4.2 混合检索策略（`HybridRetriever`）
+
+```
+Step 0: 预取缓存（Redis GETDEL memory:{user_id}:prefetch_result）
+  ↓ Miss
+Step 1: 向量 KNN 检索（ES knn / script_score，余弦相似度 ≥ 0.7）
+  ↓
+Step 2: BM25 全文检索（score ≥ max(relative_min, text_abs_floor)）
+  ↓
+Step 3: 按 turn_id 合并去重，取最高分，截取 top_k
+```
+
+**双阈值策略**：向量结果用绝对阈值（0.7），全文结果用相对+绝对混合阈值，避免语料稀疏导致低质量结果通过。
+
+**同会话评分加权**：同 `session_id` 的历史 turn 分数额外加权，提升上下文连贯性。
+
+### 4.3 预取缓存机制
+
+每轮对话结束后，`store_turn()` 后台调用 `queue_prefetch(user_id, user_input)`:
+
+1. 以当前 `user_input` 为 query 预取下一轮可能用到的记忆
+2. 结果写入 `memory:{user_id}:prefetch_result`（TTL 5min）
+3. 下一轮请求 Step 0 原子 `GETDEL` 命中则跳过完整检索
+
+**ES 未就绪降级**：`retrieve_memory()` 返回空时，fallback 读取 Redis 近期对话写入预取缓存。
+
+### 4.4 切片策略
+
+每轮对话生成三类独立向量块：
+
+| 块类型 | 来源 | 最短长度 |
+|--------|------|---------|
+| `question` | 用户输入 | 10 字符 |
+| `answer` | LLM 最终回复 | 10 字符 |
+| `agent_output` | 各 agent 独立输出 | 10 字符 |
+
+串行 pipeline 的每步 agent 输出均独立向量化（而非只存最终结果）。
+
+### 4.5 ES 版本兼容
+
+- ES 7.x：使用 `script_score` + `cosineSimilarity`
+- ES 8.x/9.x：使用原生 `knn` 查询
+- 版本在启动时通过 `_es_major_version` 检测并缓存
+
+---
+
+## 5. 工具系统
+
+### 5.1 工具来源与可见性
+
+| 来源 (`source`) | 创建方式 | 可见性选项 |
+|----------------|---------|-----------|
+| `code` | 继承 `BaseTool`，代码中定义 | public / private / exclusive |
+| `user` | 用户通过 API 创建 | public / private |
+| `agent` | 运行时由 Agent 动态生成 | exclusive（仅归属 Agent） |
+
+### 5.2 执行位置
+
+| `exec_location` | 说明 |
+|----------------|------|
+| `server` | 在服务端 Python 进程中执行 |
+| `client` | 推送给客户端执行，服务端不运行 |
+
+### 5.3 BaseTool 执行流程
+
+```python
+BaseTool._wrapped_execute(params, context):
+  for op in self.dangerous_ops:
+    ok = await consent_manager.check_consented(tool_name, op, user_id, ...)
+    if not ok:
+      hook = get_consent_hook()
+      if hook:
+        decision = await hook(ConsentRequiredException(...))
+        if decision == "deny":
+          return {result: "用户拒绝", success: False}
+        # allow/conversation → continue
+      else:
+        raise ConsentRequiredException(...)
+  result = await self.execute(params, context)
+  return result
+```
+
+### 5.4 危险操作类型（`DANGEROUS_OPS`）
+
+| 类型 | 说明 |
+|------|------|
+| `modify` | 修改文件/数据 |
+| `delete` | 删除操作 |
+| `execute` | 执行命令 |
+| `network` | 网络请求 |
+| `privilege` | 权限提升 |
+| `sensitive_read` | 读取敏感信息 |
+
+工具在定义时声明，例如：`dangerous_ops = ["modify", "delete"]`
+
+### 5.5 工具注册与加载
+
+- **启动时**：`builtin/__init__.py` 统一导入所有内置工具并注册
+- **运行时**：`ToolLoader` 按 source 动态从 MySQL 加载 user/agent 工具
+- **Agent 绑定**：`_registry_tools_for_agent(agent_name, user_id)` 返回 public + exclusive 工具集，按 `user_id + agent_name` 缓存 LangGraph 实例
+
+---
+
+## 6. 危险操作授权系统
+
+> v2.9 新增，v2.10 优化（全量放行 + 性能缓存）
+
+### 6.1 设计目标
+
+工具执行危险操作时，**原地暂停**工具执行（不重跑 pipeline），向前端推送 SSE 授权事件，等待用户决策后恢复，整个过程对 Agent 调用链透明。
+
+### 6.2 授权级别优先级链
+
+```
+op_disabled（用户已关闭该操作类型授权）
+  ↓ 未关闭
+once（当次调用临时放行）
+  ↓ 无
+conversation-blanket（本轮全量放行，v2.10 新增）
+  ↓ 无
+conversation（本轮特定 tool+op 放行）
+  ↓ 无
+session（本会话内放行，内存缓存）
+  ↓ 无
+project / always（持久化到 MySQL）
+  ↓ 无
+→ 需要弹窗授权
+```
+
+### 6.3 核心数据结构（`app/tools/permission.py`）
+
+```python
+# 模块级内存缓存
+_session_cache:        Dict[(tool, op, session_id), bool]
+_once_granted:         Set[(tool, op, user_id)]
+_conversation_cache:   Dict[(tool, op, turn_id), bool]
+_conversation_blanket: Set[turn_id]        # v2.10：全量放行集合
+_op_enabled_cache:     Dict[(user_id, op), (bool, timestamp)]  # v2.10：60s TTL
+
+# ContextVar（流式场景由 HermesEngine 注入）
+_CONSENT_HOOK:    ContextVar[Optional[Callable]]   # async hook
+_CONSENT_TURN_ID: ContextVar[str]                  # 当前 turn_id
+```
+
+### 6.4 asyncio.Future 暂停机制
+
+```python
+# HermesEngine._run() 中注入的 _consent_hook 闭包
+
+async def _consent_hook(exc: ConsentRequiredException) -> str:
+    async with _consent_lock:                     # 串行化并发请求
+        already = await consent_manager.check_consented(...)
+        if already:
+            return "allow"                        # 并发已授权，跳过
+
+        fut = asyncio.get_event_loop().create_future()
+        self._consent_futures[exc.request_id] = fut
+        q.put_nowait({"event": "consent_required", "data": exc.to_dict()})
+
+        try:
+            decision = await asyncio.wait_for(
+                asyncio.shield(fut), timeout=300  # 5 分钟超时
+            )
+        except asyncio.TimeoutError:
+            decision = "deny"
+        finally:
+            self._consent_futures.pop(exc.request_id, None)
+
+        if decision == "conversation":
+            consent_manager.grant_conversation_all(turn_id)  # v2.10
+
+        bus.consent_decision(user_id, tool, op, decision)   # v2.10
+        return decision
+
+# POST /chat/consent 触发
+def consent_respond(request_id, decision) -> bool:
+    fut = self._consent_futures.get(request_id)
+    if fut and not fut.done():
+        fut.set_result(decision)   # 恢复工具执行
+        return True
+    return False
+```
+
+### 6.5 全量放行（v2.10 `_conversation_blanket`）
+
+用户选择「当前对话允许」时：
+- 调用 `grant_conversation_all(turn_id)` → `_conversation_blanket.add(turn_id)`
+- `check_consented()` 检测 `turn_id in _conversation_blanket` 直接返回 `True`
+- 本轮任意工具的任意危险操作均不弹窗
+- 轮次结束或清除时调用 `revoke_conversation(turn_id)` 同步清理
+
+### 6.6 性能缓存（v2.10 `_op_enabled_cache`）
+
+`_is_op_enabled()` 每次工具调用都查询 MySQL `dangerous_op_configs`，缓存解决频繁查询问题：
+
+```python
+_OP_ENABLED_TTL = 60.0  # 秒
+_op_enabled_cache: Dict[(user_id, op), (bool, timestamp)]
+
+# PATCH /tools/dangerous-ops/{op_type} 成功后：
+_invalidate_op_cache(user_id, op_type)  # 立即失效，无需等 TTL
+```
+
+### 6.7 用户级开关（`dangerous_op_configs` 表）
+
+用户可在设置页关闭某类操作的授权要求。关闭后 `_is_op_enabled()` 返回 `False`，`check_consented()` 优先级链第一步即放行。
+
+---
+
+## 7. 记忆管理系统
+
+### 7.1 三层架构
+
+| 层 | 存储 | 容量/TTL | 作用 |
+|----|------|---------|------|
+| L1 | Redis List | 最近 10 轮，无 TTL | 快速加载近期对话 |
+| L2 | MySQL `memory_facts` | 持久化 | 结构化事实，引用计数 |
+| L3 | Elasticsearch | 永久 | 全文 + 向量语义检索 |
+
+### 7.2 L1→L3 同步机制
+
+- 触发条件：Redis List 长度 ≥ `recent_turns × es_sync_threshold_pct`（默认 10 × 0.6 = 6）
+- 同步以 `turn_id` 为幂等键，防重复写入
+- `refresh=False`（ES 默认 1s 刷新周期），与预取并发时有窗口，预取降级到 Redis 近期对话兜底
+
+### 7.3 记忆压缩（`MemoryArchiverAgent`）
+
+**触发条件**：累计轮次计数器 ≥ `max_total_turns`（默认 30）
+
+**Saga 三步**：
+1. `LLM 生成摘要`（Summarizer Agent，8 节结构）
+2. `ES checkpoint`（写入摘要记录，`is_summary=true`）
+3. `删除原始 turn`（Redis + ES 清除压缩区间的对话）
+
+**8 节摘要结构**：事件概要 / 用户意图 / 决策与结论 / Agent 调用记录 / 待办与跟进 / 用户偏好与习惯 / 知识积累 / 情感与背景
+
+**月度/年度归档**（独立 4 节提示词）：
+- 月度：每月月底，归档 > 365 天的 turn，`memory_monthly_jobs` 作业表（`UNIQUE KEY uq_user_ym`，防重复）
+- 年度：每年 12 月 31 日，归档 > 3 年的月度摘要，`memory_yearly_jobs` 作业表
+
+### 7.4 用户画像
+
+`MemoryManager` 在每轮对话前加载用户画像（`_user_profile`），注入系统提示 `<user-profile>` XML 块，使模型感知用户偏好、专业背景等。
+
+程序关闭时 `_flush_all_profiles_on_shutdown()` 批量固化到 MySQL。
+
+---
+
+## 8. 定时任务调度系统
+
+### 8.1 架构（`app/scheduler/`）
+
+| 文件 | 职责 |
+|------|------|
+| `runner.py` | 异步调度主循环（30s tick），handler 注册表 |
+| `store.py` | MySQL 持久化，upsert/查询/更新 |
+| `notifier.py` | Redis 通知队列 + SSE 推送（3s 轮询） |
+| `models.py` | TaskType / ActionType / TaskStatus 枚举 |
+| `holiday.py` | 中国法定节假日（含调休补班） |
+| `system_tasks.py` | 月度/年度归档的幂等 cron 注册 |
+
+### 8.2 任务类型
+
+`once` / `daily` / `weekly` / `monthly` / `workday` / `weekend` / `cron`
+
+时间存储 UTC，API 层接收 CST（UTC+8）自动转换 `_cst_hour_to_utc()`。
+
+### 8.3 Cron 解析器
+
+自实现 5 字段解析器（`分 时 日 月 周`），支持 `*` / 数值 / 逗号列表，不依赖第三方库。
+
+### 8.4 系统级 Cron
+
+| 任务 | Cron 表达式 | 说明 |
+|------|------------|------|
+| 月度归档 | `0 23 28,29,30,31 * *` | 月底 UTC 23:00，幂等（作业表防重） |
+| 年度归档 | `0 1 31 12 *` | 12 月 31 日 UTC 01:00 |
+| 文件清理 | `0 2 * * *` | 每日 UTC 02:00，清理 `cleanup_days` 前的生成文件 |
+
+---
+
+## 9. 安全沙箱
+
+### 9.1 架构（`app/sandbox/`）
+
+| 文件 | 职责 |
+|------|------|
+| `executor.py` | subprocess 隔离执行，强制超时，Linux resource 限制 |
+| `scanner.py` | 静态扫描高危调用模式 |
+| `file_handler.py` | 沙箱文件管理，隔离临时目录 |
+
+### 9.2 执行约束
+
+- **CPU**：通过 `resource.RLIMIT_CPU` 限制 CPU 时间
+- **内存**：`resource.RLIMIT_AS` 限制进程地址空间
+- **超时**：subprocess 强制 `timeout` 参数
+- **隔离目录**：每次执行创建独立临时目录，执行后清理
+
+### 9.3 静态扫描规则
+
+`scanner.py` 拦截以下高危模式：`os.system` / `subprocess` / `eval` / `exec` / `__import__` / 网络 socket 创建等。
+
+---
+
+## 10. 日志系统
+
+### 10.1 架构（`app/utils/log_bus.py`）
+
+`HermesLogger` 单例，所有事件在 `hermes.bus` logger 命名空间下发射，不影响其他模块的 logging 配置。
+
+### 10.2 事件颜色映射（终端 ANSI）
+
+| 事件类型 | 颜色 | 触发时机 |
+|----------|------|---------|
+| `user` | 亮青 | 用户消息进入系统 |
+| `context` | 蓝 | RAG 上下文组装完成 |
+| `routing` | 洋红 | 路由决策结果 |
+| `llm_in` | 黄 | 发送给 LLM 的输入 |
+| `llm_out` | 亮绿 | LLM 返回内容 |
+| `tool` | 白 | 工具调用开始 |
+| `tool_ok` | 绿 | 工具调用成功 |
+| `tool_err` | 亮红 | 工具调用失败 |
+| `turn` | 亮紫 | 完整轮次摘要（v2.10 新增） |
+| `consent` | 亮黄 | 危险操作授权决策（v2.10 新增） |
+| `system` | 深灰 | 系统/其他 |
+
+### 10.3 关键方法
+
+```python
+bus.user_message(user_id, message, client_type)
+bus.context_built(user_id, history_count, memory_count, client_type)
+bus.routing(user_id, intent, mode, target_agent, pipeline_steps)
+bus.llm_input(user_id, agent_name, human_content, system_prompt, tools)
+bus.llm_output(user_id, agent_name, response, elapsed_ms)
+bus.tool_call(user_id, agent_name, tool_name, args)
+bus.tool_result(user_id, agent_name, tool_name, result, elapsed_ms)
+bus.tool_error(user_id, agent_name, tool_name, error)
+
+# v2.10 新增
+bus.conversation_turn(user_id, turn_id, user_message, intent, mode,
+                      agents_used, tools_called, response_len, elapsed_ms, client_type)
+bus.consent_decision(user_id, tool_name, operation, decision)
+```
+
+`tool_call` / `tool_result` / `tool_error` 同时调用 `progress_bus.push()` 推送 SSE 进度事件。
+
+### 10.4 JSON 文件输出（可选）
+
+`init_log_bus({"json_file": "logs/hermes.json"})` 启用 JSON handler，写入 NDJSON 格式，供 ELK/Loki 采集。
+
+---
+
+## 11. 数据库设计
+
+### 11.1 MySQL 核心表
+
+#### `users` — 用户账户
+
+```sql
+CREATE TABLE users (
+  id          VARCHAR(36) PRIMARY KEY,
+  username    VARCHAR(64) UNIQUE NOT NULL,
+  password    VARCHAR(255) NOT NULL,  -- bcrypt hash
+  created_at  DATETIME DEFAULT NOW()
+);
+```
+
+#### `llms` — 用户 LLM 配置
+
+```sql
+CREATE TABLE llms (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  user_id     VARCHAR(36) NOT NULL,
+  url         VARCHAR(255),
+  api_key     VARCHAR(512),
+  model_name  VARCHAR(128),
+  model_type  VARCHAR(32) DEFAULT 'chat',
+  temperature FLOAT DEFAULT 0.7,
+  state       TINYINT DEFAULT 1,  -- 1=激活
+  created_at  DATETIME DEFAULT NOW()
+);
+```
+
+#### `agents` — 用户自定义 Agent
+
+```sql
+CREATE TABLE agents (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  user_id     VARCHAR(36) NOT NULL,
+  name        VARCHAR(64) NOT NULL,
+  role        VARCHAR(255),
+  background  TEXT,
+  is_public   TINYINT DEFAULT 0,
+  source      VARCHAR(16) DEFAULT 'db',  -- 'code' | 'db'
+  created_at  DATETIME DEFAULT NOW()
+);
+```
+
+#### `tools` — 工具定义
+
+```sql
+CREATE TABLE tools (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  name            VARCHAR(64) NOT NULL,
+  description     TEXT,
+  code            LONGTEXT,
+  exec_location   VARCHAR(16) DEFAULT 'server',  -- 'server' | 'client'
+  visibility      VARCHAR(16) DEFAULT 'private',  -- 'public' | 'private' | 'exclusive'
+  source          VARCHAR(16) DEFAULT 'user',     -- 'code' | 'user' | 'agent'
+  dangerous_ops   JSON,                           -- ["modify", "delete"]
+  owner_user_id   VARCHAR(36),
+  owner_agent_name VARCHAR(64),
+  created_at      DATETIME DEFAULT NOW()
+);
+```
+
+#### `tool_consent_records` — 工具授权持久化
+
+```sql
+CREATE TABLE tool_consent_records (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  tool_name     VARCHAR(64),
+  operation     VARCHAR(50),
+  user_id       VARCHAR(36),
+  consent_level VARCHAR(20),  -- 'project' | 'always'
+  session_id    VARCHAR(64),
+  project_id    VARCHAR(64),
+  granted_at    DATETIME,
+  expires_at    DATETIME,
+  UNIQUE KEY uq_tool_op_user (tool_name, operation, user_id, consent_level)
+);
+```
+
+#### `dangerous_op_configs` — 用户级危险操作开关（v2.9）
+
+```sql
+CREATE TABLE dangerous_op_configs (
+  id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  user_id     VARCHAR(36) NOT NULL,
+  op_type     VARCHAR(50) NOT NULL,
+  is_enabled  TINYINT(1) NOT NULL DEFAULT 1,  -- 1=需授权，0=自动放行
+  created_at  DATETIME DEFAULT NOW(),
+  UNIQUE KEY uq_user_op (user_id, op_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+#### `scheduler_tasks` — 定时任务
+
+```sql
+CREATE TABLE scheduler_tasks (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  user_id       VARCHAR(36),
+  name          VARCHAR(128),
+  task_type     VARCHAR(16),  -- once/daily/weekly/monthly/workday/weekend/cron
+  action_type   VARCHAR(16),  -- reminder/agent/system
+  cron_expr     VARCHAR(64),
+  hour          INT,
+  minute        INT,
+  weekday       INT,
+  day_of_month  INT,
+  run_at        DATETIME,
+  status        VARCHAR(16) DEFAULT 'active',
+  last_run_at   DATETIME,
+  next_run_at   DATETIME,
+  action_data   JSON,
+  notify_on_done TINYINT DEFAULT 0,
+  created_at    DATETIME DEFAULT NOW()
+);
+```
+
+#### `memory_monthly_jobs` / `memory_yearly_jobs` — 归档作业
+
+```sql
+CREATE TABLE memory_monthly_jobs (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  user_id     VARCHAR(36),
+  year_month  VARCHAR(7),   -- "2025-12"
+  status      VARCHAR(16),
+  created_at  DATETIME DEFAULT NOW(),
+  UNIQUE KEY uq_user_ym (user_id, year_month)
+);
+```
+
+### 11.2 Redis Key 设计
+
+| Key 模式 | 类型 | TTL | 说明 |
+|---------|------|-----|------|
+| `session:{token}` | Hash | 24h | Token → user_id 映射 |
+| `user:{user_id}:llm` | Hash | 1h | LLM 配置缓存 |
+| `user:{user_id}:recent_turns` | List | 无 | 近期 10 轮对话 |
+| `user:{user_id}:turn_count` | String | 无 | 累计轮次计数 |
+| `user:{user_id}:prefetch_result` | String | 5min | 预取记忆缓存 |
+| `user:{user_id}:delegation_chain` | List (定长 20) | 无 | on_delegation 委托链 |
+| `user:{user_id}:profile` | Hash | 无 | 用户画像 |
+| `scheduler:notify:{user_id}` | List | 无 | 通知队列 |
+| `es_sync_lock:{user_id}` | String | 30s | ES 同步分布式锁 |
+
+### 11.3 Elasticsearch 索引设计
+
+**Index**：`chat_history_global`（按 `user_id` 字段过滤）
+
+**Mapping**（关键字段）：
+
+```json
+{
+  "turn_id":        "keyword",
+  "user_id":        "keyword",
+  "session_id":     "keyword",
+  "user_input":     "text + keyword",
+  "assistant_response": "text",
+  "agent_outputs":  "object",
+  "timestamp":      "date",
+  "is_summary":     "boolean",
+  "message_vector": "dense_vector (dim=1024, similarity=cosine)"
+}
+```
+
+向量字段支持三种块类型独立存储：`question_vector` / `answer_vector` / `agent_output_vector`（由 `TurnChunker` 生成，各自建立向量索引）。
+
+---
+
+## 12. API 接口设计
+
+### 12.1 接口汇总
+
+#### 认证（`/auth`）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/auth/register` | 用户注册（bcrypt） |
+| POST | `/auth/login` | 登录（RSA-OAEP 加密密码），复用有效 session |
+| POST | `/auth/logout` | 登出，清除 Redis Token |
+| GET  | `/auth/public-key` | 获取 RSA 公钥 + nonce |
+| POST | `/auth/change-password` | 修改密码 |
+
+#### 对话（`/chat`）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/chat/send` | 同步发送，返回完整响应 |
+| POST | `/chat/stream` | SSE 流式输出 |
+| POST | `/chat/cancel` | 取消当前流式对话 |
+| GET  | `/chat/history` | 分页查询 ES 历史（turn 粒度） |
+| POST | `/chat/upload` | 上传文件后发起对话 |
+| POST | `/chat/revectorize` | 全量重建向量索引 |
+| POST | `/chat/consent` | **危险操作授权决策响应**（v2.9） |
+
+#### 工具（`/tools`）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET  | `/tools` | 查询可用工具列表 |
+| POST | `/tools` | 创建工具（自然语言或代码） |
+| PUT  | `/tools/{tool_id}` | 修改工具属性 |
+| DELETE | `/tools/{tool_id}` | 删除工具 |
+| GET  | `/tools/dangerous-ops` | **查询危险操作类型开关状态**（v2.9） |
+| PATCH | `/tools/dangerous-ops/{op_type}` | **切换危险操作类型开关**（v2.9） |
+
+> **路由顺序**：`/dangerous-ops` 和 `/dangerous-ops/{op_type}` 必须在 `/{tool_id}` 之前注册，防止 FastAPI 将 `dangerous-ops` 误解析为 tool_id。
+
+#### 其他
+
+| 前缀 | 说明 |
+|------|------|
+| `/models` | LLM 配置 CRUD + 切换 |
+| `/agents` | Agent CRUD + 评分 + 热重载 |
+| `/scheduler` | 定时任务 CRUD + 通知 SSE |
+| `/decisions` | 工具构建决策门控（ask/allow/deny） |
+| `/files` | 文件列表 / 下载 / 删除 |
+
+### 12.2 SSE 事件类型
+
+| 事件 | 数据字段 | 说明 |
+|------|---------|------|
+| `routing` | `intent, mode, target_agent` | 路由完成 |
+| `planning` | `pipeline: [{step, agent_name, description}]` | Pipeline 规划 |
+| `agent_start` | `agent_name` | Agent 开始执行 |
+| `step_start` | `agent_name, step_id, description` | 子步骤开始 |
+| `step_done` | `agent_name, step_id, success, result` | 子步骤完成 |
+| `tool_call` | `agent_name, tool_name, args` | 工具调用 |
+| `tool_result` | `agent_name, tool_name, result, elapsed_ms` | 工具成功 |
+| `tool_error` | `agent_name, tool_name, error` | 工具失败 |
+| `agent_done` | `agent_name` | Agent 完成 |
+| `consent_required` | `request_id, tool_name, operation, description` | **危险操作授权请求**（v2.9） |
+| `token` | `text` | 最终输出 token |
+| `done` | `turn_id` | 对话完成 |
+| `cancelled` | `turn_id` | 已取消 |
+| `error` | `message` | 错误 |
+
+### 12.3 鉴权机制
+
+- Header：`Authorization: Bearer <token>`
+- Query：`?token=<token>`（兼容 SSE 场景）
+- Redis session 查找：`GET session:{token}` → `user_id`
+- 降级：Redis 不可用时降级为测试用户（仅开发/测试）
+
+---
+
+## 13. 配置管理
+
+### 13.1 system_config.yaml 结构
+
+```yaml
+logging:
+  level: "INFO"            # DEBUG / INFO / WARNING / ERROR
+  json_file: ""            # 留空则不启用 JSON 文件 handler
 
 database:
   mysql:
-    url: "mysql+pymysql://user:pass@localhost/db"
+    url: "mysql+pymysql://root:pass@localhost/agent_db"
   redis:
     url: "redis://localhost:6379/0"
   elasticsearch:
     url: "http://localhost:9200"
-    index_prefix: "hermes_chat"
-    vector_field: "message_vector"
 
-agents:
-
-动态配置 Agent 类型及其可用工具
-
-  - name: "data_analyst"
-    role: "数据分析师"
-    prompt_template: "templates/analyst.txt"
-    tools: ["sql_query", "chart_gen"] # 对应 tools_config 中的 ID
-  - name: "customer_support"
-    role: "客服专员"
-    prompt_template: "templates/support.txt"
-    tools: ["order_lookup", "refund_policy"]
-
-tools:
-  - id: "sql_query"
-    type: "python_function"
-    path: "tools.database.query"
-    description: "用于查询业务数据库"
-
-## 关键流程时序图
-
-用户对话处理流程
-
-sequenceDiagram
-    participant U as 用户
-    participant API as FastAPI
-    participant RM as 记忆管理器
-    participant ES as Elasticsearch
-    participant LLM as LLM (Hermes)
-    participant DB as MySQL
-
-    U->>API: 发送消息 (User ID, Content)
-    API->>RM: 获取上下文 (User ID)
-    
-    rect rgb(240, 248, 255)
-        note right of RM: 1. 检查是否需要压缩 (要求 4)
-        RM->>ES: 统计消息数 & 时间范围
-        alt 需要压缩
-            RM->>ES: 检索旧消息
-            RM->>LLM: 调用 Summarizer Agent 生成摘要
-            LLM-->>RM: 返回 "提问->解决" 摘要
-            RM->>DB: 存入 chat_summaries 表
-            RM->>ES: 存入摘要记录 (System Msg)
-            RM->>ES: 删除旧明细消息
-        end
-    end
-    
-    rect rgb(255, 250, 240)
-        note right of RM: 2. 检索增强 (要求 5)
-        RM->>ES: 向量相似度搜索 (Top K)
-        ES-->>RM: 返回相关历史片段
-    end
-    
-    RM->>API: 返回完整上下文 (近期消息 + 摘要 + 检索片段)
-    
-    API->>LLM: 构建 Prompt (含配置化的 Agent 路由)
-    LLM->>LLM: 推理 & 工具调用 (Hermes 编排)
-    LLM-->>API: 生成回复
-    
-    API->>ES: 异步写入新消息 (含 Vector Embedding)
-    API->>U: 返回回复
-
-## 目录结构建议
-
-project_root/
-├── app/
-│   ├── api/                # FastAPI 路由
-│   │   ├── routes/
-│   │   └── dependencies.py # 鉴权等依赖
-│   ├── core/               # 核心逻辑
-│   │   ├── hermes_engine.py # Hermes 框架初始化与运行
-│   │   ├── memory_manager.py # 记忆压缩与检索逻辑 (核心)
-│   │   └── config_loader.py  # 配置加载
-│   ├── agents/             # 智能体定义
-│   │   ├── router.py
-│   │   └── workers/
-│   ├── tools/              # 工具函数
-│   ├── models/             # Pydantic 模型 & SQLModel
-│   └── utils/              # ES 客户端，Redis 客户端等
-├── config/                 # 配置文件 (YAML)
-│   ├── system_config.yaml
-│   └── agents_config.yaml
-├── templates/              # Prompt 模板
-├── tests/
-├── main.py                 # 入口
-└── requirements.txt
-
-## 开发实施关键点与建议
-
-### 6.1 关于 Hermes 框架
-
-目前开源社区中名为 "Hermes" 的框架可能有多个（如 NousResearch 的 Hermes 模型，或某些特定的 Agent 框架）。
-
-*   如果指的是特定的 Python 库：请直接使用该库的 AgentOrchestrator 类。
-*   如果是指自定义架构：建议使用 LangGraph (LangChain 官方编排库) 来实现 "Hermes" 的核心逻辑，因为它完美支持状态机、多智能体循环和断点续传，非常符合你的需求。
-
-### 6.2 向量检索优化 (要求 5)
-
-*   混合搜索 (Hybrid Search)：在 ES 中同时使用 BM25 (关键词) 和 KNN (向量)。对于“解决办法”这类精确匹配，关键词搜索往往比纯向量更准。
-*   元数据过滤：在进行向量搜索时，务必带上 user_id 过滤器，确保数据隔离。
-
-### 6.3 压缩算法的鲁棒性
-
-*   异常处理：如果 LLM 总结失败（超时或格式错误），必须有降级策略（例如：暂时不删除旧消息，仅记录日志，等待下次重试），防止数据丢失。
-*   原子性：总结、存档、删除这三步操作最好在一个事务或逻辑单元中完成，避免中间状态导致数据不一致。
-
-### 6.4 性能优化
-
-*   异步写入：用户发消息后，立即返回响应。将“写入 ES"、“向量化”、“检查压缩逻辑”放入 Celery 或 FastAPI 的 BackgroundTasks 中异步执行，避免阻塞主线程。
-*   Redis 缓存配置：将 system_config.yaml 解析后的对象缓存在 Redis 中，设置版本号，配置变更时失效缓存，减少文件 IO。
-
-### 6.5 安全性
-
-*   多租户隔离：所有数据库查询和 ES 查询必须强制注入 user_id 条件，防止越权访问。
-*   敏感信息脱敏：在存入 ES 进行总结前，可增加一步 PII (个人敏感信息) 识别与脱敏处理。
-
-## 下一步行动清单
-
-1.  环境搭建：部署 Docker 容器 (MySQL, Redis, Elasticsearch with vector plugin)。
-2.  配置先行：编写 system_config.yaml，定义好字段结构。
-3.  原型开发：
-    *   实现 MemoryManager 的压缩逻辑（这是最复杂的业务逻辑）。
-    *   实现 ES 的 Vector 写入与检索 Demo。
-4.  框架集成：将 LangChain/Hermes 接入，打通 "输入 -> 检索 -> 代理 -> 输出" 链路。
-5.  API 封装：用 FastAPI 暴露接口，并进行多用户并发测试。
-
-这个架构既满足了你对于数据生命周期管理（压缩与归档）的严格要求，又利用了 ES 的强大检索能力和 LangChain 的生态灵活性，是一个可扩展的企业级方案。
-
-
-
-# 🚀 智能体操作系统 (Agent OS) 开发框架与详细设计文档 
-
-版本说明：本版本已整合安全沙箱升级、动态记忆压缩、防作弊评分体系、分层检索策略及全链路可观测性等核心优化建议。
-适用场景：企业级多租户 AI Agent 平台，支持用户自定义技能、长期记忆管理及公有技能市场。
-
-# 系统架构概览
-
-## 1.1 核心设计理念
-
-*   零信任安全 (Zero-Trust Security)：所有用户代码必须在微虚拟机 (MicroVM) 中运行，默认无网络、只读文件系统。
-*   语义化记忆 (Semantic Memory)：从“文本摘要”升级为“结构化事实 + 滚动摘要”的双层记忆模型。
-*   生态公平性 (Fair Ecosystem)：基于贝叶斯平均的评分算法，兼顾冷启动扶持与反作弊。
-*   成本感知 (Cost-Aware)：分层检索策略，平衡向量检索精度与响应延迟/成本。
-
-## 1.2 逻辑架构图
-
-graph TD
-    User[用户终端] --> Gateway[API 网关 (Auth/RateLimit)]
-    Gateway --> AgentCore[Agent 编排引擎]
-    
-
-    subgraph "安全执行层 (Secure Execution)"
-        AgentCore --> Scheduler[任务调度器]
-        Scheduler --> Firecracker[Firecracker MicroVM / E2B]
-        Firecracker -->UserCode[用户 Python 代码沙箱]
-        Firecracker --> NetPolicy[网络白名单策略]
-    end
-    
-    subgraph "记忆与知识层 (Memory & Knowledge)"
-        AgentCore --> MemMgr[记忆管理器]
-        MemMgr --> ShortTerm[Redis: 近期对话缓存]
-        MemMgr --> LongTerm[(MySQL: 结构化事实库)]
-        MemMgr --> VectorDB[(ES/Milvus: 向量索引)]
-        MemMgr --> Compressor[LLM 压缩服务 (双层摘要)]
-    end
-    
-    subgraph "生态与市场层 (Ecosystem)"
-        AgentCore --> ToolRegistry[工具注册中心]
-        ToolRegistry --> ScoreEngine[评分引擎 (贝叶斯/反作弊)]
-        ToolRegistry --> VersionCtrl[版本控制 (Git-like)]
-    end
-    
-    subgraph "可观测性 (Observability)"
-        AgentCore --> Trace[LangSmith/Phoenix Tracker]
-        Firecracker --> Trace
-        ScoreEngine --> Trace
-    end
-
-# 核心模块详细设计
-
-## 2.1 安全沙箱执行引擎 (Secure Sandbox Engine)
-
-目标：毫秒级启动、绝对隔离、资源可控。
-
-*   技术选型：
-    *   运行时：采用 Firecracker MicroVM (轻量级 KVM) 或集成 E2B SDK。摒弃传统 Docker (启动慢、隔离弱)。
-    *   网络策略：默认 DENY ALL。仅允许访问预定义的域名白名单 (如 api.openai.com, weather.com)，通过 eBPF 或 iptables 在微网卡层拦截。
-    *   文件系统：根文件系统 (rootfs) 挂载为 Read-Only。仅挂载临时的 tmpfs (内存盘) 供代码写入临时文件，进程结束自动销毁。
-    *   资源限制：每个 MicroVM 限制 CPU (0.5 vCPU), 内存 (128MB), 执行超时 (30s)。
-
-*   执行流程：
-    1.  用户提交代码 -> 网关验证签名。
-    2.  调度器请求空闲 MicroVM 池 (预热池保持 10 个实例)。
-    3.  注入代码与环境变量 (含临时 Token)。
-    4.  执行并捕获 stdout/stderr 及返回值。
-    5.  强制销毁：无论成功失败，执行后立即销毁该微虚拟机实例，防止状态残留。
-
-## 2.2 动态记忆管理系统 (Dynamic Memory System)
-
-目标：解决上下文断裂问题，提取高价值信息，降低 Token 消耗。
-
-*   数据结构设计：
-    *   L1 滚动窗口 (Short-Term)：Redis List，存储最近 N 轮完整对话 (默认 10 轮)。
-    *   L2 结构化事实 (Long-Term Facts)：MySQL 表 user_facts。
-        *   字段：fact_id, user_id, content (文本), category (偏好/项目/身份), confidence (置信度), updated_at。
-    *   L3 语义摘要 (Semantic Summary)：向量数据库，存储历史对话的压缩摘要。
-*   压缩触发策略 (动态)：
-    *   条件 A (Token 阈值)：当前 Context Window 使用率 > 80%。
-    *   条件 B (语义密度)：检测到连续 3 轮对话无新实体产生，且主要为闲聊。
-    *   条件 C (时间跨度)：会话中断超过 24 小时。
-*   压缩算法流程：
-    1.  提取 L1 窗口内容。
-    2.  调用 LLM 进行 双重处理：
-        *   任务 1 (提取)：识别并更新 user_facts (如：发现用户喜欢用 Pandas)。
-        *   任务 2 (摘要)：生成一段简洁的叙事性摘要，丢弃冗余调试过程，保留关键决策点。
-    3.  将摘要存入 L3，旧对话归档。
-
-注：总结放在服务器资源不紧张时进行
-
-## 2.3 工具生态与评分引擎 (Tool Ecosystem & Scoring)
-
-目标：防止刷分，扶持优质新工具，实现版本回溯。
-
-*   数据库模型优化：
-        CREATE TABLE public_tools (
-        tool_id VARCHAR(64) PRIMARY KEY,
-        owner_id VARCHAR(64),
-        version INT DEFAULT 1,          -- 版本号
-        code_hash VARCHAR(64),          -- 代码指纹
-        status ENUM('pending', 'active', 'banned'),
-        created_at TIMESTAMP,
-        -- 评分字段
-        raw_score FLOAT DEFAULT 0,      -- 原始加权分
-        bayesian_score FLOAT DEFAULT 0, -- 贝叶斯修正分
-        total_calls BIGINT DEFAULT 0,
-        unique_users BIGINT DEFAULT 0   -- 去重用户数
-    );
-    
-    CREATE TABLE tool_usage_logs (
-        log_id BIGINT PRIMARY KEY,
-        tool_id VARCHAR(64),
-        user_id VARCHAR(64),
-        ip_hash VARCHAR(64),            -- 用于反作弊
-        success BOOLEAN,
-        feedback_score INT,             -- 1-5
-        created_at TIMESTAMP
-    );
-    
-*   评分算法 (贝叶斯平均 + 反作弊)：
-    
-    算法执行也放在服务器资源不紧张时进行
-    
-    *   基础公式：
-         S = frac{C times m + sum_{i=1}^{n} w_i cdot r_i}{C + n} 
-        *   S: 最终得分
-        *   m: 全局工具平均分 (先验值，例如 3.5)
-        *   C: 置信度常数 (例如 20，表示需要 20 次有效评价才能脱离先验值)
-        *   r_i: 第 i 次评分
-        *   w_i: 权重系数
-    *   权重系数 w_i 规则：
-        *   同一用户 24 小时内多次调用：权重递减 (1.0, 0.5, 0.2, 0.0)。
-        *   自产自销检测 (Owner == User)：权重 0.1 或直接忽略。
-        *   异常高频 IP：权重 0。
-    
-*   冷启动扶持机制：
-    *   新建 new_arrivals 队列，存放上线  0.8，直接返回。
-    3.  第三层 (冷数据)：仅当上述两层未找到高相关结果，或用户显式询问“很久以前的事情”时，才调用 Embedding 模型并查询向量索引 (Milvus/ES Vector)。
-
-*   Embedding 优化：
-    *   部署本地量化模型 (如 bge-m3-int8) 替代云端 API，降低长期边际成本。
-    *   对 user_facts (结构化事实) 建立独立的高优先级索引，检索时加权提升。
-
-## 2.5 可观测性与调试 (Observability)
-
-目标：全链路追踪，支持人工介入。
-
-*   集成方案：部署 LangSmith 或 Arize Phoenix。
-*   埋点规范：
-    *   Trace ID：贯穿用户请求 -> Agent 思考 -> 工具调用 -> 沙箱执行 -> 返回结果。
-    *   快照记录：
-        *   记录沙箱执行前的输入参数和执行后的原始输出。
-        *   记录记忆压缩前后的文本对比 (Diff)。
-        *   记录评分计算的中间变量 (用于审计作弊)。
-*   人工控制台：
-    *   提供“回放”功能：重现特定 Trace ID 的完整执行环境。
-    *   提供“干预”接口：管理员可手动修正错误的 user_facts 或下架异常工具。
-
-# 关键技术实现细节
-
-## 3.1 沙箱启动伪代码 (Python + E2B/Firecracker)
-
-import os
-from e2b import Sandbox, ProcessMessage # 示例使用 E2B SDK
-
-async def execute_user_code(code: str, context: dict, network_whitelist: list):
-    # 1. 创建隔离沙箱 (自动从预热池获取，毫秒级)
-    sandbox = await Sandbox.create(
-        template="python-base", 
-        timeout=30, # 30 秒强制杀死
-        env_vars=context # 注入只读环境变量
-    )
-    
-    try:
-        # 2. 配置网络白名单 (通过 SDK 或底层配置)
-        await sandbox.network.set_allowlist(network_whitelist)
-        
-        # 3. 写入代码到临时内存盘 (根目录只读)
-        file_path = "/tmp/main.py"
-        await sandbox.files.write(file_path, code)
-        
-        # 4. 执行并流式获取日志
-        execution = await sandbox.process.start(
-            command=f"python {file_path}",
-            on_message=lambda msg: print(msg.line) # 实时日志
-        )
-        
-        result = await execution.wait()
-        
-        if result.error:
-            raise Exception(f"Sandbox Error: {result.error}")
-            
-        return result.output
-        
-    finally:
-        # 5. 强制销毁，确保无状态残留
-        await sandbox.kill()
-
-## 3.2 记忆压缩 Prompt 模板 (双层结构)
-
-Role: Memory Architect
-Task: Analyze the recent conversation window and update long-term memory.
-
-Input:
-
-{last_10_turns}
-
-{current_structured_facts}
-
-Instructions:
-1. Extract Facts: Identify new user preferences, project details, or constraints. 
-   - Output format: JSON list of {"action": "add/update/delete", "category": "...", "content": "..."}
-   - Rule: Discard transient info (e.g., "let me check this code"), keep persistent info (e.g., "user prefers async python").
-
-2. Generate Summary: Create a concise narrative summary of the last 10 turns for context continuity.
-   - Focus on: Problem solved, final decision, key errors avoided.
-   - Ignore: Repetitive debugging steps, failed attempts unless they reveal a constraint.
-   - Max length: 150 words.
-
-Output Format (JSON):
-{
-  "facts_delta": [...],
-  "summary_text": "..."
-}
-
-3.3 评分计算 SQL 逻辑 (简化版)
-
--- 计算贝叶斯评分 (每小时运行一次或实时更新)
-UPDATE public_tools pt
-SET bayesian_score = (
-    (SELECT AVG(feedback_score) FROM public_tools WHERE status='active') * 20 + 
-    COALESCE((
-        SELECT SUM(
-            CASE 
-                WHEN ul.created_at > NOW() - INTERVAL '24 hours' THEN feedback_score * (1.0 / ROW_NUMBER() OVER (PARTITION BY ul.user_id ORDER BY ul.created_at))
-                ELSE feedback_score 
-            END
-        )
-        FROM tool_usage_logs ul
-        WHERE ul.tool_id = pt.tool_id AND ul.success = true
-    ), 0)
-) / (20 + pt.total_calls);
-
-# 部署与运维规划
-
-## 4.1 基础设施要求
-
-*   计算节点：需支持 KVM 虚拟化 (用于 Firecracker)。推荐 AWS EC2 (m5/m6i 系列) 或自建 Kubernetes 集群 (带 Kata Containers 支持)。
-*   存储：
-    *   MySQL (主从复制)：存储元数据、事实库。
-    *   Redis Cluster：热数据缓存、会话锁。
-    *   Elasticsearch/Milvus：混合检索引擎。
-*   网络：独立的 VPC，沙箱子网完全隔离，仅通过 NAT 网关访问白名单域名。
-
-## 4.2 灰度发布策略
-
-1.  工具版本锁定：用户会话开始时，记录 tool_id@version。即使用户更新了工具，当前会话不受影响。
-2.  金丝雀发布：新版本的 Agent 核心逻辑先对 5% 的内部测试账号开放，监控错误率和延迟指标 (P99)。
-3.  回滚机制：一旦监测到沙箱逃逸尝试或评分系统异常波动，自动切换至上一稳定版本配置。
-
-## 4.3 监控告警指标
-
-*   安全：沙箱启动失败率、网络拦截次数、异常进程行为。
-*   性能：平均响应时间 (ART)、向量检索耗时、记忆压缩延迟。
-*   业务：工具调用成功率、新用户留存率、公有工具市场活跃度。
-
-# 总结与下一步行动
-
-本 v2.0 文档通过引入微虚拟机隔离、结构化记忆、贝叶斯评分及分层检索，解决了 v1.0 在安全性、智能持续性、生态公平性和成本效率上的潜在瓶颈。
-
-建议立即执行的 P0 任务：
-1.  搭建 Firecracker/E2B 原型：验证代码沙箱的启动速度 (<500ms) 和隔离性。
-2.  设计事实提取 Prompt：小规模测试从对话中提取结构化信息的准确率。
-3.  构建评分防作弊模拟器：编写脚本模拟刷分攻击，验证贝叶斯算法的鲁棒性。
-
-此框架已具备支撑万级日活用户的能力，可作为正式开发的基准蓝图。
+embedding:
+  provider: "ollama"       # ollama / openai
+  api_url:  "http://localhost:11434"
+  model_name: "bge-m3:latest"
+  model_dim: 1024
+
+memory:
+  recent_turns: 10         # L1 Redis 滚动窗口大小
+  max_total_turns: 30      # 触发压缩的累计轮次阈值
+  es_sync_threshold_pct: 0.6
+  retrieval_top_k: 5
+  confidence_threshold: 0.7
+
+sandbox:
+  enabled: true
+  timeout_seconds: 30
+  max_memory_mb: 128
+
+scheduler:
+  tick_seconds: 30
+```
+
+### 13.2 Prompt 模板（`config/templates/`）
+
+| 文件 | 用途 |
+|------|------|
+| `router_system.txt` | RouterAgent 系统提示（LangChain 占位符） |
+| `default_system.txt` | 默认 Agent 系统提示 |
+| `analyst_system.txt` | DataAnalyst Agent 系统提示 |
+| `support_system.txt` | CustomerSupport Agent 系统提示 |
+| `code_assistant_system.txt` | CodeAssistant Agent 系统提示 |
+| `summarizer.txt` | MemoryArchiver 压缩提示（8 节结构） |
+| `summarizer_compress.txt` | 对话滚动压缩提示（300 字内） |
 
 ---
 
-# 实际实现补充说明
+## 14. 关键流程时序图
 
-本章节记录在编码实现过程中新增或细化的设计决策，这些内容在原始架构设计文档中未被覆盖，但已在代码中落地。
-
-## 5.1 LLMInfo 动态加载机制
-
-每个用户拥有独立的 LLM 配置（模型名称、provider、API Key、temperature 等），存储在 MySQL `llm_info` 表中。Hermes 引擎在处理用户请求时通过以下流程动态加载：
-
-1. 检查内存缓存（`_llm_cache` 字典，按 `user_id` 索引）。
-2. 若缓存未命中，调用 `LLMInfo.load(user_id, db)` 异步从 MySQL 读取配置。
-3. 根据 `provider` 字段自动选择 LangChain 模型类（OpenAI / Anthropic / 其他）。
-4. 构建 `BaseChatModel` 实例并写入缓存，后续请求直接复用。
+### 14.1 流式对话处理完整流程
 
 ```
-LLMInfo (dataclass)
-├── provider: str          # "openai" / "anthropic" / ...
-├── model_name: str        # "gpt-4o" / "claude-3-5-sonnet" / ...
-├── api_key: str
-├── temperature: float
-├── max_tokens: int
-└── async load(user_id, db) -> LLMInfo | None
+用户
+ │ POST /chat/stream
+ ▼
+FastAPI
+ │ asyncio.create_task(_run())
+ │ yield SSE from queue ◄──────────────────────────────┐
+ ▼                                                      │
+_run() (后台任务)                                        │ q.put_nowait(event)
+ │ 1. RagPipeline.build_context()                       │
+ │    → 预取缓存 / 向量检索 / BM25 检索                  │
+ │ 2. RouterAgent.route()                               │
+ │    → intent + tasks + mode                           │
+ │    → push: routing / planning ─────────────────────► │
+ │ 3. set_consent_hook() + set_consent_turn_id()         │
+ │ 4. _execute_pipeline(pipeline, mode)                  │
+ │    → agent_start / step_start / tool_call ─────────► │
+ │    → [危险操作: 推送 consent_required ──────────────► │]
+ │    → [等待 Future.set_result() ◄── POST /chat/consent │]
+ │    → tool_result / step_done / agent_done ─────────► │
+ │ 5. final LLM stream_aiter                             │
+ │    → push: token ──────────────────────────────────► │
+ │ 6. bus.conversation_turn()                            │
+ │ 7. _save_turn_async() (后台)                          │
+ │ 8. push: done ─────────────────────────────────────► │
+ │ 9. _end_turn()                                        │
+ └───────────────────────────────────────────────────────
 ```
 
-## 5.2 AgentExecutorCache（LangGraph 代理缓存）
-
-原设计文档描述了多智能体编排的概念，实现中引入了 `AgentExecutorCache` 类来管理 LangGraph 代理实例的生命周期：
-
-- 每个工作代理（worker agent）按 `agent_name` 缓存对应的 `AgentExecutor` 实例。
-- 代理首次使用时懒加载，构建 LangGraph StateGraph 并编译。
-- 工具列表从 `agents_config.yaml` 动态读取，通过 `LangChainToolWrapper` 注册。
-- 缓存命中时直接复用，避免重复构建带来的性能开销。
-
-## 5.3 Token 认证降级机制
-
-在 `app/api/dependencies.py` 的 `get_current_user()` 中，实现了以下降级链路，保证开发/测试阶段的可用性：
+### 14.2 危险操作授权流程
 
 ```
-Token 验证流程：
-1. 从 Header (Authorization: Bearer <token>) 或 Query 参数读取 token
-2. 在 Redis 中查找 token 对应的 user_id
-   ├─ 成功 → 返回正常用户信息 (is_authenticated=True)
-   └─ 失败（Redis 不可用 / token 不存在）→ 降级为测试用户 (is_test=True)
+工具执行
+  │ dangerous_ops = ["modify"]
+  │ check_consented() → False
+  │ get_consent_hook() → _consent_hook
+  ▼
+_consent_hook(exc):
+  acquire _consent_lock
+    check_consented() → still False
+    create asyncio.Future
+    q.put_nowait({event: "consent_required", data: {request_id, tool_name, operation}})
+    await asyncio.wait_for(fut, timeout=300)  ← 工具暂停于此
+              │
+              │  前端弹出 ConsentDialog
+              │  用户点击按钮
+              │  POST /chat/consent {request_id, decision}
+              │
+    consent_respond(request_id, decision)
+      fut.set_result(decision)  ← 工具恢复
+  ↓
+decision == "conversation" → grant_conversation_all(turn_id)
+decision == "allow"        → 工具继续执行
+decision == "deny"         → return {result: "拒绝", success: False}
 ```
 
-降级返回结构：
-
-```python
-{
-    "user_id": "test_user",
-    "username": "test",
-    "token": token,
-    "is_authenticated": False,
-    "is_test": True
-}
-```
-
-用户模型加载（`get_user_model()`）同样有三级降级：Redis 缓存 → MySQL 查询 → 硬编码默认配置。
-
-## 5.4 PooledConnection 状态机
-
-连接池中每个连接对象（`PooledConnection`）维护以下状态机，原设计文档仅描述了连接池的宏观功能，未涉及单连接的状态管理：
+### 14.3 记忆预取流程
 
 ```
-状态机：
-AVAILABLE ──acquire()──→ BUSY ──release()──→ AVAILABLE
-                                               │
-                         health_check 失败 ──→ 移除并创建新连接
+轮次 N 结束
+  │ _save_turn_async() → MemoryManager.store_turn()
+  │ → queue_prefetch(user_id, user_input_N)
+  │   后台任务：retrieve_memory(user_input_N) 
+  │   写入 Redis memory:{user_id}:prefetch_result (TTL 5min)
+
+轮次 N+1 开始
+  │ RagPipeline.build_context()
+  │ → HybridRetriever.retrieve()
+  │   Step 0: GETDEL memory:{user_id}:prefetch_result
+  │   ↓ 命中 → 直接返回，跳过向量+BM25检索
+  │   ↓ Miss  → Step 1 向量检索 + Step 2 BM25 检索
 ```
-
-每个连接还追踪以下元数据：
-
-| 字段 | 含义 |
-|------|------|
-| `created_at` | 创建时间，用于判断是否超出 `max_connection_lifetime` |
-| `last_used_at` | 最后使用时间，用于心跳检测间隔计算 |
-| `last_heartbeat_at` | 最后心跳时间 |
-| `use_count` | 累计使用次数 |
-| `pool_id` | 唯一标识，用于在 `busy_connections` 字典中索引 |
-
-## 5.5 上下文相关性过滤的双阈值策略
-
-`ContextManager` 在过滤检索结果时，向量结果与全文结果采用不同的评分规则（原文档未描述此细节）：
-
-- **向量结果**：余弦相似度 ≥ `confidence_threshold`（默认 0.7），绝对阈值。
-- **全文结果（BM25）**：`score ≥ max(relative_min, text_abs_floor)`，取相对阈值与绝对下限的较大值，避免因语料稀疏导致低质量结果通过。
-
-## 5.6 ES 同步触发机制
-
-`MemoryManager` 的 L1→L3 同步不是实时的，而是基于阈值触发的异步后台任务：
-
-- 触发条件：Redis List 长度 ≥ `redis_recent_turns × es_sync_threshold_pct`
-  - 默认：10 轮 × 0.6 = 第 6 条写入后触发同步
-- 同步采用去重写入策略，以 `turn_id` 为幂等键，防止重复数据。
-- 压缩触发条件：累计总轮次计数器 ≥ `max_total_turns`（默认 30）。
 
 ---
 
-# 功能完成状态总览
-
-## 基础设施与数据层
-
-| 功能 | 状态 |
-|------|------|
-| MySQL CRUD（用户/配置/元数据存储） | ✅ 已完成 |
-| MySQL 批量操作与原始 SQL 执行 | ✅ 已完成 |
-| Redis KV 操作（Token/模型配置缓存） | ✅ 已完成 |
-| Redis List 操作（滚动窗口对话缓存） | ✅ 已完成 |
-| Redis 多 DB 支持（select_db） | ✅ 已完成 |
-| Elasticsearch 文档 CRUD | ✅ 已完成 |
-| Elasticsearch BM25 全文检索 | ✅ 已完成 |
-| Elasticsearch KNN 向量搜索（ES 7.x `script_score` / ES 8.x `knn` 自动适配） | ✅ 已完成（2026-05-06） |
-| Elasticsearch 连接版本检测（`_es_major_version`，影响 mapping 与搜索语法） | ✅ 已完成（2026-05-06） |
-| 数据库连接池（等待队列 + 心跳检测 + 自动回收） | ✅ 已完成 |
-| PooledConnection 状态机（AVAILABLE/BUSY） | ✅ 已完成 |
-| 连接池全局管理器（ConnectionPoolManager） | ✅ 已完成 |
-| 文件存储配置统一模块（`app/core/file_storage.py`，UPLOAD_ROOT / MAX_FILE_SIZE / CLEANUP_DAYS） | ✅ 已完成（2026-05-05） |
-
-## 认证与用户管理
-
-| 功能 | 状态 |
-|------|------|
-| 用户注册（bcrypt 密码哈希） | ✅ 已完成 |
-| 用户登录（Token 生成） | ✅ 已完成 |
-| 修改密码 | ✅ 已完成 |
-| Token 认证（Header / Query 双支持） | ✅ 已完成 |
-| Token 认证降级为测试用户 | ✅ 已完成 |
-| 用户模型配置三级降级加载 | ✅ 已完成 |
-| 多租户数据隔离（user_id 强制过滤） | ✅ 已完成 |
-
-## LLM 与 Agent 编排
-
-| 功能 | 状态 |
-|------|------|
-| 每用户独立 LLM 配置（LLMInfo 动态加载） | ✅ 已完成 |
-| LLM 实例内存缓存（按 user_id） | ✅ 已完成 |
-| 多 provider 支持（OpenAI / Anthropic 等） | ✅ 已完成 |
-| LLM 模型创建 / 切换 / 列表 API | ✅ 已完成 |
-| `/models/change` 允许切换系统模型（user_id='0'）与用户自有模型 | ✅ 已完成（2026-05-05） |
-| `/models/create` 支持空 api_key（Ollama 本地模型） | ✅ 已完成（2026-05-05） |
-| Hermes 多智能体编排引擎（完整处理流程） | ✅ 已完成 |
-| AgentExecutorCache（LangGraph 代理懒加载缓存） | ✅ 已完成 |
-| LangChainToolWrapper（YAML 工具包装注册） | ✅ 已完成 |
-| RegistryToolAdapter（registry 工具 → LangChain Tool 适配） | ✅ 已完成（2026-05-06） |
-| `_registry_tools_for_agent()`：Agent 执行时自动注入公共 + 专属工具 | ✅ 已完成（2026-05-06） |
-| Agent 图缓存 key 含 user_id（不同用户工具集隔离） | ✅ 已完成（2026-05-06） |
-| RouterAgent 框架（意图识别 / 任务分解 / 代理路由） | ✅ 已完成 |
-| RouterAgent 意图识别算法（真实 LLM 推理） | ✅ 已完成 |
-| 工作代理（data_analyst / customer_support / code_assistant）框架 | ✅ 已完成（框架） |
-| 工作代理业务逻辑（工具调用驱动真实任务） | ⏳ 待完成 |
-
-## 工具系统
-
-| 功能 | 状态 |
-|------|------|
-| YAML 工具配置定义（agents_config.yaml，8 个工具） | ✅ 已完成 |
-| 工具动态注册框架（ToolRegistry 全局单例） | ✅ 已完成 |
-| 工具权限体系（public / private / exclusive + dangerous_ops） | ✅ 已完成 |
-| 工具创建 / 列表 / 修改 / 删除 API（`/tools`） | ✅ 已完成 |
-| `file_reader` 内置工具（EXEC_CLIENT，支持主流文件格式读取） | ✅ 已完成 |
-| `file_writer` 内置工具（EXEC_SERVER，支持文本/JSON/CSV/Excel/Word 等多格式写入） | ✅ 已完成（2026-05-05） |
-| 内置工具自动注册（`app/tools/builtin/__init__.py` 启动时统一导入） | ✅ 已完成（2026-05-05） |
-| 文件管理 API（`/files/list`、`/files/download/{file_id}`、`DELETE /files/{file_id}`） | ✅ 已完成（2026-05-05） |
-| 文件 ID 编解码（URL-safe base64 + 归属校验，防越权访问） | ✅ 已完成（2026-05-05） |
-| 用户上传文件与 AI 生成文件分目录存储（uploads / generated） | ✅ 已完成（2026-05-05） |
-| 文件定期清理定时任务（`__sys_file_cleanup__`，每日 UTC 02:00，cleanup_days 可配置） | ✅ 已完成（2026-05-05） |
-| `BaseAgent.collect_tools()`：自动收集公共 + 专属工具 | ✅ 已完成（2026-05-06） |
-| `BaseAgent.call_tool()`：按名称直接调用 registry 工具 | ✅ 已完成（2026-05-06） |
-| `BaseAgent.execute()` 自动绑定工具（ReAct agent / bind_tools 降级） | ✅ 已完成（2026-05-06） |
-| sql_query 工具实现 | ⏳ 待完成 |
-| chart_generation 工具实现 | ⏳ 待完成 |
-| order_lookup 工具实现 | ⏳ 待完成 |
-| 工具生态评分引擎（贝叶斯评分 + 反作弊） | ⏳ 待完成 |
-| 工具版本控制（Git-like） | ⏳ 待完成 |
-
-## 记忆管理
-
-| 功能 | 状态 |
-|------|------|
-| L1 Redis 滚动窗口缓存（最近 N 轮对话） | ✅ 已完成 |
-| L2 MySQL 结构化事实存储与引用统计 | ✅ 已完成 |
-| L3 Elasticsearch 全量聊天历史存储 | ✅ 已完成 |
-| L1→L3 阈值触发异步同步（去重写入） | ✅ 已完成 |
-| 混合检索（向量 + BM25 + 相关性过滤） | ✅ 已完成 |
-| 上下文相关性过滤（双阈值策略） | ✅ 已完成 |
-| ContextManager 上下文组装 | ✅ 已完成 |
-| ChatHistoryStore ES 聊天记录管理 | ✅ 已完成 |
-| Embedding 向量化（写入时生成向量） | ✅ 已完成（2026-04-27）|
-| 记忆压缩逻辑（MemoryArchiverAgent，Saga 全流程） | ✅ 已完成（2026-04-28）|
-| Summarizer Agent（LLM 摘要 Prompt，summarize_conversation） | ✅ 已完成（2026-04-26）|
-| `_merge_by_turn()`：向量 / 全文检索结果按 `turn_id` 合并去重（取最高分 + 拼接不同内容块），再按 turn 粒度截取 top_k，避免同 turn 多 chunk 占用配额 | ✅ 已完成（2026-05-06） |
-| ES 9.x `ObjectApiResponse` 兼容修复（`memory_manager.py`：`isinstance(raw, dict)` → `raw is not None`） | ✅ 已完成（2026-05-06） |
-
-## 聊天 API
-
-| 功能 | 状态 |
-|------|------|
-| /chat/send 发送消息接口 | ✅ 已完成 |
-| /chat/stream SSE 流式响应（astream + EventSourceResponse） | ✅ 已完成 |
-| /chat/history 历史记录分页查询（ES），返回 turn 粒度（`user_input` + `assistant_response` 合一，不再拆分为两条） | ✅ 已完成（2026-05-06 修正） |
-| `ChatHistoryStore.get_recent_turns()`：新方法，按 turn 文档原样返回，供 `/chat/history` 接口使用 | ✅ 已完成（2026-05-06） |
-| ChatHistoryStore ES `ObjectApiResponse` 兼容修复（`isinstance(res, dict)` → `res is not None`，修复返回空列表 bug） | ✅ 已完成（2026-05-06） |
-| 会话历史 Redis 缓存读写 | ✅ 已完成 |
-| 异步写入 ES 聊天历史 | ✅ 已完成 |
-
-## 配置系统
-
-| 功能 | 状态 |
-|------|------|
-| system_config.yaml 系统配置热加载 | ✅ 已完成 |
-| agents_config.yaml 代理与工具配置 | ✅ 已完成 |
-| Prompt 模板目录（config/templates/） | ⏳ 待完成（目录存在，模板文件为空） |
-
-## 安全与合规
-
-| 功能 | 状态 |
-|------|------|
-| bcrypt 密码安全存储 | ✅ 已完成 |
-| Token 认证与多租户隔离 | ✅ 已完成 |
-| E2B / Firecracker 代码沙箱执行 | ⏳ 待完成 |
-| PII 敏感信息脱敏 | ⏳ 待完成 |
-
-## 可观测性与运维
-
-| 功能 | 状态 |
-|------|------|
-| 结构化日志（DEBUG / INFO / WARNING 多级） | ✅ 已完成 |
-| 连接池统计信息接口 | ✅ 已完成 |
-| LangSmith / Arize Phoenix 全链路追踪集成 | ⏳ 待完成 |
-| 监控告警指标（安全 / 性能 / 业务） | ⏳ 待完成 |
-| 灰度发布与回滚机制 | ⏳ 待完成 |
-
-## 聊天 API 与记忆链路
-
-| 功能 | 状态 |
-|------|------|
-| 统一记忆链路（engine 调用 memory_manager.store_turn，删除 chat.py 重复 Redis 写入） | ✅ 已完成 |
-| store_turn 时附加 Embedding 向量，打通向量检索写入链路 | ✅ 已完成 |
-| /models/change 变更后清除对应用户 LLM 缓存，使新配置即时生效 | ✅ 已完成 |
-
-## 路由与任务分配
-
-| 功能 | 状态 |
-|------|------|
-| RouterAgent 初始化时注入 LLM 句柄 | ✅ 已完成 |
-| RouterAgent 使用 LLM 实现真实意图识别（identify_intent） | ✅ 已完成 |
-| RouterAgent 读取 intent_agent_mapping 完成正确 agent 路由（decide_next_agent） | ✅ 已完成 |
-| RouterAgent 使用 LLM 实现任务分解（decompose_task） | ✅ 已完成 |
-
-## 功能性智能体
-
-| 功能 | 状态 |
-|------|------|
-| 实现至少一个端到端可运行的功能性智能体（最小可用闭环） | 🔧 进行中（`BaseAgent.execute()` 已支持 ReAct / bind_tools 工具注入，业务工具 sql_query 等尚未实现） |
-| 工作代理实现（data_analyst） | ⏳ 待完成 |
-| 工作代理实现（customer_support） | ⏳ 待完成 |
-| 工作代理实现（code_assistant） | ⏳ 待完成 |
-| 统一 YAML 和 DB 两套 agent 注册体系，支持运行时智能体热更新 | ⏳ 待完成 |
-
-## 测试
-
-| 功能 | 状态 |
-|------|------|
-| 基础单元测试（LLM / 消息 / Hermes 初始化） | ✅ 已完成 |
-| 完整工作流集成测试 | ✅ 已完成 |
-| API 端点测试 | ✅ 已完成 |
-| LLM 集成测试（需真实 API Key） | ✅ 已完成（需配置） |
-| 负载与并发测试 | ⏳ 待完成 |
-
----
-
-# 待完成项优先级清单
-
-> 依据对"一个服务端 + 多客户端，Hermes 负责记忆处理、任务分配、功能性智能体调用与管理"目标的影响程度排列。
-
-## P0 — 结构性断点（当前系统无法端到端运行，必须优先修复）
-
-| # | 待完成项 | 状态 | 问题说明 |
-| --- | --- | --- | --- |
-| 1 | **统一记忆链路**：`HermesEngine.process_user_input()` 结束后调用 `memory_manager.store_turn()`，同时删除 `chat.py` 中重复的 Redis 历史写入 | ✅ 已完成 | `process_user_input` 末尾已调用 `memory_manager.store_turn()`，`chat.py` 不再重复写入 |
-| 2 | **RouterAgent 注入 LLM + 实现真实意图识别与路由** | ✅ 已完成 | `RouterAgent` 接收 LLM 句柄，`identify_intent()`、`decompose_tasks()`、`_plan_mode()` 均通过真实 LLM 推理实现 |
-| 3 | **实现至少一个端到端可运行的功能性智能体** | 🔧 进行中 | `BaseAgent.execute()` 已支持自动工具注入（ReAct agent / bind_tools 降级），`RegistryToolAdapter` 将 registry 工具包装为 LangChain Tool；`file_reader` / `file_writer` 已可用；业务工具 `sql_query` / `chart_generation` 等尚未实现，功能性 Agent 仍缺乏数据查询能力 |
-
-## P1 — 核心功能缺失（主要能力无法使用）
-
-| # | 待完成项 | 状态 | 问题说明 |
-| --- | --- | --- | --- |
-| 4 | **向量化写入链路打通**：`store_turn` 后台异步生成向量并写入独立向量索引 | ✅ 已完成 | `memory_manager.store_turn()` 异步调用 `vector_store.store_turn_vectors()`，分 chunk 写入 ES |
-| 5 | **实现记忆压缩完整逻辑（MemoryArchiverAgent）** | ✅ 已完成（2026-04-28）| `MemoryArchiverAgent` 全流程 Saga：读 Redis → 持久化 ES → LLM 摘要 → 写摘要 → 替换 Redis → 删旧数据，7 状态机 + `memory_compress_jobs` 表 + 断点续跑 |
-| 6 | **Summarizer Agent Prompt 模板** | ✅ 已完成（2026-04-26） | `config/templates/summarizer_compress.txt` 已就绪；BaseAgent 背景模板体系同步建立 |
-| 7 | **`/models/change` 后清除 LLM 缓存** | ✅ 已完成（2026-04-26） | `app/api/models.py` 切换成功后调用 `hermes_engine.clear_llm_cache(user_id)` |
-| 8 | **Prompt 模板外置**：从 `config/templates/` 目录加载，接通 `agents_config.yaml` 的 `prompt_template` 字段 | ✅ 已完成（2026-04-26） | HermesEngine `_load_agent_prompts()` + BaseAgent `_load_background_from_template()` 均已实现 |
-
-## P2 — 架构完善（多客户端场景与完整 agent 管理）
-
-| # | 待完成项 | 状态 | 问题说明 |
-| --- | --- | --- | --- |
-| 9 | **统一 YAML 和 DB 两套 agent 注册体系**，支持运行时热更新 | ⏳ 待完成 | YAML workers 与 DB agents 并行，registry 与 `agent_graphs` 缓存不统一 |
-| 10 | **SSE / WebSocket 流式响应**：LLM 使用 `astream()` 替代 `ainvoke()` | ⏳ 待完成 | 当前同步 HTTP，LLM 全量生成后返回，多客户端实时交互体验差 |
-| 11 | **工作代理实现**：`data_analyst`、`customer_support`、`code_assistant` | ⏳ 待完成 | `workers/` 框架就绪；`BaseAgent.execute()` 已自动注入工具（ReAct/bind_tools），但业务 Agent 仍无自定义 Prompt 和特化逻辑 |
-| 12 | **工具全量实现**：`sql_query`、`chart_generation`、`order_lookup` 等 | ⏳ 待完成 | `file_reader` / `file_writer` 已实现；业务类工具（查询 DB、图表、订单）仍为空，数据分析场景无法运行 |
-
-## P3 — 扩展能力（平台化与生产就绪）
-
-| # | 待完成项 | 状态 |
-| --- | --- | --- |
-| 13 | 工具生态评分引擎（贝叶斯评分 + 反作弊权重） | ⏳ 待完成 |
-| 14 | 工具版本控制（Git-like，支持会话级版本锁定） | ⏳ 待完成 |
-| 15 | E2B / Firecracker 代码沙箱执行 | ⏳ 待完成 |
-| 16 | PII 敏感信息脱敏完整实现（`_desensitize()` 接入脱敏库） | ⏳ 待完成 |
-| 17 | LangSmith / Arize Phoenix 全链路追踪集成 | ⏳ 待完成 |
-| 18 | 监控告警指标（安全 / LLM 延迟 / 业务成功率）+ Prometheus 导出 | ⏳ 待完成 |
-| 19 | 灰度发布与自动回滚机制 | ⏳ 待完成 |
-| 20 | 负载与并发压测 | ⏳ 待完成 |
-
----
-
-# 新增任务项（v2.1，2026-04-25）
-
-> 本节记录在实际开发迭代中发现的新问题和改进机会，以及基于架构分析的建议任务。
-
-## 已完成的新增工作
-
-| 任务 | 完成日期 | 说明 |
-| --- | --- | --- |
-| **MemoryArchiverAgent Saga 完整实现**：ES 旧数据删除步骤（`deleting_es` 状态）、`compressed_turn_ids` 持久化、断点续跑覆盖全部 7 状态 | 2026-04-28 | 补齐"ES 删除旧数据"这一关键步骤，三步（摘要→清 Redis→删旧数据）均有 Saga 保障；中断后可从任意状态幂等恢复 |
-| **VectorStore.delete_turn_vectors()**：按 `ref_doc_id` 批量删除向量分块（`delete_by_query`） | 2026-04-28 | 供 MemoryArchiver 在压缩后清理对应向量，防止向量索引无限膨胀 |
-| **向量化写入链路打通**：`EmbeddingService`（多 provider）+ `VectorStore` + `MemoryManager.store_turn` 后台异步向量化 | 2026-04-27 | 支持 Ollama 本地 + OpenAI 兼容在线服务；NaN 三层容错；独立 `hermes_chat_v_{user_id}` 索引 |
-| **startup embedding 校验**：启动时对比 MySQL 与 YAML 配置，不一致则重建全量向量索引 | 2026-04-27 | 防止切换模型后旧向量混入，确保向量索引与当前模型维度一致 |
-| **项目根路径统一管理**：新建 `app/core/paths.py`，入口文件设置 `PROJECT_ROOT` 环境变量，内部模块统一导入 | 2026-04-27 | 消除 11 处各自独立的 parent 链推导，支持部署时通过环境变量覆盖 |
-| **程序关闭时用户画像批量固化**：lifespan 关闭阶段扫描 Redis 全部用户画像并写入 MySQL | 2026-04-26 | 兜底覆盖进程崩溃场景，补齐第三个固化触发点 |
-| **Prompt 模板全面外置**：HermesEngine 系统提示 + BaseAgent 背景均迁移至 `config/templates/` | 2026-04-26 | 提示词修改无需改动 Python 源码；命名规则：`_system.txt` 与 `{name}.txt` 分离避冲突 |
-| **`/models/change` 后立即生效**：切换模型 API 接入 `clear_llm_cache(user_id)` | 2026-04-26 | 修复切换后需重启才能生效的问题 |
-| **日志配置统一**：全部 7 处 `basicConfig` 改为从 `system_config.yaml` 读取 `logging.level` | 2026-04-25 | 修复了 DEBUG 配置不生效的根本问题 |
-| **向量切片策略升级**：Q/A/每个 Agent 输出独立成 chunk，短输入不生成 question 块 | 2026-04-24 | 提升检索精度，串行流水线中间步骤不再丢失 |
-| **Ollama NaN Bug 修复**：三层降级容错（预处理→原生 API→截半重试） | 2026-04-24 | 解决 bge-m3 对特定中文字符产生 NaN 的问题 |
-| **per-agent 向量化调用链**：`_execute_serial/parallel` 返回 `agent_outputs`，贯穿至 `chunk_turn` | 2026-04-24 | 多 Agent 场景下各 Agent 输出独立索引 |
-
-## 新增待完成项 — 向量与记忆
-
-| # | 任务 | 优先级 | 说明 |
-| --- | --- | --- | --- |
-| V1 | **revectorize 还原 agent 结构**：全量重建时从 ES 读取 turn，尝试从 `turn_metadata.pipeline` 还原 `agent_outputs` 格式 | P1 | 当前重建只处理合并文本，多 Agent 语义块在模型切换后会丢失结构 |
-| V2 | **向量索引分片策略优化**：用户量大时，按时间范围或用户分组建立多个向量索引 | P2 | 单索引文档量超过 10 万时 KNN 性能明显下降 |
-| V3 | **向量检索结果去重增强**：同一 turn 的多个 chunk 命中时，合并回 turn 粒度再展示给 LLM | ✅ 已完成（2026-05-06） | `_merge_by_turn()` 静态方法：fetch top_k×3 候选 → 按 `turn_id` 分组取最高分 + 拼接不同内容块 → 按 turn 粒度排序截取 top_k；同时应用于 `_vector_search()` 和 `_es_text_search()` |
-
-## 新增待完成项 — 对话体验
-
-| # | 任务 | 优先级 | 说明 |
-| --- | --- | --- | --- |
-| D1 | **对话历史查询接口**：`GET /chat/history?user_id=&page=&size=` 从 ES 分页返回历史 turn | ✅ 已完成 | `/chat/history` 接口已在 `app/api/chat.py` 实现 |
-| D2 | **SSE 流式输出**：`/chat/stream` 使用 `astream()` + `EventSourceResponse` | ✅ 已完成 | `app/api/chat.py` `/chat/stream` 已实现 SSE 流式推送，支持 routing/token/done/error 事件 |
-| D3 | **多轮对话会话 ID 支持**：请求带 `session_id`，ContextManager 按会话而非用户维度加载历史 | ⏳ 待完成 | 当前一个用户只有一个上下文流，多标签页/多设备并发时会话混乱 |
-
-## 新增待完成项 — 智能体能力
-
-| # | 任务 | 优先级 | 说明 |
-| --- | --- | --- | --- |
-| A1 | **Agent 级别 LLM 配置**：支持在 `agents_config.yaml` 中为特定 Agent 指定不同模型（如路由用低成本模型，分析 Agent 用高能力模型） | P2 | 当前所有 Agent 共享同一用户 LLM 实例，无法差异化选型 |
-| A2 | **Agent 执行超时控制**：为每个 Agent 执行设置独立超时，串行流水线中单步超时不影响整体 | P2 | 目前无超时机制，单个 Agent 卡住会导致整个请求挂起 |
-| A3 | **Agent 执行结果缓存**：对无副作用的查询类 Agent，相同输入缓存结果（TTL 可配置） | P3 | 减少重复 LLM 调用成本，适合数据查询类场景 |
-| A4 | **技能库冷启动优化**：新 Agent 首次执行时从同类 Agent 迁移相关技能，加速收敛 | P3 | 当前新 Agent 技能库为空，需要多次执行才能积累 |
-
-## 新增待完成项 — 工程与运维
-
-| # | 任务 | 优先级 | 说明 |
-| --- | --- | --- | --- |
-| E1 | **Docker Compose 编排**：一键启动 MySQL + Redis + Elasticsearch + 应用服务 | P1 | 当前部署依赖手动配置各服务，新环境搭建门槛高 |
-| E2 | **API 速率限制**：`slowapi` 或自定义中间件，按 user_id 限制请求频率 | P1 | 无限流保护，恶意或异常客户端可耗尽 LLM 配额 |
-| E3 | **配置热重载**：`ConfigLoader` 支持文件变更监听（`watchdog` 库），无需重启服务 | P2 | 当前修改 YAML 配置必须重启；Agent 路由映射等变更代价过高 |
-| E4 | **结构化日志输出**：日志支持 JSON 格式（`python-json-logger`），便于 ELK/Loki 收集 | P2 | 当前文本格式日志难以被日志平台解析 |
-| E5 | **健康检查增强**：`/health` 接口扩展为探测 MySQL/Redis/ES 连接状态，而不仅返回进程存活 | P2 | 当前 `/health` 只返回固定 JSON，无法感知下游服务故障 |
-| E6 | **Prometheus 指标导出**：`/metrics` 端点暴露请求量、LLM 延迟、向量化耗时、错误率等指标 | P3 | 无可观测性数据，生产告警无从建立 |
-
-## 架构建议（基于当前实现的洞察）
-
-> 以下为 Claude 基于对代码的全面审查，提出的架构层面改进建议。
-
-**1. 向量索引与聊天历史的双写一致性**
-
-当前 `chat_history.save_turn()` 和 `vector_store.store_turn_vectors()` 是独立的异步任务，
-如果向量化失败，聊天历史已写入但向量缺失，后续检索会静默遗漏这些 turn。
-建议：增加向量化失败的重试队列（Redis List），周期性扫描并补充写入。
-
-**2. 串行流水线的上下文污染风险**
-
-`_execute_serial` 中将每步结果追加到 `accumulated["prev_result"]`，下一步 Agent 的提示词会包含所有前步输出。
-当步骤超过 3-4 步时，Context 积累导致 Token 消耗指数级增长。
-建议：支持配置"传递窗口"，只将最近 N 步结果传入下步。
-
-**3. LLM 缓存的并发安全问题**
-
-`HermesEngine.llm_cache` 是普通 `dict`，在高并发场景下多个协程可能同时为同一用户初始化 LLM，
-造成重复数据库查询和资源浪费。
-建议：引入 `asyncio.Lock` 或双重检查锁定模式。
-
-**4. 技能记忆相似匹配的局限性**
-
-当前 `update_skill` 使用字符串前 30 字做相似匹配，误判率较高。
-建议：利用现有的向量化基础设施，用 Embedding 相似度替代字符串匹配，
-大幅提升技能迁移的精准度。
-
-**5. 记忆压缩的原子性保障** ✅ 已完成（2026-04-28）
-
-压缩涉及"LLM 摘要 → 清 Redis → ES 删除旧数据"三步，任一步失败都会导致数据不一致。
-建议：引入补偿事务（Saga 模式）：先写摘要，确认写入后再删除原始数据；
-同时记录"压缩任务状态"到 MySQL，支持中断后恢复。
-已实现：7 状态机 + `compressed_turn_ids` 持久化 + `resume_failed_jobs()` 断点续跑 + ES 旧 turn 删除。
-
----
-
-# 优化建议（2026-04-28 整理）
-
-> 以下为基于当前代码全量审查后，Claude 认为最值得优先处理的优化点，按影响程度排列。
-
-## O1（高优先级）— 影响系统可用性与数据正确性
-
-**O1-1：向量化失败的补偿队列**
-
-`vector_store.store_turn_vectors()` 作为 `asyncio.create_task` 后台运行，失败时只打日志，无重试机制。
-若 Ollama 临时不可用，这些 turn 的向量永远缺失，后续语义检索会静默遗漏。
-建议：在 Redis 中维护一个 `hermes:vec_retry:{user_id}` 列表，失败时入队；服务启动时或定时任务扫描并补偿写入。
-
-**O1-2：LLM 缓存并发安全**
-
-`HermesEngine.llm_cache` 是普通 `dict`，高并发时多协程可能同时为同一用户构建 LLM 实例，
-导致重复数据库查询甚至实例不一致。
-建议：用 `asyncio.Lock` 或每个 user_id 一把锁的字典（`_llm_locks: dict[str, asyncio.Lock]`）做双重检查锁定。
-
-**O1-3：chat.py 与 MemoryManager 的双写残留风险**
-
-尽管 `HermesEngine.process_user_input()` 已调用 `memory_manager.store_turn()`，
-但若 API 层（chat.py）在 engine 调用之外有任何直接写 Redis 的路径（如错误兜底），
-仍可能造成计数器错乱，触发错误的压缩时机。
-建议：在 chat.py 中明确禁止直接操作 Redis 历史，所有记忆写入必须经过 MemoryManager。
-
-## O2（中优先级）— 影响性能与扩展性
-
-**O2-1：串行流水线 Token 消耗爆炸**
-
-`_execute_serial` 将每步输出累积追加到 `accumulated["prev_result"]`，
-步骤超过 3-4 步后 prompt 长度指数增长，Token 费用和延迟同步飙升。
-建议：增加 `pipeline_context_window` 配置项（默认 2），只传递最近 N 步输出给下一 Agent，
-而非全量累积。
-
-**O2-2：向量检索多 chunk 命中占用 top_k 配额**
-
-同一 turn 的多个 chunk 均命中时，会占用多个 top_k 位置，导致实际召回的 turn 数量远小于预期。
-建议：在 `VectorStore.search()` 的结果后处理阶段，按 `ref_doc_id` 合并分组，
-取每个 turn 内得分最高的 chunk 作为代表，再按 turn 粒度排序截取 top_k。
-
-**O2-3：技能匹配精度低**
-
-`update_skill` 用字符串前 30 字做相似匹配，极易误判（不同问题开头相同）。
-现有 EmbeddingService 基础设施已就绪，升级成本很低。
-建议：对技能 description 字段维护向量，用余弦相似度替代字符串 startswith 匹配；
-相似度阈值可配置（建议 0.85 以上才合并）。
-
-**O2-4：Worker Agent 无工具调用能力**
-
-`DataAnalystAgent`、`CustomerSupportAgent`、`CodeAssistantAgent` 目前只调用 LLM 做纯文本生成，
-`app/tools/` 目录为空，没有任何工具执行能力。
-建议：至少实现一个最小闭环工具（如 `sql_query`：接收 SQL → 查 MySQL → 返回结果），
-让 data_analyst 真正具备数据查询能力，验证整条 tool-call 链路可用。
-
-## O3（低优先级）— 影响运维与可维护性
-
-**O3-1：多会话支持缺失**
-
-当前每个用户只有一个上下文流，多标签页或多设备同时使用时，历史记录相互污染。
-建议：在请求中引入可选的 `session_id`，ContextManager 和 MemoryManager 按 `{user_id}:{session_id}` 作为隔离键。
-
-**O3-2：缺少 Docker Compose 一键部署**
-
-新环境搭建依赖手动配置 MySQL + Redis + Elasticsearch，部署门槛高。
-建议：提供 `docker-compose.yml`，包含三个基础服务 + 应用服务，以及初始化脚本自动建表。
-
-**O3-3：Agent 级 LLM 差异化配置**
-
-所有 Agent 共用同一用户 LLM 实例，Router 与高能力分析 Agent 无法分别使用不同模型（成本/能力权衡）。
-建议：在 `agents_config.yaml` 中增加 `model_override` 字段，Agent 执行时优先使用该字段指定的模型。
-
-**O3-4：revectorize 时 agent_outputs 结构丢失**
-
-全量重建向量索引时，从 ES 读取的 turn 只有合并文本，无法还原多 Agent 流水线的独立输出结构，
-导致重建后的向量语义块与首次写入时不一致。
-建议：`store_turn` 写 ES 时，在 turn 文档的 `metadata.pipeline` 字段保存 `agent_outputs` 列表，
-`_revectorize_index` 读取时还原该结构再传入 `chunk_turn`。
-
-**O3-5：API 缺少速率限制**
-
-无任何限流保护，单一用户可无限发送请求耗尽 LLM 配额。
-建议：引入 `slowapi`，按 `user_id` 限制请求频率（如 10 次/分钟），超限返回 429。
-
----
-
-## 新增任务项（v2.2，2026-05-06）
-
-> 本节记录 2026-05-06 迭代中发现并修复的问题与新增能力。
-
-### 已完成工作（v2.2）
-
-| 任务 | 完成日期 | 说明 |
-| --- | --- | --- |
-| **ES 7.x / 8.x 向量搜索自动适配**：连接时解析 `_es_major_version`；ES 7.x 用 `script_score + cosineSimilarity`，ES 8.x 用顶层 `knn` | 2026-05-06 | 修复 ES 7.17 环境下 `Unknown key for a START_OBJECT in [knn]` 报错；mapping 建立逻辑同步分版本，ES 7.x 去除不支持的 `index: true` / `similarity` 字段 |
-| **向量检索结果按 turn 粒度去重（V3）**：`_merge_by_turn()` 静态方法，在 `_vector_search()` 和 `_es_text_search()` 均应用 | 2026-05-06 | fetch top_k×3 候选后合并同 turn 多 chunk，取最高分 + 拼接不同内容，解决多 chunk 占用 top_k 配额问题 |
-| **Agent 执行自动工具注入**：`RegistryToolAdapter`（`hermes_engine.py`）+ `_RegistryToolAdapter`（`base.py`）将 registry 工具包装为 LangChain Tool | 2026-05-06 | 将 `VIS_PUBLIC + EXEC_SERVER` 工具和 `VIS_EXCLUSIVE + owner_agent` 工具自动合并注入 LLM 请求，支持 ReAct agent（`create_react_agent`）/ bind_tools 降级 / 纯 LLM 三级策略 |
-| **`_registry_tools_for_agent()`**：按 Agent 名称收集公共 + 专属 registry 工具，与 YAML 工具合并后注入 LangGraph | 2026-05-06 | Agent 图缓存 key 升级为 `worker_name::user_id`，不同用户工具集互不污染 |
-| **`BaseAgent.collect_tools()` / `call_tool()` / `_invoke_with_tools()`**：BaseAgent 层工具收集与调用能力完整实现 | 2026-05-06 | `collect_tools()` 从 registry 筛选 EXEC_SERVER 工具；`call_tool()` 按名称直接调用；`_run_react_agent()` / `_run_bind_tools()` 分别实现 ReAct 和手动 tool-call 循环 |
-| **`file_writer` 内置工具自动注册修复**：`app/tools/builtin/__init__.py` 补充 `FileWriterTool` 导入 | 2026-05-06 | 修复 `/api/tools` 只返回 `file_reader`，`file_writer` 未注册的问题 |
-| **`/chat/history` 返回 turn 粒度格式修复**：新增 `ChatHistoryStore.get_recent_turns()`，按 ES turn 文档原样返回，不再拆分为独立 role 条目 | 2026-05-06 | 修复前端收到两条分离消息（一条 user、一条 assistant）而非一个对话回合的问题 |
-| **ES `ObjectApiResponse` 兼容修复**：`chat_history_store.py` 和 `memory_manager.py` 中 `isinstance(res, dict)` → `res is not None` | 2026-05-06 | `elasticsearch-py` 9.x 的 `ObjectApiResponse` 不继承 `dict`，导致写入校验和读取结果均走失败分支；`.get()` 方法对两者均兼容 |
-| **`/models/change` 支持系统模型切换**：查询 SQL 扩展为 `user_id = :user_id OR user_id = '0'`，切换到系统模型时重置其他系统模型状态 | 2026-05-06 | 修复切换系统内置模型返回 404 "Model not found or not owned by user" 的问题 |
-| **`/models/create` 空 api_key 修复**：仅当 `api_key` 非空时才设置 `Authorization` 请求头 | 2026-05-06 | 修复 Ollama 本地模型创建时因 `Bearer`（尾部空格）触发 `Illegal header value` 402 错误 |
-
-### 新增待完成项 — 工具与 Agent 能力（v2.2）
-
-| # | 任务 | 优先级 | 说明 |
-| --- | --- | --- | --- |
-| T1 | **RegistryToolAdapter `args_schema` 显式声明**：为每个 registry 工具生成 Pydantic `args_schema`，而非留空 `{}` | P1 | 当前 LLM 收到工具定义时无参数说明，导致工具调用成功率低；可从 `tool.parameters` 字段自动生成 JSON Schema |
-| T2 | **Agent 图缓存工具变更感知**：工具注册 / 注销后，使对应 `worker_name::user_id` 的图缓存失效 | P2 | 当前缓存只在首次构建，工具变更后需重启才能生效 |
-| T3 | **`_run_react_agent()` / `_run_bind_tools()` 工具错误透传**：工具执行抛异常时，将错误信息作为 `ToolMessage` 反馈给 LLM，而非静默忽略 | P2 | 当前工具失败只打 WARNING 日志，LLM 不知道执行失败，可能进入无限重试或产生幻觉结果 |
-| T4 | **`sql_query` 工具实现**：接收 SQL 字符串 → 通过连接池查询 MySQL → 返回 JSON 结果集 | P1 | 是 data_analyst Agent 可用的最小闭环工具，实现后可验证整条 tool-call 链路 |
-
----
-
-## 优化建议（2026-05-06 补充）
-
-> 本节为 2026-05-06 迭代后新增的优化观察，与 2026-04-28 已有建议不重复。
-
-### O4（2026-05-06 新增）
-
-#### O4-1：RegistryToolAdapter 参数 Schema 缺失
-
-`RegistryToolAdapter` 和 `_RegistryToolAdapter` 当前 `args_schema = {}` / `Schema(type=object)`，
-LLM 生成工具调用时没有参数结构参考，容易产生格式错误的 JSON。
-建议：从 `registry_tool.parameters`（已有 JSON Schema 定义）动态构建 Pydantic `BaseModel`，
-赋值给 `args_schema`；可用 `pydantic.create_model()` 从 dict 一步生成。
-
-#### O4-2：Agent 图缓存不感知工具变更
-
-`_execute_worker_with_tools()` 按 `worker_name::user_id` 缓存 LangGraph compiled graph。
-当用户新增/删除工具时，缓存图仍使用旧工具集，必须重启才能生效。
-建议：工具注册/注销时（`ToolRegistry.register()` / `unregister()`），广播 `cache_invalidate` 事件；
-`HermesEngine` 监听事件后删除对应缓存项。低成本方案：每个图缓存记录创建时 `tool_hash`（工具名称集的 MD5），每次执行前对比当前 hash，不一致则重建。
-
-#### O4-3：ES 7.x `script_score` 分数偏移问题
-
-ES 7.x 的 `cosineSimilarity() + 1.0` 会使分数范围从 [0,2] 变为正数（必须 > 0），
-但 `memory_manager.py` 的向量结果相关性过滤阈值（`confidence_threshold` 默认 0.7）
-是按余弦相似度 [0,1] 设计的，现在分数范围 [1,2] 会导致阈值过滤逻辑混乱。
-建议：ES 7.x 结果后处理时将分数映射回 [0,1]：`similarity = score - 1.0`，再与阈值比较。
-
-#### O4-4：BaseAgent 工具注入与 LangGraph 版本兼容性
-
-`_run_react_agent()` 使用 `create_react_agent(llm, tools, state_modifier=system_prompt)`，
-该 API 签名在 `langgraph` 不同版本间有变化（`state_modifier` vs `messages_modifier`）。
-当前 `collect_tools()` 用 try/except 做了导入降级，但调用参数未做版本检测。
-建议：统一在 `app/core/compat.py` 中封装 `build_react_agent(llm, tools, system_prompt)` 函数，
-内部检测 `langgraph` 版本并选择正确参数名，避免在多处分散处理兼容性问题。
+## 附录：功能完成状态（v2.10）
+
+| 模块 | 功能 | 状态 |
+|------|------|------|
+| 基础设施 | MySQL/Redis/ES 连接池 | ✅ |
+| 基础设施 | PooledConnection 状态机 | ✅ |
+| 基础设施 | ES 7/8/9 版本自动适配 | ✅ |
+| 认证 | 注册/登录/Token/RSA-OAEP | ✅ |
+| 认证 | 多租户 user_id 隔离 | ✅ |
+| 编排引擎 | 同步/流式双路径 | ✅ |
+| 编排引擎 | LLM 动态加载+缓存 | ✅ |
+| 编排引擎 | 取消机制 | ✅ |
+| 路由 | 意图识别+任务分解+模式规划 | ✅ |
+| 路由 | 三种执行模式（single/serial/parallel） | ✅ |
+| 路由 | 重规划（replan） | ✅ |
+| RAG | 三步混合检索 | ✅ |
+| RAG | 预取缓存 | ✅ |
+| RAG | 双阈值过滤 | ✅ |
+| RAG | 独立向量切片 | ✅ |
+| 工具 | 三来源+三可见性框架 | ✅ |
+| 工具 | dangerous_ops 声明 | ✅ |
+| 工具 | 内置工具（file_reader/file_writer/cli_exec/web_*） | ✅ |
+| **工具** | **危险操作授权系统（v2.9）** | ✅ |
+| **工具** | **全量放行 + TTL 缓存（v2.10）** | ✅ |
+| 记忆 | L1/L2/L3 三层架构 | ✅ |
+| 记忆 | 阈值触发压缩+归档 | ✅ |
+| 记忆 | 月度/年度归档 | ✅ |
+| 记忆 | 用户画像注入 | ✅ |
+| 定时任务 | 7 种类型+cron解析器 | ✅ |
+| 定时任务 | 中国法定节假日 | ✅ |
+| 定时任务 | SSE 通知推送 | ✅ |
+| 沙箱 | subprocess 隔离+资源限制 | ✅ |
+| 沙箱 | 静态高危扫描 | ✅ |
+| 日志 | 彩色结构化终端输出 | ✅ |
+| **日志** | **conversation_turn + consent_decision（v2.10）** | ✅ |
+| 日志 | JSON 文件输出（ELK/Loki） | ✅ |
+| Worker Agent | 框架（data_analyst/support/code_assistant） | ✅ |
+| Worker Agent | 工具调用驱动真实业务逻辑 | ⏳ 待完成 |
+| 工具评分 | 贝叶斯评分+反作弊 | ⏳ 待完成 |
+| 工具版本 | 版本控制（Git-like） | ⏳ 待完成 |
+| 可观测性 | LangSmith/Arize Phoenix 接入 | ⏳ 待完成 |

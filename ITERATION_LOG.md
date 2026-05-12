@@ -2,8 +2,238 @@
 
 **项目**：smart_butler-server（`/home/seven/smart_butler-server`）
 **语言**：Python 3 / FastAPI / LangChain + LangGraph
-**最后更新**：2026-05-06
-**当前版本**：v2.7
+**最后更新**：2026-05-12
+**当前版本**：v2.10
+
+---
+
+## v2.10 — 2026-05-12：工程质量优化（Phase 4）
+
+### 1. Bug 修复：对话授权弹窗重复出现
+
+**问题**：用户在授权弹窗中选择「当前对话允许」后，同一轮对话内后续触发的危险操作仍弹窗。
+
+**根因**：`grant_conversation()` 以 `(tool_name, operation, turn_id)` 为 key 仅授权特定工具的特定操作，未能覆盖本轮全部危险操作。
+
+**修复**（`app/tools/permission.py`）：
+- 新增 `_conversation_blanket: Set[str]` 集合，以 `turn_id` 为 key
+- 新增 `grant_conversation_all(turn_id)` 方法，一次性放行本轮所有危险操作
+- `check_consented()` 在逐 op 检查前优先检测 `turn_id in _conversation_blanket`
+- `revoke_conversation()` 同步清除 blanket 集合
+
+**修复**（`app/core/hermes_engine.py`）：`_consent_hook` 中 decision 为 `"conversation"` 时调用 `grant_conversation_all(turn_id)` 而非逐 op 授权。
+
+---
+
+### 2. Bug 修复：对话结束后执行过程不可见
+
+**问题**：消息记录在对话完成后无法展开查看执行过程（Pipeline 面板为空）。
+
+**根因**：`commitStream()` 使用 `{ ...this.pipeline }` 浅拷贝，Pinia 响应式代理中嵌套的 `agents` / `steps` / `tools` 数组在 `this.pipeline = emptyPipeline()` 重置后与拷贝体共享引用而失效。
+
+**修复**（`src/stores/chat.ts`）：`commitStream()` 和 `commitCancelled()` 改用 `JSON.parse(JSON.stringify(...))` 深拷贝，确保历史消息快照独立于 store 状态。
+
+---
+
+### 3. Import 优化
+
+| 位置 | 问题 | 修复 |
+| --- | --- | --- |
+| `app/utils/log_bus.py` | 3 个方法内各有一行 `from app.utils.progress_bus import push as _pb` | 合并为文件顶部单条导入 |
+| `app/core/hermes_engine.py` | `finally` 块重复 `from app.tools.permission import _CONSENT_HOOK, _CONSENT_TURN_ID` | 删除重复导入，统一在 Hook 定义处一次性导入 |
+
+---
+
+### 4. 性能优化：`_is_op_enabled()` 缓存
+
+**问题**：每次工具调用都触发 `_is_op_enabled()` 查询 `dangerous_op_configs` 表，高频工具调用场景下 MySQL 压力明显。
+
+**修复**（`app/tools/permission.py`）：
+- 新增 `_op_enabled_cache: Dict[Tuple[str,str], Tuple[bool,float]]` 模块级缓存，TTL 60 秒
+- 新增 `_invalidate_op_cache(user_id, operation)` 供外部失效
+
+**修复**（`app/api/tools_api.py`）：`PATCH /tools/dangerous-ops/{op_type}` 成功后调用 `_invalidate_op_cache()`，切换立即生效无需等待 TTL。
+
+---
+
+### 5. 日志增强
+
+**新增方法**（`app/utils/log_bus.py`）：
+
+| 方法 | 颜色 | 说明 |
+| --- | --- | --- |
+| `conversation_turn()` | 亮紫 (`turn`) | 轮次结束时记录完整摘要：intent、mode、agents 列表、tools 列表、响应长度、总耗时 |
+| `consent_decision()` | 亮黄 (`consent`) | 用户授权弹窗决策记录（tool、operation、decision） |
+
+**接入**（`app/core/hermes_engine.py`）：
+- `_run()` 起始记录 `_turn_start = time.monotonic()`
+- 保存 turn 前调用 `_bus.conversation_turn(...)` 输出轮次摘要
+- `_consent_hook` 决策后调用 `_bus.consent_decision(...)`
+
+---
+
+## v2.9 — 2026-05-12：危险操作授权系统
+
+### 1. 设计目标
+
+工具执行危险操作（修改文件、删除数据、网络请求等）时，在 SSE 流式场景下**暂停工具执行**，向前端推送授权事件，等待用户决策后恢复，避免危险操作在用户未确认时静默执行。
+
+### 2. 数据库变更（`app/database/agent_db.sql`）
+
+新增 `dangerous_op_configs` 表，用于用户级别危险操作类型开关：
+
+```sql
+CREATE TABLE IF NOT EXISTS `dangerous_op_configs` (
+  `id`         BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `user_id`    VARCHAR(36) NOT NULL,
+  `op_type`    VARCHAR(50) NOT NULL,
+  `is_enabled` TINYINT(1)  NOT NULL DEFAULT 1,  -- 1=需授权 0=跳过授权
+  `created_at` DATETIME    DEFAULT NOW(),
+  UNIQUE KEY uq_user_op (`user_id`, `op_type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### 3. 后端核心修改
+
+#### `app/tools/permission.py` — ConsentManager 扩展
+
+| 变更项 | 说明 |
+| --- | --- |
+| 新增 `CONSENT_CONVERSATION` 常量 | 当前轮次全部允许 |
+| `_conversation_cache` | `(tool_name, op, turn_id)` 键，轮内缓存 |
+| `ContextVar _CONSENT_HOOK` / `_CONSENT_TURN_ID` | 由 HermesEngine 注入，流式场景下提供 hook 和 turn_id |
+| `_is_op_enabled()` | 查询 `dangerous_op_configs`，用户关闭则直接放行 |
+| `grant_conversation()` / `revoke_conversation()` | 轮次粒度授权管理 |
+| `check_consented()` 优先级链 | op_disabled > once > conversation > session > project/always |
+
+#### `app/tools/base.py` — `_wrapped_execute` 集成 Hook
+
+- 检测到未授权操作时，若 `consent_hook` 存在则调用 hook（SSE 流式：推送事件 + await Future）
+- hook 返回 `"allow"` / `"deny"` / `"conversation"` 后继续执行或返回拒绝结果
+
+#### `app/core/hermes_engine.py`
+
+| 变更项 | 说明 |
+| --- | --- |
+| `self._consent_futures` | `Dict[str, asyncio.Future]`，暂存等待中的授权 Future |
+| `_consent_lock` | 串行化并发授权请求，同一时刻只有一个弹窗 |
+| `_consent_hook` 闭包 | 推送 `consent_required` SSE 事件 + `asyncio.wait_for`（300s 超时） |
+| `consent_respond()` | `request_id` → resolve Future，恢复工具执行 |
+
+#### 新增 API 端点
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET  /tools/dangerous-ops` | 查询用户危险操作类型开关状态（含标签描述） |
+| `PATCH /tools/dangerous-ops/{op_type}` | 开启/关闭指定危险操作类型授权 |
+| `POST /chat/consent` | 用户决策提交（`request_id` + `decision`） |
+
+### 4. 前端核心修改
+
+#### 新增组件
+
+| 文件 | 说明 |
+| --- | --- |
+| `src/components/ConsentDialog.vue` | 授权弹窗：显示操作详情，提供拒绝 / 允许 / 当前对话允许三个选项，调用 `POST /chat/consent` |
+| `src/views/tools/DangerousOpsSettings.vue` | 危险操作配置页：列出全部操作类型，toggle 开启/关闭授权 |
+
+#### 现有组件修改
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/views/tools/ToolsView.vue` | 添加 Tab 切换（工具列表 / 危险操作配置），嵌入 `DangerousOpsSettings` |
+| `src/views/chat/ChatView.vue` | 接收 `consent_required` SSE 事件，弹出 `ConsentDialog` |
+| `src/utils/stream.ts` | 新增 `ConsentRequestData` 接口，解析 `consent_required` 事件 |
+| `src/api/tools.ts` | 新增 `listDangerousOps()` / `toggleDangerousOp()` |
+| `src/api/chat.ts` | 新增 `respondConsent()` |
+| `src/types/index.ts` | 新增 `DangerousOpStatus` 接口；`SseEventType` 加入 `consent_required` |
+
+### 5. 流程图
+
+```
+工具触发危险操作
+    ↓
+check_consented() → 未授权
+    ↓
+consent_hook 推送 SSE "consent_required"
+    ↓
+前端弹出 ConsentDialog（暂停工具执行）
+    ↓
+用户选择 ────────────────────────────┐
+  允许（allow）                       │
+  拒绝（deny）                        │
+  当前对话允许（conversation）         │
+    ↓                                 │
+POST /chat/consent ───────────────────┘
+    ↓
+consent_respond() resolve Future
+    ↓
+工具恢复执行 / 返回拒绝结果
+```
+
+---
+
+## v2.8 — 2026-05-09：Scrapling 集成 + cli_exec 增强 + 冗余代码审查
+
+### 1. Scrapling 集成（web_agent）
+
+**目标**：为 WebAgent 引入 Scrapling 框架，提升网络检索的速度、成功率和数据精准性。
+
+**修改文件**：`app/agents/workers/web_agent.py`（+301 行，1019 → 1320）
+
+| 变更项 | 详情 |
+| --- | --- |
+| 新增 Scrapling 导入 | `try/except` 优雅降级，`_SCRAPLING` 标志控制路径切换 |
+| `_scrap_l1()` | curl_cffi + TLS 指纹伪装，速度最快，适合无 Cloudflare 的站点 |
+| `_scrap_l2()` | Chromium + Cloudflare bypass（StealthyFetcher），适合强防护站点 |
+| `_scrap_l3()` | Playwright JS 渲染（DynamicFetcher），适合 SPA/动态页面 |
+| `_fetch()` 4 层降级 | scrapling-basic → scrapling-stealth → scrapling-dynamic → playwright(legacy) |
+| `web_fetch` / `web_batch_fetch` | 新增 `stealth` 参数，透传给 `_fetch()` |
+| 新工具 `web_smart_extract` | 基于 Scrapling 自适应 CSS 选择器（`auto_save=True` + `adaptive=True`），精准提取结构化数据，VIS_EXCLUSIVE |
+| 系统提示词 | 新增决策树：首选 `web_smart_extract`，降级 `web_fetch`，stealth 场景自动判断 |
+
+**requirements.txt**：添加 `scrapling[all]`。
+
+---
+
+### 2. cli_exec 工具增强
+
+**目标**：支持结果断言，方便在 Agent 流水线中做自动化测试和验证。
+
+**修改文件**：`app/tools/builtin/cli_exec.py`
+
+| 变更项 | 详情 |
+| --- | --- |
+| 新增输入参数 `expected` | 可选字符串，默认 `None`；非空时对 stdout 执行子串断言 |
+| 新增输出字段 `status` | `"pass"` / `"fail"`，`expected=None` 时恒为 `"pass"` |
+| 新增输出字段 `result` | 原始 stdout 内容 |
+| 新增输出字段 `log` | 执行信息（OS / Shell / exit_code / 耗时 / stderr / 断言结果） |
+| 断言格式 | `[断言] 期望包含: 'xxx' → 匹配 ✓ / 不匹配 ✗` |
+
+---
+
+### 3. 冗余代码审查（Karpathy 视角）
+
+对全项目进行系统性审查，在源码中用 `# REDUNDANT[xx]:` 标记注释标注关键冗余点，保持代码可运行（只标注、不重构）。
+
+**标注汇总**：
+
+| 编码 | 位置 | 问题描述 |
+| --- | --- | --- |
+| WA01 | `workers/data_analyst.py` 等 5 个 Worker | `execute()` 骨架相同（~70%），绕过 `BaseAgent.execute()` 的 `collect_tools / _invoke_with_tools / L2 拆分` |
+| WA02 | 同上 + `skill_builder.py` + `summarizer.py` | `hasattr(result, "content")` 为死代码，LangChain ChatModel 始终返回 `AIMessage.content` |
+| WA03 | `skill_builder.py` `_do_generate/_do_optimize` | 两个方法骨架相同（~60%），LLM 调用 + 文件写入 + 返回结构重复 |
+| RA01 | `router.py` 7 个方法 | `ainvoke → _strip_fence → json.loads` 三行模式重复 7 次 |
+| RA02 | `router.py` 同上 | `getattr(resp, "content", str(resp))` 同 WA02，fallback 为死代码 |
+| HE01 | `hermes_engine.py` `RegistryToolAdapter` | 与 `base.py` 的 `_RegistryToolAdapter` 功能重复，且缺少 log_bus 事件集成 |
+| DG01 | `decision_gate.py` 模块级 dict | `_pending_events/_pending_results` 单进程内存，多进程部署或重启后挂起状态丢失 |
+| TP01 | `task_planner.py` 提示词区 | 3 套任务分解提示词（`DECOMPOSE_SYSTEM` / `_DECOMPOSE_SYSTEM` in router / `L1_DECOMPOSE_SYSTEM`）语义重叠，随版本独立漂移 |
+
+**修复建议**（待后续实施）：
+- WA01：`BaseAgent` 增加 `_build_context_messages(context)` 钩子，Worker 只需实现该钩子
+- RA01：`RouterAgent` 提取 `_invoke_json(messages, fallback, llm)` 辅助方法
+- HE01：`hermes_engine.py` 直接 import 并复用 `_RegistryToolAdapter`
+- DG01：以 Redis Streams / pub/sub 替换模块级 dict，key = `decision:{id}`，TTL = 330s
 
 ---
 
@@ -229,20 +459,21 @@ Ollama NaN bug 三层降级：预处理 → /api/embed → 截半重试
 
 ---
 
-## 代码规模（截至 v2.7）
+## 代码规模（截至 v2.10）
 
-| 模块 | 估算行数 |
-| --- | --- |
-| app/core | ~4,100 行 |
-| app/agents | ~3,150 行 |
-| app/api | ~2,500 行 |
-| app/rag | ~650 行（新增） |
-| app/database | ~2,150 行 |
-| app/tools | ~1,600 行 |
-| app/scheduler | ~1,050 行 |
-| app/sandbox | ~590 行 |
-| main.py | ~460 行 |
-| **总计** | **~16,250+ 行** |
+| 模块 | 估算行数 | 备注 |
+| --- | --- | --- |
+| app/core | ~4,200 行 | hermes_engine 新增 consent 逻辑 |
+| app/agents | ~3,150 行 | |
+| app/api | ~2,700 行 | chat + tools_api 新增 3 个端点 |
+| app/rag | ~650 行 | |
+| app/database | ~2,150 行 | |
+| app/tools | ~1,900 行 | permission.py 大幅扩展 |
+| app/scheduler | ~1,050 行 | |
+| app/sandbox | ~590 行 | |
+| app/utils | ~350 行 | log_bus 新增 2 个方法 |
+| main.py | ~460 行 | |
+| **总计** | **~17,200+ 行** | |
 
 ---
 
@@ -253,6 +484,7 @@ Ollama NaN bug 三层降级：预处理 → /api/embed → 截半重试
 | 功能 | 说明 |
 | --- | --- |
 | 归档作业表建表 | memory_monthly_jobs / memory_yearly_jobs 需在 create_tables.py 添加 DDL |
+| dangerous_op_configs 建表 | 需在 create_tables.py 添加 DDL（v2.9 新增表） |
 | Worker Agent 工具调用 | data_analyst / customer_support / code_assistant 接入真实工具 |
 
 ### 中优先级

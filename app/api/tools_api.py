@@ -1,9 +1,26 @@
-"""工具管理 API
-
-接口列表：
-  GET  /tools        查询当前用户可用的工具列表（鉴权）
-  POST /tools        用户创建工具（鉴权）
 """
+【模块说明】工具管理 — 创建、查询、修改、删除工具，以及危险操作授权开关
+
+这个文件负责管理 AI 可以调用的"工具"（Tools）。
+工具是 AI 执行具体任务时使用的能力，例如：搜索网页、读取文件、执行命令等。
+
+功能一览：
+  - 查看工具列表（可用工具 + 支持按来源/执行位置过滤）
+  - 创建工具（两种方式：直接写代码 OR 用文字描述由 AI 自动生成代码）
+  - 修改工具的描述、可见性等基本信息（不可修改代码）
+  - 删除工具（软删除，数据保留）
+  - 危险操作开关管理：可以针对每种危险操作类型单独开关是否需要用户授权
+
+【工具可见性】
+  - public：所有用户都可以使用
+  - private：仅创建者自己可使用
+  - exclusive：仅绑定的 Agent 内部使用（不在列表中展示）
+
+【危险操作声明】
+  如果工具会执行危险动作（写文件、删除、执行命令等），
+  必须在创建时声明 dangerous_ops，调用时系统会暂停等待用户授权。
+"""
+
 
 import logging
 from typing import Any, Dict, List, Optional
@@ -19,6 +36,8 @@ from app.tools.base import (
     SRC_CODE, SRC_USER, SRC_AGENT,
     DANGEROUS_OPS,
 )
+from app.database.pool import get_connection, release_connection
+from app.tools.permission import _invalidate_op_cache
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +413,120 @@ async def create_tool(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 危险操作类型配置接口（固定路径必须在 /{tool_id} 参数路由之前注册）
+# GET  /tools/dangerous-ops        — 查询用户的危险操作类型开关状态
+# PATCH /tools/dangerous-ops/{op}  — 修改单个操作类型的开关状态
+# ══════════════════════════════════════════════════════════════════════════════
+
+_OP_LABELS: dict = {
+    "modify":       "修改文件/数据",
+    "delete":       "删除文件/数据",
+    "cli":          "本地 CLI 命令",
+    "write":        "写文件/写数据库",
+    "admin":        "管理员操作",
+    "sudo":         "提权操作",
+    "execute_code": "执行任意代码",
+}
+
+
+class DangerousOpStatus(BaseModel):
+    op_type:    str
+    label:      str
+    is_enabled: bool
+
+
+class DangerousOpToggle(BaseModel):
+    is_enabled: bool
+
+
+@router.get(
+    "/dangerous-ops",
+    response_model=List[DangerousOpStatus],
+    summary="查询用户的危险操作类型开关",
+)
+async def list_dangerous_ops(
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+) -> List[DangerousOpStatus]:
+    """返回所有危险操作类型及当前用户的开关状态（无记录 = 默认开启）。"""
+    ResponseHeaders().apply(response)
+    user_id = current_user["user_id"]
+
+    conn = None
+    try:
+        conn = await get_connection("mysql", None)
+        user_configs: dict = {}
+        if conn:
+            rows = await conn.execute_raw(
+                "SELECT op_type, is_enabled FROM dangerous_op_configs WHERE user_id = :uid",
+                {"uid": user_id},
+            )
+            if rows is not None and len(rows) > 0:
+                for _, row in rows.iterrows():
+                    user_configs[str(row["op_type"])] = bool(row["is_enabled"])
+
+        return [
+            DangerousOpStatus(
+                op_type    = op,
+                label      = _OP_LABELS.get(op, op),
+                is_enabled = user_configs.get(op, True),
+            )
+            for op in sorted(DANGEROUS_OPS)
+        ]
+    except Exception as e:
+        logger.error("查询危险操作配置失败 user=%s: %s", user_id, e)
+        raise HTTPException(status_code=500, detail="查询失败")
+    finally:
+        if conn:
+            await release_connection("mysql", conn)
+
+
+@router.patch(
+    "/dangerous-ops/{op_type}",
+    response_model=dict,
+    summary="修改危险操作类型的开关状态",
+)
+async def toggle_dangerous_op(
+    op_type:      str,
+    body:         DangerousOpToggle,
+    response:     Response,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """开启或关闭指定危险操作类型（用户级别，关闭后该类操作无需授权即可执行）。"""
+    ResponseHeaders().apply(response)
+
+    if op_type not in DANGEROUS_OPS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"op_type 不合法，合法值：{sorted(DANGEROUS_OPS)}",
+        )
+
+    user_id = current_user["user_id"]
+    conn = None
+    try:
+        conn = await get_connection("mysql", None)
+        await conn.execute_raw(
+            """
+            INSERT INTO dangerous_op_configs (user_id, op_type, is_enabled)
+            VALUES (:uid, :op, :enabled)
+            ON DUPLICATE KEY UPDATE is_enabled = VALUES(is_enabled)
+            """,
+            {"uid": user_id, "op": op_type, "enabled": int(body.is_enabled)},
+        )
+        _invalidate_op_cache(user_id, op_type)
+        state = "开启" if body.is_enabled else "关闭"
+        return {"message": f"危险操作 '{op_type}' 已{state}", "is_enabled": body.is_enabled}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("修改危险操作配置失败 user=%s op=%s: %s", user_id, op_type, e)
+        raise HTTPException(status_code=500, detail="修改失败")
+    finally:
+        if conn:
+            await release_connection("mysql", conn)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PUT /tools/{tool_id}  — 修改工具（仅创建者）
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -420,8 +553,6 @@ async def update_tool(
     conn = None
     try:
         conn = await get_connection("mysql", None)
-        if not conn:
-            raise HTTPException(status_code=500, detail="数据库连接失败")
 
         df = await conn.execute_raw(
             "SELECT tool_id, name, owner_user_id, description, visibility, exec_location "
@@ -486,8 +617,6 @@ async def delete_tool(
     conn = None
     try:
         conn = await get_connection("mysql", None)
-        if not conn:
-            raise HTTPException(status_code=500, detail="数据库连接失败")
 
         df = await conn.execute_raw(
             "SELECT tool_id, name, owner_user_id FROM tools WHERE tool_id = :tid AND is_active = 1",

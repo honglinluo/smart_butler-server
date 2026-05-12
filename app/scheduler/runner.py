@@ -1,4 +1,31 @@
-"""异步任务调度器 — asyncio 驱动的定时任务执行引擎。
+"""
+【模块说明】定时任务调度器（Runner）— 系统的"闹钟大脑"
+
+用户可以给 AI 设置定时任务，比如"每天早上 9 点提醒我开会"或"每周一让 AI 自动整理周报"。
+这个模块就是负责在正确的时间触发这些任务的引擎。
+
+【它是怎么工作的？】
+  服务器启动后，这里会开启一个后台循环：
+  1. 每 30 秒醒来一次
+  2. 查询数据库：有没有"应该现在执行"的任务？
+  3. 有的话，立刻异步执行（不会卡住其他任务）
+  4. 执行完后记录结果，计算下一次触发时间，发推送通知给用户
+
+【支持的任务类型】
+  - 一次性任务（only once）：指定某个时间执行一次
+  - 每日（daily）：每天固定时间执行
+  - 每周（weekly）：每周固定某天执行
+  - 每月（monthly）：每月固定某日执行
+  - 工作日（workday）：只在工作日执行，自动识别法定节假日
+  - 周末/节假日（weekend）：只在休息日执行
+  - Cron 表达式（cron）：高级用户可以用"0 9 * * 1-5"这类表达式精确配置
+
+【三种动作类型】
+  - REMINDER：纯提醒，不调用 AI，只推送一条消息给用户
+  - AGENT：让指定的 AI Agent 自动执行一段任务
+  - SYSTEM：系统内部维护任务（用户不可见），如月度记忆归档
+
+异步任务调度器 — asyncio 驱动的定时任务执行引擎。
 
 设计要点：
   - 单一后台协程循环，每 30 秒检查一次到期任务
@@ -323,8 +350,6 @@ class TaskScheduler:
         try:
             from app.database.pool import get_connection, release_connection
             conn = await get_connection("mysql", None)
-            if not conn:
-                return
             rows = await conn.execute_raw(
                 "SELECT * FROM scheduled_tasks WHERE status='active' AND next_run_at IS NULL",
                 {},
