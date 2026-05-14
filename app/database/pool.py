@@ -20,7 +20,7 @@
 
 
 import asyncio
-from typing import Any, Dict, List, Optional, Type, Tuple
+from typing import Any, Dict, List, Literal, Optional, Type, Tuple, overload
 from collections import deque
 from datetime import datetime, timedelta
 import logging
@@ -751,6 +751,12 @@ async def initialize_pools(database_config: Dict[str, Any]) -> bool:
         return False
 
 
+@overload
+async def get_connection(db_type: Literal["mysql"], db_name: Optional[str], timeout: Optional[int] = ...) -> MySQLDatabase: ...
+@overload
+async def get_connection(db_type: Literal["redis"], db_name: Optional[str], timeout: Optional[int] = ...) -> RedisDatabase: ...
+@overload
+async def get_connection(db_type: Literal["elasticsearch"], db_name: Optional[str], timeout: Optional[int] = ...) -> ElasticsearchDatabase: ...
 async def get_connection(db_type: str, db_name: Optional[str], timeout: Optional[int] = None) -> DatabaseBase:
     """
     获取数据库连接。保证返回一个健康可用的连接对象，失败时抛出异常。

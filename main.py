@@ -119,27 +119,53 @@ async def _get_db_embedding_config(system_user_id: str) -> dict:
 async def _upsert_db_embedding_config(
     system_user_id: str, model_name: str, api_url: str
 ) -> None:
-    """将 embedding 模型信息写入 MySQL llms 表（不存在则插入，存在则更新）。"""
+    """将 embedding 模型信息写入 MySQL llms 表（存在则更新，不存在则插入）。
+
+    llms 表没有 (user_id, model_type) 唯一索引，不能用 ON DUPLICATE KEY UPDATE，
+    改为先 SELECT 再 UPDATE/INSERT，同时清理历史重复记录。
+    """
     conn = None
     try:
-        conn = await get_connection("mysql", None)
+        conn = await get_connection("mysql", "agent_db")
         # 确保系统用户存在（user_id = "0"）
         await conn.execute_raw(
-            "INSERT IGNORE INTO user (user_id, username, password) "
+            "INSERT IGNORE INTO users (user_id, username, password) "
             "VALUES (:uid, 'system', 'N/A')",
-            {"uid": system_user_id}
+            {"uid": system_user_id},
         )
-        await conn.execute_raw(
-            """
-            INSERT INTO llms (user_id, url, api_key, model_name, model_type, temperature, state)
-            VALUES (:uid, :url, '', :model, 'embedding', 0, 1)
-            ON DUPLICATE KEY UPDATE url = :url, model_name = :model, state = 1
-            """,
-            {"uid": system_user_id, "url": api_url, "model": model_name}
+
+        # 查询是否已有 embedding 记录
+        existing = await conn.execute_raw(
+            "SELECT id FROM llms "
+            "WHERE user_id = :uid AND model_type = 'embedding' "
+            "ORDER BY id DESC LIMIT 1",
+            {"uid": system_user_id},
         )
-        logger.info(f"DB embedding 配置已更新: model={model_name} url={api_url}")
+
+        if existing is not None and len(existing) > 0:
+            keep_id = int(existing.iloc[0]["id"])
+            # 更新保留的记录
+            await conn.execute_raw(
+                "UPDATE llms SET url = :url, model_name = :model, state = 1, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = :id",
+                {"url": api_url, "model": model_name, "id": keep_id},
+            )
+            # 删除重复记录（历史多插入遗留）
+            await conn.execute_raw(
+                "DELETE FROM llms "
+                "WHERE user_id = :uid AND model_type = 'embedding' AND id != :id",
+                {"uid": system_user_id, "id": keep_id},
+            )
+        else:
+            await conn.execute_raw(
+                "INSERT INTO llms (user_id, url, api_key, model_name, model_type, temperature, state) "
+                "VALUES (:uid, :url, '', :model, 'embedding', 0, 1)",
+                {"uid": system_user_id, "url": api_url, "model": model_name},
+            )
+
+        logger.info("DB embedding 配置已更新: model=%s url=%s", model_name, api_url)
     except Exception as e:
-        logger.warning(f"写入 DB embedding 配置失败: {e}")
+        logger.warning("写入 DB embedding 配置失败: %s", e)
     finally:
         if conn:
             await release_connection("mysql", conn)

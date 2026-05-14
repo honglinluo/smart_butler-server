@@ -21,6 +21,7 @@ import logging
 from typing import Optional
 from fastapi import Depends, HTTPException, Request, status, Header, Query
 from app.database.pool import get_connection, release_connection
+from app.core.hermes_engine import LLMInfo
 from app.core.redis_keys import SESSION_TOKEN, USER_INIT, INIT_TTL_WARN
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ async def get_current_user(
             token = authorization[7:]  # 移除 "Bearer " 前缀
         else:
             token = authorization
-    
+
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -54,7 +55,7 @@ async def get_current_user(
                    "请在 Authorization header 中提供 token，格式: 'Authorization: Bearer <token>' "
                    "或使用 query 参数: '?token=<token>'"
         )
-    
+
     # 从 Redis 验证 token
     redis_conn = await get_connection("redis", None)
 
@@ -130,67 +131,42 @@ async def require_local_or_auth(
 
 async def get_user_model(user: dict = Depends(get_current_user)):
     """
-    【模型加载】从数据库中取出当前用户正在使用的 AI 模型配置。
+    【模型加载】从数据库中取出当前用户正在使用的 AI 模型配置，返回 LLMInfo 对象。
 
     查找逻辑：
-      1. 先查用户自己添加并激活的模型
-      2. 找不到则自动回退到系统预置的默认模型
-      3. 两者都没有则提示用户去"模型管理"页面添加一个
+      a. 读取 users.current_llm_id（用户手动选择的模型 ID）
+      b. 有值则直接读取 llms 表对应记录；无值则读取系统默认模型（user_id='0'）
+      c. 两者都没有则提示用户前往「模型管理」页面创建一个
 
     同时检查用户缓存剩余时间，即将过期时在后台悄悄把用户画像存回数据库。
     """
     user_id = user.get("user_id", "test_user")
 
-    # 模型配置以 MySQL 为准（llms 表 state=1 的最新记录），保证切换模型后立即生效
-    mysql_conn = await get_connection("mysql", None)
-    if mysql_conn:
+    llm_info = await LLMInfo.load(user_id)
+
+    if llm_info is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="未找到可用模型，请前往「模型管理」页面创建一个模型",
+        )
+
+    logger.info("从 MySQL 加载模型配置: user=%s model=%s", user_id, llm_info.model_name)
+
+    # TTL 告警：USER_INIT 即将到期时异步固化画像到 MySQL
+    redis_conn = await get_connection("redis", None)
+    if redis_conn:
         try:
-            sql = (
-                "SELECT url, api_key, model_name, temperature, model_type "
-                "FROM llms WHERE user_id = :user_id AND state = 1 "
-                "AND model_type != 'embedding' "
-                "ORDER BY id DESC LIMIT 1"
-            )
-            # 先查用户自有模型，找不到则回退到系统默认模型（user_id = '0'）
-            df = await mysql_conn.execute_raw(sql, {"user_id": user_id})
-            if (df is None or len(df) == 0) and user_id != "0":
-                logger.info(f"用户 {user_id} 无可用模型，回退到系统默认模型")
-                df = await mysql_conn.execute_raw(sql, {"user_id": "0"})
-
-            if df is not None and len(df) > 0:
-                row = df.iloc[0]
-                model_data = {
-                    "model_name": row["model_name"],
-                    "api_key":    row["api_key"],
-                    "url":        row["url"],
-                    "temperature": float(row["temperature"]) if row.get("temperature") is not None else 0.7,
-                    "model_type": row.get("model_type", "chat"),
-                }
-                logger.info(f"从 MySQL 加载模型配置: {user_id}, model={model_data['model_name']}")
-
-                # TTL 告警：USER_INIT 即将到期时异步固化画像到 MySQL
-                redis_conn = await get_connection("redis", None)
-                if redis_conn:
-                    try:
-                        init_key = USER_INIT.format(user_id=user_id)
-                        ttl = await redis_conn.get_ttl(init_key)
-                        if 0 < ttl < INIT_TTL_WARN:
-                            init_data = await redis_conn.read(init_key)
-                            profile = init_data.get("profile") if isinstance(init_data, dict) else None
-                            if profile:
-                                from app.api.auth import _flush_profile_to_mysql
-                                asyncio.create_task(_flush_profile_to_mysql(user_id, profile))
-                    except Exception:
-                        pass
-                    finally:
-                        await release_connection("redis", redis_conn)
-
-                return model_data
-
-            logger.warning(f"用户 {user_id} 及系统默认均无可用模型")
-        except Exception as e:
-            logger.warning(f"从 MySQL 读取模型配置失败 user={user_id}: {e}")
+            init_key = USER_INIT.format(user_id=user_id)
+            ttl = await redis_conn.get_ttl(init_key)
+            if 0 < ttl < INIT_TTL_WARN:
+                init_data = await redis_conn.read(init_key)
+                profile = init_data.get("profile") if isinstance(init_data, dict) else None
+                if profile:
+                    from app.api.auth import _flush_profile_to_mysql
+                    asyncio.create_task(_flush_profile_to_mysql(user_id, profile))
+        except Exception:
+            logger.error("用户 %s 的画像信息固化失败", user_id)
         finally:
-            await release_connection("mysql", mysql_conn)
+            await release_connection("redis", redis_conn)
 
-    raise HTTPException(status_code=404, detail="未找到可用模型，请先配置模型")
+    return llm_info

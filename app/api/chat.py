@@ -35,7 +35,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from app.api.dependencies import get_current_user, get_user_model, require_local_or_auth
 from app.utils.headers import RequestHeaders, ResponseHeaders
-from app.core.hermes_engine import LLMInfo
+from app.agents.registry import registry as agent_registry
 
 logger = logging.getLogger(__name__)
 
@@ -89,25 +89,22 @@ async def send_message(
     user_id = current_user["user_id"]
     logger.debug("收到聊天请求: user_id=%s message=%r", user_id, chat_data.message)
 
+    # 校验 agent_name 是否当前用户可用
+    if chat_data.agent_name:
+        available = {ag.name for ag in agent_registry.list_available_for_user(user_id)}
+        if chat_data.agent_name not in available:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Agent '{chat_data.agent_name}' 不存在或当前用户无权限使用",
+            )
+
     try:
         # 历史对话由 ContextManager 从 memory:{user_id}:turns 加载，此处无需重复读取
         context = chat_data.context or {}
 
-        # 如果 user_model 是配置字典而不是已构建的 LLM 实例，尝试用 engine 构建模型
-        llm_instance = None
+        # user_model 为 LLMInfo 对象，构建 BaseChatModel 实例
         try:
-            if isinstance(user_model, dict):
-                llm_info = LLMInfo(
-                    user_id=user_id,
-                    url=user_model.get("url", ""),
-                    api_key=user_model.get("api_key", ""),
-                    model_name=user_model.get("model_name", ""),
-                    model_type=user_model.get("model_type", "chat"),
-                    temperature=float(user_model.get("temperature", 0.7)) if user_model.get("temperature") is not None else 0.7,
-                )
-                llm_instance = await engine._build_llm_from_config(llm_info)
-            else:
-                llm_instance = user_model
+            llm_instance = await engine._build_llm_from_config(user_model)
         except Exception:
             llm_instance = None
 
@@ -164,20 +161,18 @@ async def stream_message(
     user_id = current_user["user_id"]
     logger.debug("收到流式聊天请求: user_id=%s message=%r", user_id, chat_data.message)
 
-    llm_instance = None
-    try:
-        if isinstance(user_model, dict):
-            llm_info = LLMInfo(
-                user_id=user_id,
-                url=user_model.get("url", ""),
-                api_key=user_model.get("api_key", ""),
-                model_name=user_model.get("model_name", ""),
-                model_type=user_model.get("model_type", "chat"),
-                temperature=float(user_model.get("temperature", 0.7)) if user_model.get("temperature") is not None else 0.7,
+    # 校验 agent_name 是否当前用户可用
+    if chat_data.agent_name:
+        available = {ag.name for ag in agent_registry.list_available_for_user(user_id)}
+        if chat_data.agent_name not in available:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Agent '{chat_data.agent_name}' 不存在或当前用户无权限使用",
             )
-            llm_instance = await engine._build_llm_from_config(llm_info)
-        else:
-            llm_instance = user_model
+
+    # user_model 为 LLMInfo 对象，构建 BaseChatModel 实例
+    try:
+        llm_instance = await engine._build_llm_from_config(user_model)
     except Exception:
         llm_instance = None
 
@@ -236,25 +231,30 @@ async def respond_consent(
     return {"resolved": resolved, "request_id": body.request_id, "decision": body.decision}
 
 
+class CancelRequest(BaseModel):
+    """取消流式对话时提交的信息。stream_id 由 stream_start 事件携带。"""
+    stream_id: str = Field(..., description="要取消的流式会话 ID（由 stream_start 事件返回）")
+
+
 @router.post("/cancel")
 async def cancel_stream(
-    request: Request,
+    body: CancelRequest,
     response: Response,
     current_user: dict = Depends(get_current_user),
     engine = Depends(get_hermes_engine),
 ):
-    """终止当前用户正在进行的流式对话，并丢弃本轮未保存的内容（恢复到上一次对话状态）。
+    """终止指定 stream_id 的流式对话，丢弃本轮未保存的内容。
 
-    前端在用户点击"停止"按钮时调用此接口。
+    前端在用户点击"停止"按钮时调用此接口，传入 stream_start 事件返回的 stream_id。
+    同一用户多终端同时对话时，取消操作仅影响对应的那一个流。
     服务端设置取消信号 → stream 生成器在下一个检查点停止 → 本轮不写入存储层。
     """
     ResponseHeaders().apply(response)
-    user_id = current_user["user_id"]
-    cancelled = engine.request_cancel(user_id)
+    cancelled = engine.request_cancel(body.stream_id)
     return {
-        "cancelled": cancelled,
-        "user_id":   user_id,
-        "message":   "取消信号已发送" if cancelled else "当前无活跃流式对话",
+        "cancelled":  cancelled,
+        "stream_id":  body.stream_id,
+        "message":    "取消信号已发送" if cancelled else "未找到对应的活跃流式对话",
     }
 
 
@@ -389,24 +389,23 @@ async def upload_content(
     if message:
         engine = getattr(request.app.state, "hermes_engine", None)
         if engine:
+            # 校验 agent_name 是否当前用户可用
+            if agent_name:
+                available = {ag.name for ag in agent_registry.list_available_for_user(user_id)}
+                if agent_name not in available:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Agent '{agent_name}' 不存在或当前用户无权限使用",
+                    )
+
             # 将沙箱摘要注入 context，让 Hermes 感知已处理的内容
             sandbox_summary = _build_sandbox_summary(processed, text_result)
             extra_context   = {"sandbox_results": sandbox_summary}
 
-            llm_instance = None
             try:
-                if isinstance(user_model, dict):
-                    llm_info = LLMInfo(
-                        user_id    = user_id,
-                        url        = user_model.get("url", ""),
-                        api_key    = user_model.get("api_key", ""),
-                        model_name = user_model.get("model_name", ""),
-                        model_type = user_model.get("model_type", "chat"),
-                        temperature= float(user_model.get("temperature", 0.7)),
-                    )
-                    llm_instance = await engine._build_llm_from_config(llm_info)
+                llm_instance = await engine._build_llm_from_config(user_model)
             except Exception:
-                pass
+                llm_instance = None
 
             try:
                 hermes_response = await engine.process_user_input(

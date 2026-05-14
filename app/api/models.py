@@ -17,28 +17,16 @@
 
 
 from typing import Optional, Literal
-from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException, Request, Response, status, Depends
+from fastapi import APIRouter, HTTPException, Response, status, Depends
 from pydantic import BaseModel, Field, field_validator
+from app.core.hermes_engine import _validate_llm_url
 from app.database.pool import get_connection, release_connection
 from app.api.dependencies import get_current_user
 from app.utils.headers import ResponseHeaders
 
 
 router = APIRouter(prefix="/models", tags=["Models"])
-
-
-def _assert_valid_url(url: str) -> str:
-    """校验 URL 必须为合法的 http/https 地址，否则抛出 ValueError。"""
-    if not url or not url.strip():
-        raise ValueError("URL 不能为空")
-    parsed = urlparse(url.strip())
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"URL 必须以 http:// 或 https:// 开头，当前值: {url!r}")
-    if not parsed.netloc:
-        raise ValueError(f"URL 缺少主机地址，当前值: {url!r}")
-    return url.strip()
 
 
 class CreateModel(BaseModel):
@@ -58,7 +46,7 @@ class CreateModel(BaseModel):
     @classmethod
     def validate_url(cls, v: str) -> str:
         try:
-            return _assert_valid_url(v)
+            return _validate_llm_url(v)
         except ValueError as e:
             raise ValueError(str(e)) from e
 
@@ -76,7 +64,7 @@ class UpdateModel(BaseModel):
         if v is None:
             return v
         try:
-            return _assert_valid_url(v)
+            return _validate_llm_url(v)
         except ValueError as e:
             raise ValueError(str(e)) from e
 
@@ -92,14 +80,16 @@ async def _test_model(url: str, api_key: str, model_name: str) -> tuple[bool, st
     返回 (True, "") 表示测试通过；(False, 错误描述) 表示连接失败或响应异常。
     超时时间为 15 秒。
     """
+    import re
     import httpx
 
     base_url = url.rstrip("/")
-    # 兼容 /v1 结尾和不带 /v1 的 URL
-    if not base_url.endswith("/v1"):
-        endpoint = f"{base_url}/v1/chat/completions"
-    else:
+    # 兼容各版本结尾（/v1、/v4 等）和不带版本的 URL；
+    # 若 URL 路径已以 /v{N} 结尾则直接追加 /chat/completions，否则默认加 /v1/
+    if re.search(r"/v\d+(\.\d+)?$", base_url):
         endpoint = f"{base_url}/chat/completions"
+    else:
+        endpoint = f"{base_url}/v1/chat/completions"
 
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -241,15 +231,13 @@ async def update_model(
 
 @router.post("/change", response_model=dict)
 async def change_model(
-    request: Request,
     response: Response,
     change_data: ChangeModel,
     current_user: dict = Depends(get_current_user)
 ):
     """
     切换当前使用的模型。
-    会先把该用户所有自有模型设为"未激活"，再把目标模型设为"激活"，
-    并立即清除引擎缓存，确保下一条消息就用新模型回答。
+    更新 users.current_llm_id，下一条消息立即使用新模型（无本地 LLM 缓存）。
     只能切换自己的模型或系统默认模型，不能使用其他人的私有模型。
     """
     ResponseHeaders().apply(response)
@@ -273,10 +261,6 @@ async def change_model(
             "UPDATE users SET current_llm_id = :model_id WHERE user_id = :user_id",
             {"model_id": change_data.model_id, "user_id": current_user["user_id"]}
         )
-
-        hermes_engine = getattr(request.app.state, "hermes_engine", None)
-        if hermes_engine:
-            hermes_engine.clear_llm_cache(current_user["user_id"])
 
         return {"message": "Model changed successfully"}
 

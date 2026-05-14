@@ -36,6 +36,9 @@ from pydantic import BaseModel, Field
 from app.api.dependencies import get_current_user
 from app.utils.headers import ResponseHeaders
 from app.database.pool import get_connection, release_connection
+from app.agents.base import BaseAgent
+from app.agents.registry import registry
+from app.tools.registry import registry as tool_registry
 
 logger = logging.getLogger(__name__)
 
@@ -79,15 +82,30 @@ class AgentRating(BaseModel):
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
 
+def _validate_tools(tools: List[str], user_id: str) -> None:
+    """校验工具列表：每个工具必须存在于注册表中，且当前用户有权限使用。
+
+    可使用的工具包括：系统内置（code/public）、公开的用户工具（public）
+    以及当前用户自己创建的私有工具（private/owner_user_id == user_id）。
+    """
+    unavailable = []
+    for tool_name in tools:
+        tool = tool_registry.get(tool_name)
+        if tool is None or not tool.is_available_for(user_id):
+            unavailable.append(tool_name)
+    if unavailable:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"以下工具不存在、状态不可用或当前用户无权限使用: {', '.join(unavailable)}",
+        )
+
+
 async def _load_db_agents_to_registry() -> int:
     """
     从数据库读取所有已启用的用户自定义 Agent，并加载到内存注册表中使其可被调用。
     返回成功加载的 Agent 数量。
     通常在服务启动或调用"重新加载"接口时执行。
     """
-    from app.agents.base import BaseAgent
-    from app.agents.registry import registry
-
     conn = await get_connection("mysql", None)
     loaded = 0
     try:
@@ -157,7 +175,6 @@ async def list_agents(response: Response, current_user: dict = Depends(get_curre
     对公开的数据库 Agent 同时附带评分统计信息。
     """
     ResponseHeaders().apply(response)
-    from app.agents.registry import registry
     user_id = current_user["user_id"]
     agents  = registry.list_available_for_user(user_id)
 
@@ -183,9 +200,6 @@ async def create_agent(
     Agent 名称全局唯一，不可重复。
     """
     ResponseHeaders().apply(response)
-    from app.agents.base import BaseAgent
-    from app.agents.registry import registry
-
     user_id = current_user["user_id"]
 
     # 检查名称唯一性
@@ -194,6 +208,10 @@ async def create_agent(
             status_code=400,
             detail=f"Agent 名称 '{data.name}' 已存在",
         )
+
+    # 校验工具列表
+    if data.tools:
+        _validate_tools(data.tools, user_id)
 
     conn = await get_connection("mysql", None)
 
@@ -239,7 +257,6 @@ async def update_agent(
 ):
     """修改自定义 Agent 的职责、背景描述、工具绑定或公开状态。仅 Agent 的创建者有权修改。"""
     ResponseHeaders().apply(response)
-    from app.agents.registry import registry
     user_id = current_user["user_id"]
 
     conn = await get_connection("mysql", None)
@@ -261,6 +278,9 @@ async def update_agent(
         if data.background is not None:
             desc_data["background"] = data.background
         if data.tools is not None:
+            # 校验工具列表
+            if data.tools:
+                _validate_tools(data.tools, user_id)
             desc_data["tools"] = data.tools
 
         await conn.execute_raw(
@@ -303,7 +323,6 @@ async def delete_agent(
     同时从内存注册表中移除，立即生效。仅 Agent 的创建者有权删除。
     """
     ResponseHeaders().apply(response)
-    from app.agents.registry import registry
     user_id = current_user["user_id"]
 
     conn = await get_connection("mysql", None)
@@ -340,7 +359,6 @@ async def rate_agent(
     创建者不能给自己的 Agent 评分，系统内置代码 Agent 不参与评分。
     """
     ResponseHeaders().apply(response)
-    from app.agents.registry import registry
     user_id = current_user["user_id"]
 
     ag = registry.get(agent_name)
@@ -379,7 +397,6 @@ async def get_my_notifications(response: Response, current_user: dict = Depends(
     系统会提醒创建者并推荐同类评分较高的 Agent 供参考改进。
     """
     ResponseHeaders().apply(response)
-    from app.agents.registry import registry
     user_id = current_user["user_id"]
 
     notifications = []
@@ -404,7 +421,7 @@ async def get_my_notifications(response: Response, current_user: dict = Depends(
                     "SELECT a.agent_name, AVG(r.score) AS avg_score, COUNT(r.id) AS cnt "
                     "FROM agents a JOIN agent_ratings r ON a.agent_name = r.agent_name "
                     "WHERE a.`public` = 1 AND a.state = 1 "
-                    "  AND a.agent_name != :name AND a.job LIKE :kw "
+                    "AND a.agent_name != :name AND a.job LIKE :kw "
                     "GROUP BY a.agent_name HAVING avg_score >= :threshold ORDER BY avg_score DESC LIMIT 3",
                     {
                         "name": name,
@@ -441,7 +458,6 @@ async def reload_code_agents(response: Response, current_user: dict = Depends(ge
     同时重新加载所有 DB Agent。
     """
     ResponseHeaders().apply(response)
-    from app.agents.registry import registry
 
     # 1. 扫描 workers 目录，重新导入模块（触发 @agent 装饰器）
     workers_dir = os.path.join(os.path.dirname(__file__), "../agents/workers")
@@ -469,4 +485,3 @@ async def reload_code_agents(response: Response, current_user: dict = Depends(ge
         "db_agents_loaded": db_count,
         "registered":       registry.names(),
     }
-

@@ -51,6 +51,7 @@ import re
 import secrets
 from datetime import datetime
 from typing import Any, Optional
+from phonenumbers import parse, is_valid_number
 
 import bcrypt
 from fastapi import APIRouter, HTTPException, Request, Response, status, Depends
@@ -110,7 +111,6 @@ class PhoneStr:
     @classmethod
     def _validate(cls, value: str, /) -> str:
         try:
-            from phonenumbers import parse, is_valid_number
             p = parse(str(value).strip(), "CN")
             if is_valid_number(p):
                 return str(value).strip()
@@ -315,11 +315,22 @@ async def _consume_nonce(nonce: str, redis_conn) -> None:
 
 async def _load_user_init_data(user_id: str, redis_conn) -> None:
     """
-    用户登录成功后，把用户画像（偏好、个人信息等）从数据库预加载到内存缓存（Redis）中。
-    这样后续对话中 AI 可以快速读取用户信息，无需每次都查询数据库，加快响应速度。
-    """
-    mysql_conn = await get_connection("mysql", "agent_db")
+    用户登录成功后预热用户画像缓存（Redis）。
 
+    若 Redis 中已存在该用户的画像（另一平台已登录且可能有更新数据），
+    则跳过 MySQL 加载，避免旧数据覆盖新数据。
+    只有 Redis 中不存在时才从 MySQL 读取并写入 Redis。
+    """
+    init_key = USER_INIT.format(user_id=user_id)
+
+    # Redis 中已有画像 → 另一平台正在使用，直接续期 TTL，不覆盖
+    existing = await redis_conn.read(init_key)
+    if existing is not None:
+        logger.info("[auth] 用户画像已在 Redis 中，跳过 MySQL 加载 user=%s", user_id)
+        await redis_conn.create(init_key, existing, ttl=INIT_TTL)
+        return
+
+    mysql_conn = await get_connection("mysql", "agent_db")
     try:
         profile: dict = {}
         df_p = await mysql_conn.execute_raw(
@@ -330,11 +341,8 @@ async def _load_user_init_data(user_id: str, redis_conn) -> None:
             raw     = df_p.iloc[0]["profile"]
             profile = json.loads(raw) if isinstance(raw, str) else (raw or {})
 
-        await redis_conn.create(
-            USER_INIT.format(user_id=user_id),
-            {"profile": profile},
-            ttl=INIT_TTL,
-        )
+        await redis_conn.create(init_key, {"profile": profile}, ttl=INIT_TTL)
+        logger.info("[auth] 用户画像已从 MySQL 加载到 Redis user=%s", user_id)
     finally:
         await release_connection("mysql", mysql_conn)
 
@@ -385,8 +393,8 @@ async def get_public_key(response: Response):
             ttl=AUTH_NONCE_TTL,
         )
         return PublicKeyResponse(
-            public_key_pem=get_public_key_pem(),
-            key_nonce     =nonce,
+            public_key_pem= get_public_key_pem(),
+            key_nonce     = nonce,
         )
     finally:
         await release_connection("redis", redis_conn)
@@ -577,15 +585,19 @@ async def logout(request: Request, response: Response, current_user: dict = Depe
             if dead_tokens:
                 client.srem(sessions_key, *dead_tokens)
 
-        # 3. 所有平台退出 → 固化画像 + 同步 ES
+        # 3. 所有平台退出 → 固化画像 + 同步 ES + 清理 Redis 画像
         if remaining_valid == 0:
             logger.info("[logout] 用户 %s 所有 session 已退出，开始固化数据", user_id)
-            init_data = await redis_conn.read(USER_INIT.format(user_id=user_id))
+            init_key  = USER_INIT.format(user_id=user_id)
+            init_data = await redis_conn.read(init_key)
             if isinstance(init_data, dict):
                 profile = init_data.get("profile")
                 if profile:
                     await _flush_profile_to_mysql(user_id, profile)
                     logger.info("[logout] 用户画像已固化到 MySQL user=%s", user_id)
+                # 画像已持久化，清理 Redis 中的副本
+                await redis_conn.delete(init_key)
+                logger.info("[logout] Redis 用户画像已清理 user=%s", user_id)
 
             memory_manager = getattr(request.app.state, "memory_manager", None)
             if memory_manager:

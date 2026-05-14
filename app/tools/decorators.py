@@ -18,10 +18,9 @@
       async def execute(self, params, context):
           ...  # 实现工具的具体逻辑
 
-工具装饰器 — @tool 声明式注册服务端工具。
-"""
+【工具装饰器】 — @tool 声明式注册服务端工具。
 
-示例::
+示例:
 
     from app.tools.decorators import tool
     from app.tools.base import BaseTool, EXEC_SERVER, VIS_PUBLIC

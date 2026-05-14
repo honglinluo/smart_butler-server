@@ -2,8 +2,127 @@
 
 **项目**：smart_butler-server（`/home/seven/smart_butler-server`）
 **语言**：Python 3 / FastAPI / LangChain + LangGraph
-**最后更新**：2026-05-12
-**当前版本**：v2.10
+**最后更新**：2026-05-15
+**当前版本**：v2.11
+
+---
+
+## v2.11 — 2026-05-15：API 层精化 + LLM 重试与故障恢复
+
+### 1. Agent 创建/更新：工具可用性校验
+
+**问题**：`create_agent` / `update_agent` 保存工具列表时不验证工具是否存在，导致配置了不存在或无权限工具的 Agent 在运行时报错。
+
+**修复**（`app/api/agents_api.py`）：
+
+- 新增 `_validate_tools(tools, user_id)` 函数，对工具列表中的每个 `tool_name` 查询注册表，不存在或当前用户无权限则统一报错 `HTTP 400`
+- 将 `BaseAgent`、`registry`、`tool_registry` 从方法内懒导入提升为模块级导入
+
+---
+
+### 2. 多平台登录：画像缓存保护
+
+**问题**：同一用户从第二台设备登录时，`_load_user_init_data()` 无条件从 MySQL 加载并覆盖 Redis 中已有的画像，导致第一台设备的运行时画像更新丢失。
+
+**修复**（`app/api/auth.py`）：
+
+- `_load_user_init_data()` 先读取 Redis，已有画像则只续期 TTL 跳过 MySQL 加载
+- `phonenumbers` 导入提升到模块级（避免高频请求时重复导入开销）
+
+---
+
+### 3. 消息接口：Agent 可用性校验 + LLM 构建简化
+
+**修复**（`app/api/chat.py`）：
+
+| 变更项 | 说明 |
+| --- | --- |
+| `agent_name` 校验 | `send_message` / `stream_message` 均在处理前验证 `agent_name` 对当前用户可用，不可用返回 `HTTP 400` |
+| LLM 构建简化 | 删除 `isinstance(user_model, dict)` 分支，`get_user_model` 已保证返回 `LLMInfo`，统一调用 `engine._build_llm_from_config(user_model)` |
+| `cancel_stream` 精确取消 | 引入 `CancelRequest(stream_id)` 模型，按 `stream_id` 而非 `user_id` 发送取消信号，支持同一用户多端并发对话时精准停止指定流 |
+
+---
+
+### 4. 模型加载路径统一
+
+**修复**（`app/api/dependencies.py`）：
+
+- `get_user_model` 重构：删除内联 MySQL 查询，改为调用 `LLMInfo.load(user_id)`，与 hermes_engine 内部逻辑保持一致
+- `LLMInfo` 提升为模块级导入
+
+---
+
+### 5. 模型 URL 校验去重 + 版本后缀兼容
+
+**修复**（`app/api/models.py`）：
+
+| 变更项 | 说明 |
+| --- | --- |
+| 删除 `_assert_valid_url()` | 与 `hermes_engine._validate_llm_url()` 逻辑完全重复；Pydantic validator 改为懒加载导入后者，避免启动时引入 hermes_engine 的重量级依赖 |
+| `_test_model` 版本兼容 | 原代码硬编码 `/v1/chat/completions`；改用 `re.search(r"/v\d+(\.\d+)?$", base_url)` 检测 URL 末尾版本号，有则直接拼 `/chat/completions`，否则默认补 `/v1/`；兼容 GLM `/v4`、DeepSeek `/v3` 等非 v1 接口 |
+
+---
+
+### 6. LLM 重试与故障恢复
+
+**背景**：LLM 非 200 响应时引擎直接跳到下一步，既浪费已完成的 pipeline 工作，也无法让用户从中断点续跑。
+
+**修改**（`app/core/hermes_engine.py`）：
+
+#### 6.1 可重试错误类型
+
+模块顶部新增 `_LLM_RETRYABLE_ERRORS` 元组，覆盖：
+
+- `httpx`：`ConnectError` / `ConnectTimeout` / `TimeoutException` / `HTTPStatusError`
+- `openai`：`APIConnectionError` / `APITimeoutError` / `APIStatusError`
+
+新增 `_LLMRetryExhausted(RuntimeError)` 异常，携带 `llm_message: str` 属性。
+
+#### 6.2 三处重试循环
+
+| 方法 | 重试策略 |
+| --- | --- |
+| `_generate_llm_response` | 3 次，失败间隔 2s / 4s，全部失败抛 `_LLMRetryExhausted` |
+| `_generate_llm_response_stream` | 同上（非 200 在首个 chunk 前发生，重试安全） |
+| `_execute_worker_with_tools` | 同上（`graph.ainvoke` 外层） |
+
+#### 6.3 新增辅助方法
+
+| 方法 | 说明 |
+| --- | --- |
+| `_fmt_llm_error(exc)` | 解析 HTTP 响应体 JSON（`error.message` → `message` → 原始文本），限 300 字 |
+| `_save_llm_failure(user_id, pending_input, completed_content, llm_message)` | 将失败状态写入 Redis key `llm:failure:{user_id}`，TTL 30 分钟 |
+| `_load_llm_failure(user_id)` | 一次性读取并删除该 key（防止重复使用） |
+
+#### 6.4 流式路径故障处理
+
+`process_user_input_stream._run()` 三处修改：
+
+1. **开头「继续」检测**：检测到 `user_input in ("继续", "continue")` 且 Redis 有故障状态时，恢复原始输入并注入 `context["_resume_hint"]`（含已完成内容提示）
+2. **Pipeline 异常**：`_execute_pipeline()` 用 `try/except _LLMRetryExhausted` + `finally`（确保 consent hook 重置），失败后推送 `llm_failure` SSE 事件并异步保存故障状态
+3. **流式 LLM 异常**：stream 生成器内同样捕获 `_LLMRetryExhausted`，保存状态并推送 `llm_failure` 事件后 return
+
+#### 6.5 非流式路径
+
+`process_user_input` 在通用 `except Exception` 之前加 `except _LLMRetryExhausted`，返回 `"LLM 访问失败，{llm_message}"`。
+
+#### 6.6 故障恢复流程
+
+```text
+[用户请求] → LLM 3次重试均失败
+    ↓
+推送 SSE llm_failure { message, hint:"输入「继续」可恢复" }
+    ↓
+Redis llm:failure:{user_id} 保存 { pending_input, completed_content, failed_reason }
+    ↓
+用户发送「继续」
+    ↓
+_load_llm_failure() 读取并删除 key
+    ↓
+恢复原始 user_input + _resume_hint 注入 context
+    ↓
+正常走 pipeline 流程，LLM 续跑未完成工作
+```
 
 ---
 
@@ -16,6 +135,7 @@
 **根因**：`grant_conversation()` 以 `(tool_name, operation, turn_id)` 为 key 仅授权特定工具的特定操作，未能覆盖本轮全部危险操作。
 
 **修复**（`app/tools/permission.py`）：
+
 - 新增 `_conversation_blanket: Set[str]` 集合，以 `turn_id` 为 key
 - 新增 `grant_conversation_all(turn_id)` 方法，一次性放行本轮所有危险操作
 - `check_consented()` 在逐 op 检查前优先检测 `turn_id in _conversation_blanket`
@@ -49,6 +169,7 @@
 **问题**：每次工具调用都触发 `_is_op_enabled()` 查询 `dangerous_op_configs` 表，高频工具调用场景下 MySQL 压力明显。
 
 **修复**（`app/tools/permission.py`）：
+
 - 新增 `_op_enabled_cache: Dict[Tuple[str,str], Tuple[bool,float]]` 模块级缓存，TTL 60 秒
 - 新增 `_invalidate_op_cache(user_id, operation)` 供外部失效
 
@@ -66,6 +187,7 @@
 | `consent_decision()` | 亮黄 (`consent`) | 用户授权弹窗决策记录（tool、operation、decision） |
 
 **接入**（`app/core/hermes_engine.py`）：
+
 - `_run()` 起始记录 `_turn_start = time.monotonic()`
 - 保存 turn 前调用 `_bus.conversation_turn(...)` 输出轮次摘要
 - `_consent_hook` 决策后调用 `_bus.consent_decision(...)`
@@ -150,7 +272,7 @@ CREATE TABLE IF NOT EXISTS `dangerous_op_configs` (
 
 ### 5. 流程图
 
-```
+```text
 工具触发危险操作
     ↓
 check_consented() → 未授权
@@ -230,6 +352,7 @@ consent_respond() resolve Future
 | TP01 | `task_planner.py` 提示词区 | 3 套任务分解提示词（`DECOMPOSE_SYSTEM` / `_DECOMPOSE_SYSTEM` in router / `L1_DECOMPOSE_SYSTEM`）语义重叠，随版本独立漂移 |
 
 **修复建议**（待后续实施）：
+
 - WA01：`BaseAgent` 增加 `_build_context_messages(context)` 钩子，Worker 只需实现该钩子
 - RA01：`RouterAgent` 提取 `_invoke_json(messages, fallback, llm)` 辅助方法
 - HE01：`hermes_engine.py` 直接 import 并复用 `_RegistryToolAdapter`

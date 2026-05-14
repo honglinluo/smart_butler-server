@@ -49,17 +49,29 @@ from typing import Dict, List, Any, Optional, Callable, Coroutine, Tuple
 try:
     import httpx as _httpx
     _HTTPX_CONNECT_ERRORS = (_httpx.ConnectError, _httpx.ConnectTimeout, _httpx.TimeoutException)
+    _HTTPX_STATUS_ERRORS  = (_httpx.HTTPStatusError,)
 except ImportError:
     _HTTPX_CONNECT_ERRORS = (OSError,)
+    _HTTPX_STATUS_ERRORS  = ()
 
 try:
-    from openai import APIConnectionError as _OAIConnectionError, APITimeoutError as _OAITimeoutError
+    from openai import (
+        APIConnectionError as _OAIConnectionError,
+        APITimeoutError    as _OAITimeoutError,
+        APIStatusError     as _OAIStatusError,
+    )
     _OPENAI_CONNECT_ERRORS = (_OAIConnectionError, _OAITimeoutError)
+    _OPENAI_STATUS_ERRORS  = (_OAIStatusError,)
 except ImportError:
     _OPENAI_CONNECT_ERRORS = ()
+    _OPENAI_STATUS_ERRORS  = ()
 
-# 所有"LLM 端点无法连接"的异常类型，统一用于 except 子句
+# 所有"LLM 端点无法连接"的异常类型（含超时），统一用于 except 子句
 _LLM_CONNECT_ERRORS = _HTTPX_CONNECT_ERRORS + _OPENAI_CONNECT_ERRORS
+# LLM API 返回 HTTP 非 200 状态码时的异常类型
+_LLM_HTTP_ERRORS    = _HTTPX_STATUS_ERRORS + _OPENAI_STATUS_ERRORS
+# 所有可重试的 LLM 调用异常（连接失败 + 非 200 响应）
+_LLM_RETRYABLE_ERRORS = _LLM_CONNECT_ERRORS + _LLM_HTTP_ERRORS
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
@@ -86,6 +98,13 @@ from app.core.context_manager import ContextManager
 from app.rag import RagPipeline
 
 logger = logging.getLogger(__name__)
+
+
+class _LLMRetryExhausted(RuntimeError):
+    """LLM 调用经 3 次重试全部失败后抛出，携带最后一次错误消息。"""
+    def __init__(self, llm_message: str):
+        super().__init__(llm_message)
+        self.llm_message = llm_message
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -413,7 +432,7 @@ class LLMInfo:
         except Exception as e:
             logger.error(f"构建 LLM 模型失败: {e}")
             return None
-    
+
 
 class AgentExecutorCache:
     """AgentExecutor 缓存管理类。使用 LangGraph 的新 API。"""
@@ -527,7 +546,7 @@ class AgentExecutorCache:
 class HermesEngine:
     """
     Hermes 编排引擎 - 基于 LangChain 的多智能体协调引擎
-    
+
     核心职责:
     1. LLM 生命周期管理 (创建、缓存、销毁)
     2. 代理生命周期管理 (初始化、执行、销毁)
@@ -536,33 +555,33 @@ class HermesEngine:
     5. Agent 执行流程 (使用 LangChain AgentExecutor)
     6. 上下文传递 (在代理间流转状态)
     """
-    
+
     def __init__(self, config: Dict[str, Any]):
         """
         初始化 Hermes 引擎
-        
+
         Args:
             config: 系统配置
         """
         self.config = config
         self.config_loader = ConfigLoader("config")
-        
+
         # LLM 管理
-        self.llm_cache: Dict[str, BaseChatModel] = {}  # 用户 LLM 缓存
+        self.llm_cache: Dict[str, BaseChatModel] = {}  # 保留字段，不再用于用户请求缓存
         self.default_llm: Optional[BaseChatModel] = None  # 默认 LLM
-        
+
         # 代理管理
         self.router_agent: Optional[RouterAgent] = None
         self.agents: Dict[str, Any] = {}
         self.agent_executors: Dict[str, Any] = {}  # LangChain AgentExecutor 缓存
-        
+
         # 配置管理
         self.worker_configs: Dict[str, Dict[str, Any]] = {}
         self.tool_configs: Dict[str, Dict[str, Any]] = {}
         self.agents_config: Dict[str, Any] = {}
         self.agent_config: Dict[str, Any] = {}
         self.intent_agent_mapping: Dict[str, str] = {}
-        
+
         # 工具管理
         self.loaded_tool_functions: Dict[str, Any] = {}
         self.langchain_tools: Dict[str, BaseTool] = {}  # LangChain Tool 对象缓存
@@ -570,7 +589,7 @@ class HermesEngine:
         self.agent_graphs: Dict[str, Any] = {}  # LangGraph 代理图缓存
         # 聊天记录存储
         self.chat_history = ChatHistoryStore()
-        # 流式取消信号（每用户一个 Event）
+        # 流式取消信号（每个流式会话一个 Event，key=stream_id）
         self._cancel_signals: Dict[str, asyncio.Event] = {}
         # 已取消的 turn_id 集合（阻止 _save_turn_async 写入）
         self._cancelled_turns: set = set()
@@ -803,13 +822,13 @@ class HermesEngine:
     ) -> str:
         """
         处理用户输入的主流程
-        
+
         Args:
             user_id: 用户 ID
             user_input: 用户输入文本
             context: 上下文信息 (历史消息、检索结果等)
             llm: 可选的 LangChain 模型实例，如果已从 Redis 加载
-            
+
         Returns:
             str: 最终回复文本
         """
@@ -817,7 +836,7 @@ class HermesEngine:
             raise RuntimeError("Router agent has not been initialized")
 
         if llm is None:
-            llm = await self._get_user_llm(user_id)
+            llm = await self._build_user_llm(user_id)
 
         if llm is None:
             logger.error(f"无法为用户 {user_id} 获取 LLM")
@@ -1021,6 +1040,9 @@ class HermesEngine:
             logger.info(f"用户输入处理完成 (user_id={user_id})")
             logger.debug(f"生成回复: {response}")
             return response
+        except _LLMRetryExhausted as e:
+            logger.error("LLM 重试耗尽 user=%s: %s", user_id, e.llm_message)
+            return f"LLM 访问失败，{e.llm_message}"
         except Exception as e:
             logger.error(f"处理用户输入失败: {e}")
             return "处理请求时发生错误，请稍后重试。"
@@ -1028,48 +1050,20 @@ class HermesEngine:
             if _ns_turn_id:
                 _end_turn(_ns_turn_id)
 
-    async def _get_user_llm(self, user_id: str) -> Optional[BaseChatModel]:
-        """
-        获取用户 LLM - 支持缓存和动态加载
-        
-        Args:
-            user_id: 用户 ID
-            
-        Returns:
-            BaseChatModel: LangChain 聊天模型，或 None
-        """
-        # 检查缓存
-        if user_id in self.llm_cache:
-            return self.llm_cache[user_id]
-        
-        # 从数据库加载 LLM 信息
-        llm_info = await self._load_llm_info(user_id)
-        if not llm_info:
-            logger.warning(f"未找到用户 {user_id} 的 LLM 配置，尝试使用默认模型")
-            if self.default_llm:
-                self.llm_cache[user_id] = self.default_llm
-                return self.default_llm
-            
-            # 加载默认用户的 LLM
-            llm_info = await self._load_llm_info("0")
-            if not llm_info:
-                logger.error("未找到任何 LLM 模型配置")
-                return None
-
-        # 根据配置构建 LLM
-        llm = await self._build_llm_from_config(llm_info)
-        if llm:
-            self.llm_cache[user_id] = llm
-        
-        return llm
+    async def _build_user_llm(self, user_id: str) -> Optional[BaseChatModel]:
+        """从 MySQL 动态加载用户 LLM 配置并构建 ChatModel 实例，不使用本地缓存。"""
+        llm_info = await LLMInfo.load(user_id)
+        if llm_info is None:
+            return None
+        return await self._build_llm_from_config(llm_info)
 
     async def _load_llm_info(self, user_id: str) -> Optional[LLMInfo]:
         """
         从数据库加载用户 LLM 配置信息
-        
+
         Args:
             user_id: 用户 ID
-            
+
         Returns:
             LLMInfo: LLM 信息对象
         """
@@ -1110,33 +1104,85 @@ class HermesEngine:
             return None
 
     def clear_llm_cache(self, user_id: Optional[str] = None) -> None:
-        """
-        清空 LLM 缓存
+        """已废弃：LLM 不再缓存，此方法保留以兼容旧调用方。"""
 
-        Args:
-            user_id: 指定用户 ID，如果为 None 则清空所有缓存
-        """
-        if user_id:
-            if user_id in self.llm_cache:
-                del self.llm_cache[user_id]
-                logger.info(f"已清空用户 {user_id} 的 LLM 缓存")
-        else:
-            self.llm_cache.clear()
-            logger.info("已清空所有 LLM 缓存")
+    @staticmethod
+    def _fmt_llm_error(exc: Exception) -> str:
+        """从 LLM API 异常中提取人读错误消息（优先解析 JSON body）。"""
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            try:
+                data = resp.json() if callable(getattr(resp, "json", None)) else {}
+                err = data.get("error", {})
+                if isinstance(err, dict):
+                    msg = err.get("message", "")
+                    if msg:
+                        return str(msg)[:300]
+                body_msg = data.get("message", "")
+                if body_msg:
+                    return str(body_msg)[:300]
+            except Exception:
+                pass
+            text = getattr(resp, "text", "") or ""
+            return text[:300]
+        return str(exc)[:300]
 
-    def request_cancel(self, user_id: str) -> bool:
-        """请求终止用户当前进行中的流式对话。
+    async def _save_llm_failure(
+        self,
+        user_id: str,
+        pending_input: str,
+        completed_content: str,
+        llm_message: str,
+    ) -> None:
+        """将 LLM 失败状态保存到 Redis（TTL 30 分钟），供用户发送「继续」时恢复。"""
+        conn = await get_connection("redis", None)
+        if conn is None:
+            return
+        try:
+            data = {
+                "pending_input":     pending_input,
+                "completed_content": completed_content,
+                "failed_reason":     llm_message,
+                "timestamp":         datetime.now().isoformat(),
+            }
+            await conn.create(f"llm:failure:{user_id}", data, ttl=1800)
+            logger.info("已保存 LLM 失败状态 user=%s input=%r", user_id, pending_input[:50])
+        except Exception as e:
+            logger.error("保存 LLM 失败状态异常: %s", e)
+        finally:
+            await release_connection("redis", conn)
 
-        设置取消信号后，stream 生成器将在下一个检查点停止，
-        并阻止本轮对话写入存储层（实现"恢复到上一次对话状态"）。
+    async def _load_llm_failure(self, user_id: str) -> Optional[dict]:
+        """从 Redis 加载 LLM 失败状态，加载后立即删除（仅允许使用一次）。"""
+        conn = await get_connection("redis", None)
+        if conn is None:
+            return None
+        try:
+            key = f"llm:failure:{user_id}"
+            data = await conn.read(key)
+            if isinstance(data, dict):
+                await conn.delete(key)
+                return data
+            return None
+        except Exception as e:
+            logger.error("加载 LLM 失败状态异常: %s", e)
+            return None
+        finally:
+            await release_connection("redis", conn)
+
+    def request_cancel(self, stream_id: str) -> bool:
+        """请求终止指定流式会话。
+
+        每个 SSE 流在启动时生成唯一 stream_id，仅终止该 stream_id 对应的流，
+        不影响同一用户其他终端正在进行的对话。
 
         Returns:
-            bool: True 表示有活跃流且已发送取消信号，False 表示无活跃流。
+            bool: True 表示找到活跃流且已发送取消信号，False 表示未找到。
         """
-        ev = self._cancel_signals.get(user_id)
+        ev = self._cancel_signals.get(stream_id)
         if ev is not None:
             ev.set()
-            logger.info("已发送取消信号 user=%s", user_id)
+            logger.info("已发送取消信号 stream_id=%s", stream_id)
             return True
         return False
 
@@ -1161,11 +1207,11 @@ class HermesEngine:
     async def call_tool(self, tool_name: str, **kwargs) -> Any:
         """
         调用工具 (基于 LangChain Tool)
-        
+
         Args:
             tool_name: 工具名称
             **kwargs: 工具参数
-            
+
         Returns:
             Any: 工具执行结果
         """
@@ -1174,15 +1220,15 @@ class HermesEngine:
             # 加载工具函数
             tool_func = self._load_tool_function(tool_name)
             tool_config = self.tool_configs.get(tool_name)
-            
+
             if tool_func is None or tool_config is None:
                 logger.warning(f"工具加载失败: {tool_name}")
                 return None
-            
+
             # 将函数包装为 LangChain Tool
             langchain_tool = LangChainToolWrapper(tool_name, tool_func, tool_config)
             self.langchain_tools[tool_name] = langchain_tool
-        
+
         try:
             tool = self.langchain_tools[tool_name]
             # 如果参数为字典，使用 invoke；如果有单个参数，转换为字典
@@ -1242,7 +1288,7 @@ class HermesEngine:
         if user_id not in self.agent_executor_caches:
             self.agent_executor_caches[user_id] = AgentExecutorCache(
                 user_id=user_id,
-                llm_factory=self._get_user_llm,
+                llm_factory=self._build_user_llm,
                 tool_loader=self._load_tool_function,
                 db_alias=None,
             )
@@ -1263,11 +1309,11 @@ class HermesEngine:
 
         results: List[str] = []
         tool_ids = worker_config.get("tools", []) or []
-        
+
         for task in tasks:
             task_desc = task.get("description", "")
             results.append(f"任务: {task_desc}")
-            
+
             for tool_id in tool_ids:
                 tool_result = await self.call_tool(
                     tool_id,
@@ -1444,9 +1490,23 @@ class HermesEngine:
                 task_desc = task_desc[:task_desc.index(_TRS_MARKER)]
 
             logger.debug("LangGraph调用: worker=%s task_desc=%r", worker_name, task_desc[:120])
-            raw = await graph.ainvoke(
-                {"messages": [HumanMessage(content=f"请执行以下任务: {task_desc}")]}
-            )
+            _invoke_msg = {"messages": [HumanMessage(content=f"请执行以下任务: {task_desc}")]}
+            _last_ag_err = ""
+            for _attempt in range(3):
+                try:
+                    raw = await graph.ainvoke(_invoke_msg)
+                    _last_ag_err = ""
+                    break
+                except _LLM_RETRYABLE_ERRORS as _e:
+                    _last_ag_err = self._fmt_llm_error(_e)
+                    logger.warning(
+                        "Agent LLM 调用失败 (第 %d/3 次) agent=%s: %s",
+                        _attempt + 1, worker_name, _last_ag_err,
+                    )
+                    if _attempt < 2:
+                        await asyncio.sleep(2.0 * (_attempt + 1))
+            if _last_ag_err:
+                raise _LLMRetryExhausted(_last_ag_err)
 
             messages   = raw.get("messages", []) if isinstance(raw, dict) else []
             tool_steps = self._extract_tool_steps(messages)
@@ -1475,6 +1535,8 @@ class HermesEngine:
 
             return result_str, tool_steps
 
+        except _LLMRetryExhausted:
+            raise  # 重试耗尽，终止整条流
         except Exception as e:
             logger.error(f"LangGraph 执行失败: {e}", exc_info=True)
             result = await self._execute_worker(worker_name, tasks, user_id, context)
@@ -1493,9 +1555,9 @@ class HermesEngine:
     ) -> str:
         """
         使用 LangChain ChatModel 生成最终回复 (基于 LCEL)
-        
+
         使用 LangChain Expression Language (LCEL) 构建高效的处理链
-        
+
         Args:
             llm: LangChain 聊天模型
             user_id: 用户 ID
@@ -1505,7 +1567,7 @@ class HermesEngine:
             context: 上下文
             agent_name: 代理名称
             tool_results: 工具执行结果
-            
+
         Returns:
             str: 生成的回复
         """
@@ -1537,15 +1599,14 @@ class HermesEngine:
             system_prompt = ChatPromptTemplate.from_messages([
                 ("system", base_sys_prompt),
                 ("human", """{user_input}
+                    当前任务:
+                    {tasks_summary}
 
-当前任务:
-{tasks_summary}
+                    工具执行结果:
+                    {tool_results_summary}
 
-工具执行结果:
-{tool_results_summary}
-
-背景信息:
-{context_summary}"""),
+                    背景信息:
+                    {context_summary}"""),
             ])
 
             # 准备上下文变量
@@ -1576,8 +1637,8 @@ class HermesEngine:
             if tool_results:
                 logger.debug("工具结果: %s", tool_results_summary)
 
-            # 调用链 (使用异步)
-            response = await chain.ainvoke({
+            # 调用链（含 3 次重试，针对 LLM 返回非 200 或连接失败的场景）
+            _payload = {
                 "agent_name":           agent_name,
                 "user_id":              user_id,
                 "intent":               intent,
@@ -1586,15 +1647,29 @@ class HermesEngine:
                 "tool_results_summary": tool_results_summary,
                 "context_summary":      context_summary,
                 "memory_section":       memory_section,
-            })
-            
+            }
+            _last_err = ""
+            for _attempt in range(3):
+                try:
+                    response = await chain.ainvoke(_payload)
+                    _last_err = ""
+                    break
+                except _LLM_RETRYABLE_ERRORS as _e:
+                    _last_err = self._fmt_llm_error(_e)
+                    logger.warning(
+                        "LLM 调用失败 (第 %d/3 次) user=%s: %s", _attempt + 1, user_id, _last_err
+                    )
+                    if _attempt < 2:
+                        await asyncio.sleep(2.0 * (_attempt + 1))
+            if _last_err:
+                raise _LLMRetryExhausted(_last_err)
+
             logger.info(f"LLM 已生成回复 (user_id={user_id}, agent={agent_name}, intent={intent})")
             logger.debug("LLM输出 user=%s len=%d:\n%s", user_id, len(response), response)
             return response
-            
-        except _LLM_CONNECT_ERRORS as e:
-            logger.warning("LLM 端点连接失败 user=%s: %s", user_id, e)
-            return "LLM 服务端点无法连接，请检查服务是否启动。"
+
+        except _LLMRetryExhausted:
+            raise  # 传播到调用方，由上层决定如何处理
         except Exception as e:
             logger.error(f"LLM 生成回复失败: {e}")
             return "LLM 生成失败，请稍后重试。"
@@ -1651,19 +1726,34 @@ class HermesEngine:
             memory_section = memory_text if memory_text else ""
 
             chain: Runnable = system_prompt | llm | StrOutputParser()
-            async for chunk in chain.astream({
-                "agent_name":    agent_name,
-                "user_id":       user_id,
-                "intent":        intent,
-                "user_input":    user_input,
-                "tasks_summary": tasks_summary,
+            _stream_payload = {
+                "agent_name":      agent_name,
+                "user_id":         user_id,
+                "intent":          intent,
+                "user_input":      user_input,
+                "tasks_summary":   tasks_summary,
                 "context_summary": context_summary,
-                "memory_section": memory_section,
-            }):
-                yield chunk
-        except _LLM_CONNECT_ERRORS as e:
-            logger.warning("流式 LLM 端点连接失败 user=%s: %s", user_id, e)
-            yield "LLM 服务端点无法连接，请检查服务是否启动。"
+                "memory_section":  memory_section,
+            }
+            # 3 次重试（非 200 / 连接失败场景下，error 发生在流开始前，重试安全）
+            _last_err = ""
+            for _attempt in range(3):
+                try:
+                    async for chunk in chain.astream(_stream_payload):
+                        yield chunk
+                    _last_err = ""
+                    break
+                except _LLM_RETRYABLE_ERRORS as _e:
+                    _last_err = self._fmt_llm_error(_e)
+                    logger.warning(
+                        "流式 LLM 失败 (第 %d/3 次) user=%s: %s", _attempt + 1, user_id, _last_err
+                    )
+                    if _attempt < 2:
+                        await asyncio.sleep(2.0 * (_attempt + 1))
+            if _last_err:
+                raise _LLMRetryExhausted(_last_err)
+        except _LLMRetryExhausted:
+            raise  # 传播到 process_user_input_stream._run() 的消费方
         except Exception as e:
             logger.error(f"流式 LLM 生成失败: {e}")
             yield "LLM 生成失败，请稍后重试。"
@@ -1697,14 +1787,16 @@ class HermesEngine:
             return
 
         if llm is None:
-            llm = await self._get_user_llm(user_id)
+            llm = await self._build_user_llm(user_id)
         if llm is None:
             yield 'event: error\ndata: {"message": "LLM unavailable"}\n\n'
             return
 
-        # ── 取消信号（每用户一个 Event，每次请求重置） ──────────────────────────
-        cancel_ev = self._cancel_signals.setdefault(user_id, asyncio.Event())
-        cancel_ev.clear()
+        # ── 取消信号（每个流唯一 stream_id，互相隔离） ─────────────────────────
+        stream_id = uuid.uuid4().hex
+        cancel_ev = asyncio.Event()
+        self._cancel_signals[stream_id] = cancel_ev
+        yield f'event: stream_start\ndata: {{"stream_id": "{stream_id}"}}\n\n'
 
         # ── 进度队列：所有进度事件（含 token）均经此队列流出 ─────────────────────
         q: asyncio.Queue = asyncio.Queue(maxsize=500)
@@ -1719,6 +1811,25 @@ class HermesEngine:
             _start_turn(turn_id)
             _turn_start = _time.monotonic()
             try:
+                # ── 检测「继续」命令，恢复上次 LLM 失败的中断任务 ───────────────
+                if user_input.strip() in ("继续", "continue"):
+                    _failure = await self._load_llm_failure(user_id)
+                    if _failure:
+                        _orig_input = _failure.get("pending_input", "")
+                        _completed  = _failure.get("completed_content", "")
+                        if _orig_input:
+                            logger.info(
+                                "检测到「继续」命令，恢复中断任务 user=%s input=%r",
+                                user_id, _orig_input[:60],
+                            )
+                            user_input = _orig_input
+                            if _completed and isinstance(context, dict):
+                                context = dict(context)
+                                context["_resume_hint"] = (
+                                    f"上次因 LLM 故障中断，已完成部分：\n{_completed[:500]}\n\n"
+                                    "请继续完成剩余工作。"
+                                )
+
                 from app.utils.log_bus import get_bus as _get_bus
                 _bus = _get_bus()
                 _ctx_pre = context if isinstance(context, dict) else {}
@@ -1869,7 +1980,9 @@ class HermesEngine:
                 _hook_token  = set_consent_hook(_consent_hook)
                 _turn_token  = set_consent_turn_id(turn_id)
 
+                pipeline_response = ""
                 agent_outputs: List[Dict[str, str]] = []
+                _pipeline_llm_err: Optional[_LLMRetryExhausted] = None
                 try:
                     if pipeline and target_agent != self.router_agent.name:
                         pipeline_response, agent_outputs = await self._execute_pipeline(
@@ -1877,11 +1990,21 @@ class HermesEngine:
                             user_id=user_id, llm=llm, context=ctx,
                             dispatch_id=dispatch_id, user_input=user_input,
                         )
-                    else:
-                        pipeline_response = ""
+                except _LLMRetryExhausted as _le:
+                    _pipeline_llm_err = _le
                 finally:
                     _CONSENT_HOOK.reset(_hook_token)
                     _CONSENT_TURN_ID.reset(_turn_token)
+
+                if _pipeline_llm_err is not None:
+                    asyncio.create_task(self._save_llm_failure(
+                        user_id, user_input, pipeline_response, _pipeline_llm_err.llm_message
+                    ))
+                    q.put_nowait({"event": "llm_failure", "data": {
+                        "message": f"LLM 访问失败，{_pipeline_llm_err.llm_message}",
+                        "hint":    "输入「继续」可恢复未完成的任务",
+                    }})
+                    return
 
                 # ── 最终 LLM 流式输出 ─────────────────────────────────────────────
                 if cancel_ev.is_set():
@@ -1911,13 +2034,25 @@ class HermesEngine:
                     agent_name=target_agent,
                 )
 
-                async for chunk in stream_gen:
-                    if cancel_ev.is_set():
-                        break
-                    visible = scrubber.feed(chunk)
-                    if visible:
-                        full_response_parts.append(visible)
-                        q.put_nowait({"event": "token", "data": {"text": visible}})
+                try:
+                    async for chunk in stream_gen:
+                        if cancel_ev.is_set():
+                            break
+                        visible = scrubber.feed(chunk)
+                        if visible:
+                            full_response_parts.append(visible)
+                            q.put_nowait({"event": "token", "data": {"text": visible}})
+                except _LLMRetryExhausted as _le:
+                    asyncio.create_task(self._save_llm_failure(
+                        user_id, user_input,
+                        pipeline_response or "".join(full_response_parts),
+                        _le.llm_message,
+                    ))
+                    q.put_nowait({"event": "llm_failure", "data": {
+                        "message": f"LLM 访问失败，{_le.llm_message}",
+                        "hint":    "输入「继续」可恢复未完成的任务",
+                    }})
+                    return
 
                 trailing = scrubber.flush()
                 if trailing and not cancel_ev.is_set():
@@ -1972,7 +2107,7 @@ class HermesEngine:
                 q.put_nowait({"event": "error", "data": {"message": str(e)}})
             finally:
                 _end_turn(turn_id)
-                self._cancel_signals.pop(user_id, None)
+                self._cancel_signals.pop(stream_id, None)
                 q.put_nowait(None)  # 哨兵：通知生成器退出
 
         # 后台任务继承当前 context（含 ContextVar 进度队列）
@@ -2493,7 +2628,7 @@ class HermesEngine:
     async def shutdown(self) -> None:
         """
         关闭引擎，清理资源 (基于 LangChain)
-        
+
         清理:
         - 代理缓存
         - LLM 缓存
@@ -2504,26 +2639,26 @@ class HermesEngine:
             # 清理 LangChain Tools
             self.langchain_tools.clear()
             logger.info("已清理 LangChain Tool 缓存")
-            
+
             # 清理 LLM 缓存
             self.llm_cache.clear()
             logger.info("已清理 LLM 缓存")
-            
+
             # 清理 LangGraph 代理图
             self.agent_graphs.clear()
             logger.info("已清理 LangGraph 代理图")
-            
+
             # 清理 AgentExecutor 缓存
             self.agent_executor_caches.clear()
             logger.info("已清理 AgentExecutor 缓存")
-            
+
             # 清理其他缓存
             self.agents.clear()
             self.worker_configs.clear()
             self.tool_configs.clear()
             self.loaded_tool_functions.clear()
             self.intent_agent_mapping.clear()
-            
+
             logger.info("Hermes 引擎已关闭并释放所有资源 ✓")
         except Exception as e:
             logger.error(f"引擎关闭过程中出错: {e}")
