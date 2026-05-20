@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import List
 
 from app.agents.loop.events import BuiltTool, ToolCodeRequest
-from app.core.paths import PROJECT_ROOT
+from app.utils.paths import PROJECT_ROOT
 
 logger = logging.getLogger("agent_loop.tool_builder")
 

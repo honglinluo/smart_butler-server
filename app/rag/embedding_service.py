@@ -52,9 +52,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import httpx
-
-# Chunk 数据类和切片逻辑已迁移至 app.rag.chunker，此处保留向后兼容导出
-from app.rag.chunker import Chunk, TurnChunker  # noqa: F401
+from app.rag.chunker import Chunk, TurnChunker
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +74,7 @@ class EmbeddingService:
         # 切片器：委托给 app.rag.chunker.TurnChunker，此处保留 chunk_turn() 向后兼容接口
         self._chunker = TurnChunker(self.chunk_size, self.chunk_overlap)
 
-    # ── 可用性 ─────────────────────────────────────────────────
+    # ── 可用性 ─────────────────────────────────────────────────────────────
 
     @property
     def enabled(self) -> bool:
@@ -251,8 +249,6 @@ class EmbeddingService:
                 results.append(await self.embed(t))
         return results
 
-    # ── 文本切片（向后兼容接口，实现已迁移至 app.rag.chunker.TurnChunker）──
-
     def chunk_turn(
         self,
         user_input:         str,
@@ -267,6 +263,3 @@ class EmbeddingService:
             agent_outputs=agent_outputs,
         )
 
-
-# 向后兼容别名
-OllamaEmbeddingService = EmbeddingService

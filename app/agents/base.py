@@ -40,7 +40,7 @@ from langchain_core.tools import BaseTool as LCBaseTool
 from pydantic import PrivateAttr, Field, create_model
 
 from app.database.pool import get_connection, release_connection
-from app.core.paths import PROJECT_ROOT
+from app.utils.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -245,10 +245,17 @@ class BaseAgent:
                         context["_file_skills"] = file_skills
                 except Exception:
                     pass
+                t0      = time.monotonic()
+                success = False
                 try:
-                    return await _f(self, task, context, llm)
+                    result  = await _f(self, task, context, llm)
+                    success = result.get("success", True) if isinstance(result, dict) else True
+                    return result
+                except Exception:
+                    raise
                 finally:
-                    self._record_call()
+                    elapsed = (time.monotonic() - t0) * 1000
+                    self._record_call(success=success, latency_ms=elapsed)
 
             cls.execute = _auto_execute
 
@@ -376,6 +383,8 @@ class BaseAgent:
         if llm is None:
             return {"result": "LLM 未配置，无法执行任务", "success": False, "metadata": {}}
 
+        t0      = time.monotonic()
+        success = False
         try:
             try:
                 from app.skills.loader import load_skills_text
@@ -403,7 +412,6 @@ class BaseAgent:
                         history_lines.append(f"助手: {a}")
 
             # ── L2 拆分：任务复杂时先分解再按步执行 ─────────────────────────
-            t0 = time.monotonic()
             if len(task_desc) >= self._L2_DECOMPOSE_THRESHOLD:
                 result_text, l2_meta = await self._execute_with_l2(
                     task_desc, user_id, lc_tools, system_prompt, history_lines, llm, context,
@@ -419,13 +427,13 @@ class BaseAgent:
                 )
                 l2_meta = {}
 
+            elapsed = (time.monotonic() - t0) * 1000
             from app.utils.log_bus import get_bus
-            get_bus().llm_output(
-                user_id, self.name, result_text, (time.monotonic() - t0) * 1000,
-            )
+            get_bus().llm_output(user_id, self.name, result_text, elapsed)
             await self.update_skill(task_desc[:50], result_text, success=True)
             logger.debug("Agent 执行完成: name=%s tools=%d task_len=%d",
                          self.name, len(lc_tools), len(task_desc))
+            success = True
             return {
                 "result":   result_text,
                 "success":  True,
@@ -437,7 +445,7 @@ class BaseAgent:
             return {"result": f"执行出错: {e}", "success": False, "metadata": {}}
 
         finally:
-            self._record_call()
+            self._record_call(success=success, latency_ms=(time.monotonic() - t0) * 1000)
 
     async def _ask_llm_fix_step(
         self,
@@ -542,7 +550,11 @@ class BaseAgent:
                 )
                 return result, {"l2_steps": 0, "l2_fallback": True}
 
-            logger.info("[L2] agent=%s 第 %d 轮任务已拆分为 %d 步", self.name, agent_iteration + 1, len(steps))
+            logger.info(
+                "[L2] agent=%s 第 %d 轮任务已拆分为 %d 步:\n%s",
+                self.name, agent_iteration + 1, len(steps),
+                "\n".join(f"  {s.task_id}: {s.content[:120]}" for s in steps),
+            )
 
             step_results: List[str] = []
             completed_ids = []
@@ -972,26 +984,38 @@ class BaseAgent:
 
     # ── 调用统计（私有）────────────────────────────────────────────
 
-    def _record_call(self) -> None:
+    def _record_call(self, success: bool = True, latency_ms: float = 0.0) -> None:
         """后台记录一次调用，不阻塞主流程。由 __init_subclass__ 自动触发，无需手动调用。"""
-        asyncio.create_task(self._do_record_call())
+        asyncio.create_task(self._do_record_call(success=success, latency_ms=latency_ms))
 
-    async def _do_record_call(self) -> None:
+    async def _do_record_call(self, success: bool = True, latency_ms: float = 0.0) -> None:
         conn = None
         try:
             conn = await get_connection("mysql", None)
         except Exception:
-            return
+            conn = None
+        if conn:
+            try:
+                await conn.execute_raw(
+                    "INSERT INTO agent_call_stats (agent_name, source, called_at) "
+                    "VALUES (:name, :src, :ts)",
+                    {"name": self.name, "src": self.source, "ts": datetime.now()},
+                )
+            except Exception as e:
+                logger.debug("记录调用统计失败: %s", e)
+            finally:
+                await release_connection("mysql", conn)
+
+        # ── 评分埋点 ─────────────────────────────────────────────────────────
         try:
-            await conn.execute_raw(
-                "INSERT INTO agent_call_stats (agent_name, source, called_at) "
-                "VALUES (:name, :src, :ts)",
-                {"name": self.name, "src": self.source, "ts": datetime.now()},
+            from app.scoring.manager import get_scoring_manager
+            await get_scoring_manager().record_agent_call(
+                agent_name=self.name,
+                success=success,
+                latency_ms=latency_ms,
             )
-        except Exception as e:
-            logger.debug("记录调用统计失败: %s", e)
-        finally:
-            await release_connection("mysql", conn)
+        except Exception as _se:
+            logger.debug("agent 评分记录失败 agent=%s: %s", self.name, _se)
 
     # ── 元信息 ──────────────────────────────────────────────────────
 

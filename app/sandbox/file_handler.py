@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from app.core.paths import PROJECT_ROOT
+from app.utils.paths import PROJECT_ROOT
 from app.core.file_storage import UPLOAD_ROOT, SUBDIR_UPLOADS
 from app.sandbox.executor import SandboxExecutor, SandboxResult, sandbox
 from app.sandbox.scanner import CodeBlock, ContentScanner, ScanResult, scanner

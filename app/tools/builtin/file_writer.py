@@ -52,7 +52,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from app.core.paths import PROJECT_ROOT
+from app.utils.paths import PROJECT_ROOT
 from app.core.file_storage import UPLOAD_ROOT, MAX_FILE_SIZE, SUBDIR_GENERATED
 from app.tools.base import BaseTool, EXEC_SERVER, VIS_PUBLIC
 

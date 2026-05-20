@@ -66,8 +66,8 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.database.pool import get_connection, release_connection
-from app.core.redis_keys import MEMORY_TURNS as _KEY_TURNS, MEMORY_TOTAL as _KEY_TOTAL, USER_INIT, INIT_TTL
-from app.core.paths import PROJECT_ROOT
+from app.database.redis_keys import MEMORY_TURNS as _KEY_TURNS, MEMORY_TOTAL as _KEY_TOTAL, USER_INIT, INIT_TTL
+from app.utils.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -215,9 +215,10 @@ class MemoryArchiverAgent:
                         summary_turn["assistant_response"],
                     )
                 )
-            asyncio.create_task(
-                memory_manager._mysql_init_ref(user_id, summary_turn_id)
-            )
+            if hasattr(memory_manager, "_mysql_init_ref"):
+                asyncio.create_task(
+                    memory_manager._mysql_init_ref(user_id, summary_turn_id)
+                )
 
             logger.info(
                 f"[MemoryArchiver] 归档完成 user={user_id}: "
@@ -353,9 +354,10 @@ class MemoryArchiverAgent:
                 await self._resume_deleting_es(
                     job_id, user_id, compressed_turn_ids, vector_store
                 )
-                asyncio.create_task(
-                    memory_manager._mysql_init_ref(user_id, summary_turn_id)
-                )
+                if hasattr(memory_manager, "_mysql_init_ref"):
+                    asyncio.create_task(
+                        memory_manager._mysql_init_ref(user_id, summary_turn_id)
+                    )
 
             elif status == self._S_REPLACING_REDIS:
                 # ES 摘要已确认写入，只是 Redis 替换未完成
@@ -368,9 +370,10 @@ class MemoryArchiverAgent:
                 await self._resume_deleting_es(
                     job_id, user_id, compressed_turn_ids, vector_store
                 )
-                asyncio.create_task(
-                    memory_manager._mysql_init_ref(user_id, summary_turn_id)
-                )
+                if hasattr(memory_manager, "_mysql_init_ref"):
+                    asyncio.create_task(
+                        memory_manager._mysql_init_ref(user_id, summary_turn_id)
+                    )
 
             elif status == self._S_DELETING_ES:
                 # Redis 已替换，摘要安全，仅需重试旧数据删除

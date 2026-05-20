@@ -23,7 +23,7 @@ from app.database import (
     ConnectionPoolManager,
     pool_manager,
 )
-from app.core.paths import PROJECT_ROOT
+from app.utils.paths import PROJECT_ROOT
 
 def _read_log_cfg() -> dict:
     try:

@@ -52,6 +52,7 @@ from typing import Any, Callable, Dict, Optional, Set, Tuple
 from app.database.pool import get_connection, release_connection
 from app.tools.base import (
     CONSENT_ALWAYS, CONSENT_CONVERSATION, CONSENT_ONCE, CONSENT_PROJECT, CONSENT_SESSION,
+    CRITICAL_OPS,
 )
 
 logger = logging.getLogger(__name__)
@@ -154,8 +155,9 @@ class ConsentManager:
         if turn_id and _conversation_cache.get((tool_name, operation, turn_id)):
             return True
 
-        # 3. session 级别（内存缓存）
-        if session_id and _session_cache.get((tool_name, operation, session_id)):
+        # 3. session 级别（内存缓存）— 极危险操作不适用，需逐次手动确认
+        if session_id and operation not in CRITICAL_OPS \
+                and _session_cache.get((tool_name, operation, session_id)):
             return True
 
         # 4. project / always 级别（MySQL 持久化）

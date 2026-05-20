@@ -93,8 +93,7 @@ from app.agents.router import RouterAgent
 from app.agents.base import _RegistryToolAdapter
 from app.core.config_loader import ConfigLoader
 from app.database.pool import get_connection, release_connection
-from app.core.chat_history_store import ChatHistoryStore
-from app.core.context_manager import ContextManager
+from app.memory.backends.vectordb.chat_history_store import ChatHistoryStore
 from app.rag import RagPipeline
 
 logger = logging.getLogger(__name__)
@@ -401,6 +400,12 @@ class LLMInfo:
         return "openai"
 
     def to_model_kwargs(self) -> Dict[str, Any]:
+        # 超时优先级：环境变量 LLM_TIMEOUT > 模型类型默认值
+        # max_retries=0：禁用 SDK 内部重试，统一由 hermes_engine 的重试循环管理，
+        # 避免"SDK 重试 × engine 重试"的组合导致最坏情况等待时间成倍放大
+        _default_timeout = 120.0 if self._is_ollama() else 120.0
+        _timeout = float(os.getenv("LLM_TIMEOUT", _default_timeout))
+
         if self._is_ollama():
             base_url = self.url.rstrip("/")
             if base_url.endswith("/v1"):
@@ -411,16 +416,16 @@ class LLMInfo:
                 "base_url": base_url + "/v1",
                 "api_key": self.api_key or "ollama",
                 "temperature": self.temperature,
-                "timeout": 120.0,   # Ollama 本地模型冷启动较慢
-                "max_retries": 1,
+                "timeout": _timeout,
+                "max_retries": 0,
             }
         kwargs: Dict[str, Any] = {
             "model": self.model_name,
             "model_provider": self.provider,
             "temperature": self.temperature,
             "api_key": self.api_key,
-            "timeout": 60.0,
-            "max_retries": 1,
+            "timeout": _timeout,
+            "max_retries": 0,
         }
         if self.provider == "openai" and self.url:
             kwargs["base_url"] = self.url
@@ -595,8 +600,6 @@ class HermesEngine:
         self._cancelled_turns: set = set()
         # 危险操作授权等待 Future：request_id -> Future[str]
         self._consent_futures: Dict[str, asyncio.Future] = {}
-        # 上下文管理器（兼容保留；主链路已由 RagPipeline 取代）
-        self.context_manager: Optional[ContextManager] = None
         # 记忆管理器（由 set_memory_manager() 注入）
         self.memory_manager = None
         # RAG 流水线（由 set_rag_pipeline() 注入，负责检索/索引/重向量化）
@@ -709,21 +712,14 @@ class HermesEngine:
         )
 
     def set_memory_manager(self, memory_manager) -> None:
-        """注入 MemoryManager 并创建 ContextManager（兼容保留）。"""
+        """注入 MemoryManager。"""
         self.memory_manager = memory_manager
-        self.context_manager = ContextManager(memory_manager, self.config)
         if self.default_llm and hasattr(memory_manager, "set_default_llm"):
             memory_manager.set_default_llm(self.default_llm)
 
     def set_rag_pipeline(self, rag_pipeline: "RagPipeline") -> None:
-        """注入 RagPipeline（由 main.py 在 VectorStore 初始化后调用）。
-
-        注入后 process_user_input / process_user_input_stream 均走 RagPipeline 路径。
-        同时将 rag_pipeline 注入 ContextManager，使兜底路径也能受益。
-        """
+        """注入 RagPipeline（由 main.py 在 VectorStore 初始化后调用）。"""
         self.rag_pipeline = rag_pipeline
-        if self.context_manager is not None:
-            self.context_manager.set_rag_pipeline(rag_pipeline)
         logger.info("RagPipeline 已注入 HermesEngine")
         # 实例化并注入 MemoryArchiverAgent（系统内置，不注册到 registry）
         if hasattr(self.memory_manager, "set_archiver"):
@@ -855,7 +851,7 @@ class HermesEngine:
             _start_turn(turn_id)
 
             # 使用 RagPipeline 组装上下文（检索 + 历史加载 + 相关性过滤）
-            _rag_source = self.rag_pipeline or self.context_manager
+            _rag_source = self.rag_pipeline
             if _rag_source is not None:
                 try:
                     bundle  = await _rag_source.build_context(
@@ -1806,6 +1802,7 @@ class HermesEngine:
 
         # ── 后台处理任务：执行完整 pipeline 并将所有事件放入队列 ─────────────────
         async def _run() -> None:
+            nonlocal user_input, context
             import time as _time
             from app.utils.log_setup import start_turn as _start_turn, end_turn as _end_turn
             _start_turn(turn_id)
@@ -1837,7 +1834,7 @@ class HermesEngine:
 
                 # ── RAG 上下文组装 ──────────────────────────────────────────────
                 ctx = context
-                _rag_source = self.rag_pipeline or self.context_manager
+                _rag_source = self.rag_pipeline
                 if _rag_source is not None:
                     try:
                         bundle = await _rag_source.build_context(
@@ -1923,7 +1920,7 @@ class HermesEngine:
                     set_consent_hook, set_consent_turn_id, consent_manager,
                     _CONSENT_HOOK, _CONSENT_TURN_ID,
                 )
-                from app.tools.base import ConsentRequiredException
+                from app.tools.base import ConsentRequiredException, CONSENT_SESSION
 
                 # 每轮请求独立的串行化锁：保证并行 agent 或多工具调用时
                 # 同一时刻只有一个授权弹窗处于等待状态，避免授权冲突。
@@ -1964,7 +1961,14 @@ class HermesEngine:
                         finally:
                             self._consent_futures.pop(exc.request_id, None)
 
-                        if decision == "conversation":
+                        if decision == "session":
+                            # 会话级别授权：一般危险操作本会话内不再询问
+                            # 极危险操作（CRITICAL_OPS）由 check_consented 跳过 session 缓存，仍会弹窗
+                            await consent_manager.grant_consent(
+                                exc.tool_name, exc.operation, exc.user_id,
+                                CONSENT_SESSION, session_id=exc.session_id,
+                            )
+                        elif decision == "conversation":
                             # 全量放行本轮所有危险操作，后续弹窗不再出现
                             consent_manager.grant_conversation_all(turn_id)
                         # "allow": 一次性允许，工具直接执行，无需持久化
@@ -2433,17 +2437,19 @@ class HermesEngine:
         llm: Any,
         context: Dict[str, Any],
         dispatch_id: str,
-    ) -> Tuple[str, List[Dict[str, str]]]:
+    ) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, str]]]:
         """串行执行 Agent，每步校验结果后再继续。
 
-        返回: (last_result, agent_outputs)
-          agent_outputs 包含每一步的输出，供向量切片各步独立索引（req 2）。
+        返回: (last_result, agent_outputs, break_info)
+          break_info 非 None 表示流水线提前中断，包含 issue/suggestion，
+          供调用方直接触发重规划而无需再调用 judge_overall_result。
         """
         from app.utils import progress_bus as _pb
 
         accumulated   = dict(context)
         last_result   = ""
         agent_outputs: List[Dict[str, Any]] = []
+        break_info: Optional[Dict[str, str]] = None
 
         for i, step in enumerate(pipeline):
             _pb.push("agent_start", {"step": step["step"], "agent_name": step["agent_name"]})
@@ -2474,12 +2480,10 @@ class HermesEngine:
             last_result = result
 
             if not is_last:
-                next_task  = pipeline[i + 1]["task"]
                 validation = await self.router_agent.validate_step_result(
-                    agent_name    =step["agent_name"],
-                    task_desc     =step["task"].get("description", ""),
-                    result        =result,
-                    next_task_desc=next_task.get("description", ""),
+                    agent_name=step["agent_name"],
+                    task_desc =step["task"].get("description", ""),
+                    result    =result,
                     llm=llm,
                 )
                 if not validation.get("can_proceed", True):
@@ -2487,9 +2491,13 @@ class HermesEngine:
                         "串行流水线在步骤 %d 中断: agent=%s issue=%s",
                         i, step["agent_name"], validation.get("issue", ""),
                     )
+                    break_info = {
+                        "issue":      validation.get("issue", "串行流水线提前中断"),
+                        "suggestion": validation.get("suggestion", ""),
+                    }
                     break
 
-        return last_result, agent_outputs
+        return last_result, agent_outputs, break_info
 
     async def _execute_pipeline(
         self,
@@ -2515,6 +2523,7 @@ class HermesEngine:
         MAX_ROUTER_ITERATIONS = 3
         result       = ""
         agent_outputs: List[Dict[str, str]] = []
+        serial_break: Optional[Dict[str, str]] = None
 
         if not pipeline:
             result = await self._generate_llm_response(
@@ -2544,7 +2553,7 @@ class HermesEngine:
                     pipeline, intent, user_id, llm, context, dispatch_id
                 )
             elif mode == "serial":
-                result, agent_outputs = await self._execute_serial(
+                result, agent_outputs, serial_break = await self._execute_serial(
                     pipeline, user_id, llm, context, dispatch_id
                 )
             else:
@@ -2575,9 +2584,16 @@ class HermesEngine:
                 {"agent": ao["agent_name"], "result": ao["output"]}
                 for ao in agent_outputs
             ]
-            judgment = await self.router_agent.judge_overall_result(
-                user_input, pipeline_results, llm
-            )
+            # 串行流水线提前中断时，验证器已给出明确失败原因，
+            # 直接复用该结果触发重规划，无需再调用 judge_overall_result
+            # （避免 LLM 把残缺输出误判为 satisfied=True）
+            if mode == "serial" and serial_break:
+                judgment = {"satisfied": False, **serial_break}
+                serial_break = None
+            else:
+                judgment = await self.router_agent.judge_overall_result(
+                    user_input, pipeline_results, llm
+                )
             if judgment.get("satisfied", True):
                 logger.debug(
                     "[Pipeline] 第 %d 轮结果满足用户期望，退出循环",

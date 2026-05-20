@@ -34,6 +34,7 @@ from app.tools.base import (
     CONSENT_PROJECT,
     CONSENT_ALWAYS,
     DANGEROUS_OPS,
+    CRITICAL_OPS,
 )
 from app.tools.decorators import tool
 from app.tools.registry import registry
@@ -53,4 +54,5 @@ __all__ = [
     "SRC_CODE", "SRC_USER", "SRC_AGENT",
     "CONSENT_ONCE", "CONSENT_SESSION", "CONSENT_PROJECT", "CONSENT_ALWAYS",
     "DANGEROUS_OPS",
+    "CRITICAL_OPS",
 ]

@@ -60,7 +60,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
-from app.core.paths import PROJECT_ROOT
+from app.utils.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 

@@ -22,7 +22,7 @@ from typing import Optional
 from fastapi import Depends, HTTPException, Request, status, Header, Query
 from app.database.pool import get_connection, release_connection
 from app.core.hermes_engine import LLMInfo
-from app.core.redis_keys import SESSION_TOKEN, USER_INIT, INIT_TTL_WARN
+from app.database.redis_keys import SESSION_TOKEN, USER_INIT, INIT_TTL_WARN
 
 logger = logging.getLogger(__name__)
 

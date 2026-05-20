@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from app.core.paths import PROJECT_ROOT
+from app.utils.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 

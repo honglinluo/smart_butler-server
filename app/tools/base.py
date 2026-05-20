@@ -90,9 +90,17 @@ DANGEROUS_OPS: FrozenSet[str] = frozenset({
     "cli",           # 本地 CLI 命令
     "write",         # 写文件/写数据库
     "admin",         # 管理员操作
-    "sudo",         # 提权操作
+    "sudo",          # 提权操作
     "execute_code",  # 执行任意代码
     # "network",       # 外发网络请求（隐私相关）
+})
+
+# 极危险操作：即使用户选择"当前会话同意"也需要逐次手动确认
+CRITICAL_OPS: FrozenSet[str] = frozenset({
+    "delete",        # 删除文件/数据（不可逆）
+    "admin",         # 管理员权限操作
+    "sudo",          # 提权操作
+    # "execute_code",  # 执行任意代码
 })
 
 
@@ -141,9 +149,7 @@ class ConsentRequiredException(Exception):
             "user_id":    self.user_id,
             "session_id": self.session_id,
             "request_id": self.request_id,
-            "consent_options": [
-                CONSENT_ONCE, CONSENT_SESSION, CONSENT_PROJECT, CONSENT_ALWAYS
-            ],
+            "consent_options": ["allow", "deny", "session"],
         }
 
     def __str__(self) -> str:
@@ -248,13 +254,15 @@ class BaseTool:
 
                 # ── 3. 执行工具 ──────────────────────────────────
                 start = time.monotonic()
-                success = False
-                error_info: Optional[str] = None
+                success          = False
+                error_info:      Optional[str] = None
+                consent_required = False
                 try:
                     result  = await _f(self, params, context)
                     success = result.get("success", True) if isinstance(result, dict) else True
                     return result
                 except ConsentRequiredException:
+                    consent_required = True
                     raise
                 except Exception as e:
                     error_info = str(e)[:500]
@@ -263,7 +271,7 @@ class BaseTool:
                 finally:
                     elapsed_ms = int((time.monotonic() - start) * 1000)
                     asyncio.create_task(
-                        self._record_call(context, success, elapsed_ms, error_info)
+                        self._record_call(context, success, elapsed_ms, error_info, consent_required)
                     )
 
             cls.execute = _wrapped_execute
@@ -356,12 +364,13 @@ class BaseTool:
 
     async def _record_call(
         self,
-        context:    Dict[str, Any],
-        success:    bool,
-        exec_ms:    int,
-        error_info: Optional[str],
+        context:          Dict[str, Any],
+        success:          bool,
+        exec_ms:          int,
+        error_info:       Optional[str],
+        consent_required: bool = False,
     ) -> None:
-        """将一次调用记录异步写入 tool_call_stats，不阻塞主流程。"""
+        """将一次调用记录异步写入 tool_call_stats，并更新评分统计。"""
         conn = None
         try:
             conn = await get_connection("mysql", None)
@@ -387,6 +396,18 @@ class BaseTool:
         finally:
             if conn:
                 await release_connection("mysql", conn)
+
+        # ── 评分埋点 ─────────────────────────────────────────────────────────
+        try:
+            from app.scoring.manager import get_scoring_manager
+            await get_scoring_manager().record_tool_call(
+                tool_name=self.name,
+                success=success,
+                latency_ms=float(exec_ms),
+                consent_required=consent_required,
+            )
+        except Exception as _se:
+            logger.debug("工具评分记录失败 tool=%s: %s", self.name, _se)
 
     # ── 持久化（user/agent 来源工具写入数据库）──────────────────────────────
 

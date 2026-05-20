@@ -24,15 +24,13 @@
 """
 
 from pathlib import Path
-
-from app.core.paths import PROJECT_ROOT
+from app.utils.paths import PROJECT_ROOT
+from app.core.config_loader import ConfigLoader
 
 
 def _read_config():
     try:
-        import yaml
-        with open(PROJECT_ROOT / "config" / "system_config.yaml", "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        cfg = ConfigLoader(str(PROJECT_ROOT / "config")).get_system_config()
         s = cfg.get("file_storage", {})
         root      = (PROJECT_ROOT / s.get("upload_dir", "data/uploads")).resolve()
         max_bytes = int(s.get("max_file_size_mb", 50)) * 1024 * 1024

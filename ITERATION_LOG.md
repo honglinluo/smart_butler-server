@@ -2,8 +2,127 @@
 
 **项目**：smart_butler-server（`/home/seven/smart_butler-server`）
 **语言**：Python 3 / FastAPI / LangChain + LangGraph
-**最后更新**：2026-05-15
-**当前版本**：v2.11
+**最后更新**：2026-05-21
+**当前版本**：v2.12
+
+---
+
+## v2.12 — 2026-05-21：架构分层重组 + 评分系统 + Task 模型强化
+
+### 1. app/core/ 精简 — 模块归位
+
+将 `app/core/` 中职责不清的文件迁移到更合理的目录，减少核心层的耦合：
+
+| 原路径 | 新路径 | 说明 |
+| --- | --- | --- |
+| `app/core/paths.py` | `app/utils/paths.py` | `PROJECT_ROOT` 是工具类常量，不属于业务核心 |
+| `app/core/redis_keys.py` | `app/database/redis_keys.py` | Redis key 与数据库层同属基础设施 |
+| `app/core/embedding_service.py` | `app/rag/embedding_service.py` | Embedding 是 RAG 组件 |
+| `app/core/memory_manager.py` | `app/memory/backends/vectordb/` | 向量数据库后端实现迁入记忆系统分层 |
+| `app/core/chat_history_store.py` | `app/memory/backends/` | 对话存储后端实现 |
+| `app/core/context_manager.py` | — | 功能已完全整合至 `app/rag/` 和 `app/memory/` |
+
+全项目 25+ 个文件的导入路径同步更新，无向后兼容垫片。
+
+`app/core/file_storage.py`：`_read_config()` 改为调用 `ConfigLoader(str(PROJECT_ROOT / "config")).get_system_config()`，不再直接 `with open` 读取 YAML。
+
+---
+
+### 2. app/memory/ — 记忆系统抽象层
+
+**新增文件**：
+
+| 文件 | 职责 |
+| --- | --- |
+| `base.py` | `MemoryBackend` + `RagBackend` 两个 ABC；hermes_engine / RagPipeline 依赖接口而非实现 |
+| `factory.py` | 根据环境变量 `MEMORY_BACKEND`（`filesystem` / `vectordb`）选择并实例化后端 |
+| `backends/vectordb/memory_manager.py` | 原 `app/core/memory_manager.py` 迁移，实现 `MemoryBackend` |
+| `backends/vectordb/chat_history_store.py` | 原 `app/core/chat_history_store.py` 迁移，实现 `ChatHistoryBackend` |
+| `backends/filesystem/backend.py` | 纯文件系统存储后端（无 Redis/MySQL/ES 依赖） |
+
+`MemoryBackend` 必须实现：`store_turn` / `get_recent_turns` / `retrieve_memory`，其余方法提供无操作默认实现。
+
+---
+
+### 3. app/scoring/ — 新评分模块
+
+对 Agent 和 Tool 的调用效果进行持续追踪，量化质量评估：
+
+**新增文件**：
+
+| 文件 | 职责 |
+| --- | --- |
+| `models.py` | `AgentStats` / `ToolStats` / `ScoreWeights` / `AgentScore` / `ToolScore` 数据模型 |
+| `algorithm.py` | `compute_agent_score` / `compute_tool_score`：成功率 × 延迟 × 质量 × 调用频率加权计算 |
+| `store.py` | `ScoringStore`：基于文件系统的评分数据持久化（`data/scoring/`） |
+| `manager.py` | `ScoringManager`：进程级单例；内存写缓冲 + per-key asyncio.Lock + fire-and-forget 持久化 |
+
+**新增 API**（`app/api/scoring_api.py`，路由前缀 `/scoring`）：
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET  /scoring/agents` | Top-N Agent 综合评分（`?top=10`） |
+| `GET  /scoring/agents/{name}` | 指定 Agent 评分详情 + 原始统计 |
+| `GET  /scoring/tools` | Top-N Tool 综合评分 |
+| `GET  /scoring/tools/{name}` | 指定 Tool 评分详情 + 原始统计 |
+| `GET  /scoring/weights` | 查询当前评分权重配置 |
+| `PUT  /scoring/weights` | 更新评分权重（支持部分更新） |
+| `DELETE /scoring/agents/{name}` | 重置指定 Agent 统计数据 |
+| `DELETE /scoring/tools/{name}` | 重置指定 Tool 统计数据 |
+
+---
+
+### 4. app/core/task_planner.py — TaskItem 模型强化 + 向后兼容层清除
+
+#### 4.1 TaskItem 属性私有化 + property 访问器
+
+将 `task_id` / `status` / `priority` / `created_at` / `updated_at` 改为私有属性（`_task_id` 等），通过 property 暴露：
+
+| property | setter 约束 |
+| --- | --- |
+| `task_id` | 只读，由 `_new_id()` 服务端生成 |
+| `status` | 已完成/取消状态不可逆（COMPLETED/CANCELLED → 仅允许取消），自动更新 `_updated_at` |
+| `priority` | 已完成/取消状态或负数值时拒绝更新 |
+
+新增 `update(content, priority, status, tags, depends_on)` 方法，统一字段更新入口。
+
+#### 4.2 `to_dict()` / `from_dict()` 修正
+
+旧版用 `asdict(self)` 产生带下划线前缀的键（`_task_id`, `_status` 等），`from_dict` 再用 `cls(**d)` 调用——键名不匹配，导致反序列化崩溃。
+
+修正方案：
+
+- `to_dict()` 手动构造公开键名的 dict（`task_id`, `status`, `priority`, `created_at`, `updated_at`）
+- `from_dict()` 先调用 `cls(content, priority, tags, depends_on)` 创建对象，再逐一赋值私有属性
+
+同时移除不再需要的 `asdict` 导入及 `from re import L` / `from turtle import st` 误导入。
+
+#### 4.3 向后兼容层清除
+
+| 删除项 | 说明 |
+| --- | --- |
+| `TASK_LIST_KEY` / `TASK_LIST_TTL` | 旧单级任务 Redis key，已被 L1/L2 双级键替代 |
+| `DECOMPOSE_SYSTEM` / `DECOMPOSE_USER_TMPL` | 通用任务分解提示词，已被 `L1_DECOMPOSE_SYSTEM` / `L2_DECOMPOSE_SYSTEM` 替代 |
+| `TaskDecomposer.decompose()` | 旧单级分解方法，使用已删除的提示词常量；`L1Decomposer.decompose` / `L2Decomposer.decompose` 是正式替代 |
+| `make_task_planner()` | 已被 `make_l1_store()` / `make_l2_store()` 替代 |
+| REDUNDANT[TP01] 注释块 | 三套提示词重叠说明注释，随旧提示词一并删除 |
+
+`TaskStore.__init__` 的 `redis_key` 参数改为必填（不再有默认值），调用方必须通过 `make_l1_store` / `make_l2_store` 工厂函数获取，强制使用分级架构。
+
+---
+
+### 5. 前端：stream_id 精准取消
+
+**修改文件**（`smart_butler-web`）：
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/types/index.ts` | `SseEventType` 新增 `stream_start`；`SseEvent` 新增 `stream_id?: string` |
+| `src/utils/stream.ts` | 模块级 `_activeStreamId`，接收 `stream_start` 事件时赋值；新增 `getActiveStreamId()` 导出 |
+| `src/api/chat.ts` | `cancelStream(streamId)` 接受 `stream_id` 参数，POST body 带 `stream_id` |
+| `src/views/chat/ChatView.vue` | 取消时调用 `cancelStream(getActiveStreamId())` 精准停止对应流 |
+
+**效果**：同一用户多端并发对话时，「停止」按钮只停止当前客户端的流，不影响其他标签页或设备。
 
 ---
 

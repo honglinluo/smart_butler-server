@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from app.database.pool import get_connection, release_connection
-from app.core.redis_keys import (
+from app.database.redis_keys import (
     MEMORY_TURNS            as _KEY_TURNS,
     MEMORY_SESSION_TURNS    as _KEY_SESSION_TURNS,
     MEMORY_TOTAL            as _KEY_TOTAL,

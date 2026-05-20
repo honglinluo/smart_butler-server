@@ -1,46 +1,53 @@
 """
-【模块说明】聊天历史存储（ChatHistoryStore）— 把对话记录存进 Elasticsearch
+【模块说明】VectorDB 聊天历史存储后端（ChatHistoryStore）
 
-每次对话结束后，系统需要把这轮对话持久化存储，以便以后检索。
-这个模块封装了所有对 Elasticsearch 聊天记录的读写操作，
+基于 Elasticsearch 实现 ChatHistoryBackend 接口，封装聊天记录的增删改查与向量操作。
 每位用户的对话历史存在 ES 中独立的索引（Index）里，互相隔离。
 
 【主要操作】
-  save_turn()         — 保存一轮对话（用户问题 + AI 回复）
-  get_recent_turns()  — 获取最近几轮对话（组装上下文时使用）
-  search_turns()      — 按关键词全文搜索历史对话
-  delete_turns()      — 删除指定的历史轮次
-  update_vector()     — 更新某条记录的向量（用于 RAG 检索）
-
-ChatHistoryStore - 封装对 Elasticsearch 的聊天记录操作
-
-提供保存、查询、向量更新、向量检索以及简单的时间范围摘要等方法。
-使用项目已有的连接池接口 `get_connection` / `release_connection`。每次操作会独立获取并释放 ES 连接。
+  save_turn()           — 保存一轮对话（用户问题 + AI 回复）
+  get_recent_messages() — 获取最近几条消息（role/content 展开格式，供 LLM 上下文使用）
+  get_recent_turns()    — 获取最近几轮对话（含完整元数据，供历史记录 API 使用）
+  add_embedding()       — 向已存文档附加向量字段（RAG 检索用）
+  vector_search()       — 基于向量字段执行近邻搜索
+  list_indices()        — 列出 ES 中所有索引
+  count_index_docs()    — 统计指定索引的文档数量
+  summarize_recent()    — 拼接最近时间段内的聊天记录文本
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
 import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 from app.database.pool import get_connection, release_connection
+from app.memory.base import ChatHistoryBackend
 
 logger = logging.getLogger(__name__)
 
+_SYSTEM_TYPES = {"compression_summary", "monthly_summary", "yearly_summary"}
 
-class ChatHistoryStore:
-    """封装聊天记录在 Elasticsearch 中的增删改查和向量接口。
 
-    索引命名：使用 `user_id` 作为索引名（内部会加上全局 index_prefix）。
+class ChatHistoryStore(ChatHistoryBackend):
+    """基于 Elasticsearch 的聊天历史存储，实现 ChatHistoryBackend 接口。
+
+    索引命名：使用 `user_id` 作为索引名（底层连接池内部会加全局 index_prefix）。
+    每次操作独立获取并释放 ES 连接，与连接池生命周期解耦。
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         pass
 
-    async def _write_document(self, es_conn, user_id: str, doc_id: str, document: dict) -> bool:
-        """内部方法：将文档写入 ES，失败时回退到底层 client 直接写入。"""
+    # ── 内部写入辅助 ──────────────────────────────────────────────────────────
+
+    async def _write_document(
+        self, es_conn, user_id: str, doc_id: str, document: dict
+    ) -> bool:
+        """将文档写入 ES；失败时回退到底层 client 直接写入。"""
         try:
-            success = await es_conn.create(index=user_id, doc_id=doc_id, document=document, refresh=True)
+            success = await es_conn.create(
+                index=user_id, doc_id=doc_id, document=document, refresh=True
+            )
         except Exception as e:
             success = False
             logger.warning(f"es_conn.create 抛出异常: {e}")
@@ -48,7 +55,6 @@ class ChatHistoryStore:
         if success:
             return True
 
-        # 回退：直接使用底层 client 写入
         client = getattr(es_conn, "es_client", None)
         if not client:
             return False
@@ -59,13 +65,16 @@ class ChatHistoryStore:
                 prefix = getattr(es_conn, "index_prefix", "") or ""
                 full_index = f"{prefix}_{user_id}" if prefix else user_id
 
-            resp = client.index(index=full_index, id=doc_id, document=document, refresh=True)
-            logger.debug(f"底层 client.index 响应: {resp}")
+            resp = client.index(
+                index=full_index, id=doc_id, document=document, refresh=True
+            )
             if resp is not None and resp.get("result") in ("created", "updated"):
                 return True
         except Exception as e:
             logger.warning(f"底层 client.index 写入失败: {e}")
         return False
+
+    # ── ChatHistoryBackend 核心接口 ───────────────────────────────────────────
 
     async def save_turn(
         self,
@@ -78,7 +87,6 @@ class ChatHistoryStore:
         """将一轮对话（用户输入 + 模型回复）作为单一文档写入 ES。
 
         返回写入成功的 turn_id，失败时返回空字符串。
-        单文档结构便于向量检索命中后直接获取完整上下文。
         """
         es_conn = None
         try:
@@ -113,12 +121,12 @@ class ChatHistoryStore:
         size: int = 5,
         from_: int = 0,
     ) -> List[Dict[str, Any]]:
-        """获取聊天消息，按 timestamp 降序分页返回。
+        """获取聊天消息，按 timestamp 降序分页返回展开后的 role/content 列表。
 
         Args:
             user_id: 用户 ID（对应 ES 索引名）
-            size:    每页条数
-            from_:   分页偏移（turn 级别，非消息级别）
+            size:    每页轮次数
+            from_:   分页偏移（turn 级别）
         """
         es_conn = None
         try:
@@ -133,15 +141,12 @@ class ChatHistoryStore:
             )
             hits = res.get("hits", {}).get("hits", []) if res is not None else []
 
-            _SYSTEM_TYPES = {"compression_summary", "monthly_summary", "yearly_summary"}
-
             turns: List[Dict[str, Any]] = []
             for h in hits:
                 src = h.get("_source", h) if isinstance(h, dict) else {}
                 if not isinstance(src, dict):
                     continue
 
-                # 跳过系统内部归档记录（记忆压缩、月度/年度摘要）
                 meta = src.get("metadata") or {}
                 if isinstance(meta, dict) and meta.get("type") in _SYSTEM_TYPES:
                     continue
@@ -152,7 +157,6 @@ class ChatHistoryStore:
                 ts = src.get("timestamp")
 
                 if "user_input" in src:
-                    # 新格式：一个 turn 文档包含问答双方
                     turns.append({
                         "_doc_type": "turn",
                         "turn_id": src.get("turn_id", doc_id),
@@ -162,9 +166,13 @@ class ChatHistoryStore:
                         "_id": doc_id,
                     })
                 else:
-                    # 旧格式：单条 role/content 消息，包装成单轮 turn
                     role = src.get("role") or src.get("type") or "user"
-                    content = src.get("content") or src.get("question") or src.get("text") or ""
+                    content = (
+                        src.get("content")
+                        or src.get("question")
+                        or src.get("text")
+                        or ""
+                    )
                     turns.append({
                         "_doc_type": "legacy",
                         "role": role,
@@ -173,8 +181,6 @@ class ChatHistoryStore:
                         "_id": doc_id,
                     })
 
-            # ES 已按 timestamp desc 排序，无需二次排序
-            # 展开为调用方期望的 [{"role": ..., "content": ...}] 格式
             messages: List[Dict[str, Any]] = []
             for item in turns:
                 if item["_doc_type"] == "turn":
@@ -215,17 +221,16 @@ class ChatHistoryStore:
     ) -> List[Dict[str, Any]]:
         """获取对话轮次列表，每条包含 user_input + assistant_response，按 timestamp 降序分页。
 
-        供历史记录 API 使用；引擎内部构建 LLM 上下文请继续使用 get_recent_messages。
+        供历史记录 API 使用；LLM 上下文构建请使用 get_recent_messages。
         client_type 非空时只返回该客户端的对话。
         """
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
 
-            if client_type:
-                query: dict = {"term": {"client_type": client_type}}
-            else:
-                query = {"match_all": {}}
+            query: dict = (
+                {"term": {"client_type": client_type}} if client_type else {"match_all": {}}
+            )
 
             res = await es_conn.search(
                 index=user_id,
@@ -235,8 +240,6 @@ class ChatHistoryStore:
                 sort=[{"timestamp": {"order": "desc", "unmapped_type": "date"}}],
             )
             hits = res.get("hits", {}).get("hits", []) if res is not None else []
-
-            _SYSTEM_TYPES = {"compression_summary", "monthly_summary", "yearly_summary"}
 
             turns: List[Dict[str, Any]] = []
             for h in hits:
@@ -272,12 +275,22 @@ class ChatHistoryStore:
             if es_conn:
                 await release_connection("elasticsearch", es_conn)
 
-    async def add_embedding(self, user_id: str, doc_id: str, embedding: List[float], vector_field: str = "embedding") -> bool:
+    # ── 扩展功能 ──────────────────────────────────────────────────────────────
+
+    async def add_embedding(
+        self,
+        user_id: str,
+        doc_id: str,
+        embedding: List[float],
+        vector_field: str = "embedding",
+    ) -> bool:
         """向已有文档添加/更新向量字段，以便后续向量检索使用。"""
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            return await es_conn.update(index=user_id, doc_id=doc_id, document={vector_field: embedding})
+            return await es_conn.update(
+                index=user_id, doc_id=doc_id, document={vector_field: embedding}
+            )
         except Exception as e:
             logger.warning(f"为文档添加向量失败: {e}")
             return False
@@ -285,12 +298,20 @@ class ChatHistoryStore:
             if es_conn:
                 await release_connection("elasticsearch", es_conn)
 
-    async def vector_search(self, user_id: str, vector: List[float], top_k: int = 10, filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    async def vector_search(
+        self,
+        user_id: str,
+        vector: List[float],
+        top_k: int = 10,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         """基于向量字段执行近邻搜索（封装底层 vector_search）。"""
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-            return await es_conn.vector_search(index=user_id, vector=vector, top_k=top_k, filter=filter)
+            return await es_conn.vector_search(
+                index=user_id, vector=vector, top_k=top_k, filter=filter
+            )
         except Exception as e:
             logger.warning(f"向量检索失败: {e}")
             return []
@@ -303,17 +324,13 @@ class ChatHistoryStore:
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-
-            # 直接使用底层 client 列出索引
             client = getattr(es_conn, "es_client", None)
             if not client:
                 return []
 
             pattern = f"{prefix}*" if prefix else "*"
-            # 使用关键字参数避免 Positional arguments 错误
             indices_dict = client.indices.get(index=pattern)
-            indices = list(indices_dict.keys())
-            return indices
+            return list(indices_dict.keys())
         except Exception as e:
             logger.warning(f"列出索引失败: {e}")
             return []
@@ -321,23 +338,26 @@ class ChatHistoryStore:
             if es_conn:
                 await release_connection("elasticsearch", es_conn)
 
-    async def count_index_docs(self, user_id: str, client_type: Optional[str] = None) -> int:
+    async def count_index_docs(
+        self, user_id: str, client_type: Optional[str] = None
+    ) -> int:
         """返回指定索引（user_id）中的文档数量。client_type 非空时只统计该客户端。"""
         es_conn = None
         try:
             es_conn = await get_connection("elasticsearch", None)
-
             client = getattr(es_conn, "es_client", None)
             if not client:
                 return 0
 
-            query: Optional[dict] = {"term": {"client_type": client_type}} if client_type else None
+            query: Optional[dict] = (
+                {"term": {"client_type": client_type}} if client_type else None
+            )
             try:
                 return await es_conn.count_documents(index=user_id, query=query)
             except Exception:
                 try:
                     resp = client.count(index=f"{es_conn.index_prefix}_{user_id}")
-                    return int(resp.get('count', 0))
+                    return int(resp.get("count", 0))
                 except Exception:
                     return 0
 
@@ -348,8 +368,10 @@ class ChatHistoryStore:
             if es_conn:
                 await release_connection("elasticsearch", es_conn)
 
-    async def summarize_recent(self, user_id: str, hours: int = 24, max_messages: int = 200) -> str:
-        """读取最近时间范围内的聊天记录并返回一个简单的拼接文本（可替换为模型摘要流程）。"""
+    async def summarize_recent(
+        self, user_id: str, hours: int = 24, max_messages: int = 200
+    ) -> str:
+        """读取最近时间范围内的聊天记录并返回拼接文本（可替换为模型摘要流程）。"""
         try:
             msgs = await self.get_recent_messages(user_id, size=max_messages)
             if not msgs:
@@ -369,7 +391,6 @@ class ChatHistoryStore:
                 if t is None or t >= cutoff:
                     filtered.append(m)
 
-            # 简单拼接 role + content，供后续摘要使用
             parts = [f"[{m.get('role')}] {m.get('content')}" for m in reversed(filtered)]
             return "\n".join(parts)
         except Exception as e:

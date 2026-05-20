@@ -14,16 +14,21 @@ import yaml
 from fastapi import FastAPI, Depends
 
 from app.core.config_loader import ConfigLoader
-from app.core.embedding_service import EmbeddingService
+from app.rag.embedding_service import EmbeddingService
 from app.core.hermes_engine import HermesEngine
-from app.core.memory_manager import MemoryManager
 from app.core.vector_store import VectorStore
-from app.rag import RagPipeline
+from app.memory.factory import (
+    MEMORY_BACKEND,
+    create_memory_backend,
+    create_rag_pipeline,
+    is_filesystem_backend,
+)
 from app.database.pool import initialize_pools, close_all_pools, get_connection, release_connection
 from app.api import auth, models, chat, agents_api, tools_api, scheduler_api, decision_api, files_api, skills_api
+from app.api import scoring_api
 from app.api.dependencies import get_current_user
 from app.api.auth import _flush_profile_to_mysql
-from app.core.redis_keys import USER_INIT
+from app.database.redis_keys import USER_INIT
 
 
 def _read_log_cfg() -> dict:
@@ -44,12 +49,12 @@ logger = logging.getLogger(__name__)
 
 
 # 全局组件（由 lifespan 管理生命周期）
-config_loader:     ConfigLoader              = None
-hermes_engine:     HermesEngine              = None
-memory_manager:    MemoryManager             = None
-embedding_service: EmbeddingService          = None
-vector_store:      VectorStore               = None
-rag_pipeline:      RagPipeline               = None
+config_loader:     ConfigLoader  = None
+hermes_engine:     HermesEngine  = None
+memory_manager                   = None   # FilesystemMemoryBackend | MemoryManager
+embedding_service: EmbeddingService = None
+vector_store:      VectorStore   = None
+rag_pipeline                     = None   # FilesystemRagPipeline | RagPipeline
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -276,7 +281,7 @@ async def lifespan(application: FastAPI):
     from app.scheduler.runner import scheduler as task_scheduler
     global config_loader, hermes_engine, memory_manager, embedding_service, vector_store, rag_pipeline
 
-    logger.info("🚀 启动智能管家服务端...")
+    logger.info("🚀 启动智能管家服务端... (记忆后端: %s)", MEMORY_BACKEND)
     try:
         # 1. 加载配置
         config_loader = ConfigLoader("config")
@@ -291,10 +296,10 @@ async def lifespan(application: FastAPI):
         # 2b. 数据库结构迁移（幂等，仅在枚举不包含时执行）
         await _ensure_llms_table_has_embedding_type()
 
-        # 3. 初始化记忆管理器
-        memory_manager = MemoryManager(system_config)
+        # 3. 初始化记忆管理器（后端由 MEMORY_BACKEND 环境变量决定）
+        memory_manager = create_memory_backend(system_config)
         application.state.memory_manager = memory_manager
-        logger.info("✅ 记忆管理器初始化成功")
+        logger.info("✅ 记忆管理器初始化成功 (backend=%s)", MEMORY_BACKEND)
 
         # 4. 初始化 Hermes 引擎，注入 MemoryManager
         hermes_engine = HermesEngine(system_config)
@@ -303,31 +308,39 @@ async def lifespan(application: FastAPI):
         application.state.hermes_engine = hermes_engine
         logger.info("✅ Hermes 引擎初始化成功")
 
-        # 5. 初始化 Embedding 服务与 VectorStore
+        # 5. 初始化 Embedding 服务与 VectorStore（vectordb 后端需要）
         embedding_service = EmbeddingService(system_config)
         vector_store      = VectorStore(embedding_service, system_config)
 
-        # 5b. 创建 RagPipeline（统一 RAG 检索/索引/重向量化接口）
-        rag_pipeline = RagPipeline(embedding_service, vector_store, memory_manager, system_config)
+        # 5b. 创建 RAG 流水线（后端由工厂决定）
+        rag_pipeline = create_rag_pipeline(
+            memory_backend=memory_manager,
+            config=system_config,
+            embedding_service=embedding_service,
+            vector_store=vector_store,
+        )
         hermes_engine.set_rag_pipeline(rag_pipeline)
-        logger.info("✅ RagPipeline 初始化成功")
+        logger.info("✅ RAG 流水线初始化成功 (backend=%s)", MEMORY_BACKEND)
 
-        if embedding_service.enabled:
-            available = await embedding_service.is_available()
-            if available:
-                logger.info(
-                    f"✅ Embedding 服务可用: provider={embedding_service.provider} "
-                    f"model={embedding_service.model_name}"
-                )
-                # 6. 校验 embedding 配置，必要时重建向量索引
-                await validate_embedding_config(system_config, vector_store, rag_pipeline)
+        # 6. Embedding 服务可用性检查（仅 vectordb 后端需要完整校验）
+        if not is_filesystem_backend():
+            if embedding_service.enabled:
+                available = await embedding_service.is_available()
+                if available:
+                    logger.info(
+                        f"✅ Embedding 服务可用: provider={embedding_service.provider} "
+                        f"model={embedding_service.model_name}"
+                    )
+                    await validate_embedding_config(system_config, vector_store, rag_pipeline)
+                else:
+                    logger.warning(
+                        f"⚠️  Embedding 服务不可达 ({embedding_service.api_url})，"
+                        "向量化功能暂停，请检查服务配置后重启。"
+                    )
             else:
-                logger.warning(
-                    f"⚠️  Embedding 服务不可达 ({embedding_service.api_url})，"
-                    "向量化功能暂停，请检查服务配置后重启。"
-                )
+                logger.warning("⚠️  embedding.model_name 未配置，向量化功能关闭。")
         else:
-            logger.warning("⚠️  embedding.model_name 未配置，向量化功能关闭。")
+            logger.info("ℹ️  filesystem 后端：跳过 Embedding 服务检查")
 
         # 7. 自动发现并注册 workers/ 目录下所有 Worker Agent 到 registry
         try:
@@ -370,7 +383,7 @@ async def lifespan(application: FastAPI):
         except Exception as e:
             logger.warning(f"⚠️  内置工具注册失败（可忽略）: {e}")
 
-        # 8. 将 VectorStore 注入 MemoryManager（Redis/MySQL 直写路径仍需要）
+        # 8. 将 VectorStore 注入 MemoryManager（vectordb 后端需要；filesystem 后端无操作）
         memory_manager.set_vector_store(vector_store)
 
         application.state.vector_store      = vector_store
@@ -448,6 +461,7 @@ app.include_router(scheduler_api.router)
 app.include_router(decision_api.router)
 app.include_router(files_api.router)
 app.include_router(skills_api.router)
+app.include_router(scoring_api.router)
 
 
 @app.get("/health")

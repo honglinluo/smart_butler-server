@@ -67,7 +67,7 @@ from app.utils.crypto import (
     decrypt_password, generate_nonce, get_public_key_pem,
     nonce_redis_key, NONCE_TTL,
 )
-from app.core.redis_keys import (
+from app.database.redis_keys import (
     SESSION_TOKEN, SESSION_TTL,
     USER_INIT, INIT_TTL,
     USER_SESSIONS, USER_SESSIONS_TTL,

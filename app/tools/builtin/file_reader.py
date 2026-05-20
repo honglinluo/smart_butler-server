@@ -50,7 +50,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.core.paths import PROJECT_ROOT
+from app.utils.paths import PROJECT_ROOT
 from app.tools.base import BaseTool, EXEC_CLIENT, EXEC_SERVER, VIS_PUBLIC
 
 logger = logging.getLogger(__name__)

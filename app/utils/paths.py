@@ -5,7 +5,7 @@
 全项目所有模块都从这里导入路径，而不是各自去计算，避免在不同启动方式下路径出错。
 
 使用方式：
-  from app.core.paths import PROJECT_ROOT
+  from app.utils.paths import PROJECT_ROOT
   config_file = PROJECT_ROOT / "config" / "system_config.yaml"
 
 路径来源优先级：

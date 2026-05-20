@@ -36,7 +36,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from app.core.paths import PROJECT_ROOT
+from app.utils.paths import PROJECT_ROOT
 from app.skills.manager import skill_manager, SKILLS_ROOT, _validate_skill_content
 
 logger = logging.getLogger(__name__)

@@ -71,14 +71,13 @@ _PLAN_MODE_SYSTEM = """你是一个多智能体编排器。
 
 _VALIDATE_STEP_SYSTEM = """你是一个质量检验员。
 
-当前串行任务链的上一步已完成：
+当前串行任务链的某步骤已执行完毕：
   Agent：{agent_name}
-  任务：{task_desc}
-  结果：{result_preview}
+  分配任务：{task_desc}
+  执行结果：{result_preview}
 
-下一步任务：{next_task_desc}
-
-请判断上一步的结果是否足够完整，满足下一步任务的输入要求。
+请判断该步骤的执行结果是否完整完成了上方分配的任务。
+（仅评估本步骤自身任务是否达成，不考虑后续步骤的需求）
 
 只返回 JSON：{{"can_proceed": true, "issue": "", "suggestion": ""}}"""
 
@@ -394,11 +393,11 @@ class RouterAgent:
         agent_name: str,
         task_desc: str,
         result: str,
-        next_task_desc: str,
+        next_task_desc: str = "",
         llm: Optional[BaseChatModel] = None,
     ) -> Dict[str, Any]:
         """
-        校验串行流水线中某步骤的输出是否满足下一步输入要求。
+        校验串行流水线中某步骤的输出是否完成了自身分配的任务。
 
         Returns:
             {"can_proceed": bool, "issue": str, "suggestion": str}
@@ -409,7 +408,6 @@ class RouterAgent:
                 agent_name=agent_name,
                 task_desc=task_desc,
                 result_preview=result[:500],
-                next_task_desc=next_task_desc,
             )),
         ]
         try:
@@ -505,9 +503,13 @@ class RouterAgent:
                     },
                 })
 
-            logger.debug(
-                "多Agent路由: '%s' → steps=%d agents=%s",
-                user_input[:60], len(pipeline), [p["agent_name"] for p in pipeline],
+            logger.info(
+                "多Agent路由: '%s' → steps=%d\n%s",
+                user_input[:60], len(pipeline),
+                "\n".join(
+                    f"  step{p['step']}: [{p['agent_name']}] {p['task'].get('description', '')[:120]}"
+                    for p in pipeline
+                ),
             )
             return pipeline
         except Exception as e:
@@ -752,9 +754,13 @@ class RouterAgent:
                 for t in tasks_with_agents
             ]
             await store.replace(raw)
-            logger.debug(
-                "[RouterAgent] L1 任务已写入 user=%s turn=%s tasks=%d",
+            logger.info(
+                "[L1] 任务拆分写入: user=%s turn=%s steps=%d\n%s",
                 user_id, turn_id, len(raw),
+                "\n".join(
+                    f"  step{i}: [{t.get('agent_name', '')}] {t.get('content', '')[:120]}"
+                    for i, t in enumerate(raw)
+                ),
             )
         except Exception as e:
             logger.warning("[RouterAgent] L1 任务写入失败: %s", e)

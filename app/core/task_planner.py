@@ -53,7 +53,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence
@@ -70,10 +70,6 @@ TASK_L2_KEY   = "task:{user_id}:l2:{agent_name}:{exec_id}"
 TASK_L1_TTL   = 7 * 86_400
 TASK_L2_TTL   = 1 * 86_400
 
-# 向后兼容旧键（无分级时使用）
-TASK_LIST_KEY = "task:{user_id}:list"
-TASK_LIST_TTL = 7 * 86_400
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # 提示词常量（所有面向 LLM 的文本集中在此，方便独立调整）
@@ -85,7 +81,7 @@ TASK_LIST_TTL = 7 * 86_400
 # ════════════════════════════════════════════════════════════════════════════
 
 L1_DECOMPOSE_SYSTEM = """\
-你是一个多智能体任务规划器，负责将用户目标分配给合适的 Agent。
+进行多智能体任务规划，将用户目标拆分为 Agent 的工作任务。
 
 可用 Agent 列表：
 {agents_info}
@@ -95,7 +91,7 @@ L1_DECOMPOSE_SYSTEM = """\
 1. 每条子任务对应且仅对应一个 Agent，粒度为"一个 Agent 完整负责的工作块"。
 2. 明确任务间的依赖：后续任务依赖前序任务的输出时，在 depends_on_indices 中标注。
 3. 合理选 Agent：根据 Agent 的职责描述选择最匹配的；无专门 Agent 时选 general_assistant。
-4. 任务描述要具体：写明"用什么数据/来源"、"做什么操作"、"输出什么"，不能只写"分析数据"。
+4. 任务描述必须具体：写明"用什么数据/来源"、"做什么操作"、"输出什么"，不能只写"分析数据"。
 5. 若目标简单、只需一个 Agent，则只输出一条任务。
 
 输出格式（严格 JSON 数组，不要有其他文字）
@@ -124,7 +120,7 @@ L1_DECOMPOSE_USER_TMPL = """\
 # ════════════════════════════════════════════════════════════════════════════
 
 L2_DECOMPOSE_SYSTEM = """\
-你是一个任务执行规划器，负责将分配给你的任务拆解为可逐步执行的操作序列。
+进行任务执行规划，将任务拆解为可逐步执行的操作序列。
 
 拆分原则
 ────────
@@ -162,52 +158,6 @@ L2_DECOMPOSE_USER_TMPL = """\
 
 {context_block}
 请将上述任务拆解为可执行步骤，按操作顺序排列，严格输出 JSON 数组。\
-"""
-
-# REDUNDANT[TP01]: 项目中存在三套语义重叠的任务分解提示词：
-#   L1_DECOMPOSE_SYSTEM（本文件）— Agent 级分配（路由层使用）
-#   L2_DECOMPOSE_SYSTEM（本文件）— 步骤级执行（Worker 层使用）
-#   DECOMPOSE_SYSTEM（本文件）   — 通用版（向后兼容，TaskDecomposer 旧路径使用）
-#   _DECOMPOSE_SYSTEM（router.py）— 独立维护的路由分解提示词
-# 随着分级架构完善，DECOMPOSE_SYSTEM 和 _DECOMPOSE_SYSTEM 可考虑统一为 L1_DECOMPOSE_SYSTEM。
-
-# ── 通用自动拆分提示词（向后兼容，无分级场景） ──────────────────────────────
-
-# ── 自动拆分提示词 ───────────────────────────────────────────────────────────
-
-DECOMPOSE_SYSTEM = """\
-你是一个任务规划专家，负责将用户的目标拆解为可执行的子任务列表。
-
-拆分原则
-────────
-1. 粒度：每条子任务应为 2-5 分钟内可完成的单一动作，不可再拆分的最小执行单元。
-   正确示例："为 User 模型添加 email 字段并编写单元测试"
-   错误示例："实现用户认证系统"（太大）或"在第 23 行加一个分号"（太细）
-
-2. 顺序：按执行先后排列，有依赖的任务标注 depends_on。
-   基础设施/模型层 → 服务层 → API 层 → 测试/文档。
-
-3. 原子性：每条任务只做一件事。若需要先读后写，拆为两条。
-
-4. 可验证：任务描述应包含隐含的验收标准，让执行者知道何时算完成。
-
-输出格式（严格 JSON，不要有其他文本）
-─────────────────────────────────────
-[
-  {
-    "content": "任务描述（完整、可直接执行）",
-    "tags": ["类型标签，如 backend/frontend/test/infra/doc"],
-    "depends_on_indices": [前置任务在本数组中的索引，0-based，无依赖则为空数组]
-  },
-  ...
-]
-"""
-
-DECOMPOSE_USER_TMPL = """\
-目标：{goal}
-
-{context_block}
-请将上述目标拆解为子任务列表，按执行顺序排列，严格输出 JSON 数组，不要加任何注释或说明文字。\
 """
 
 # ── 增量重规划提示词（任务执行中途信息变化时使用）──────────────────────────
@@ -301,33 +251,116 @@ _STATUS_MARKER = {
 }
 
 _IMMUTABLE_STATUSES = {TaskStatus.COMPLETED, TaskStatus.CANCELLED}
+_VARIABLE_STATES = {TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED, TaskStatus.PENDING}
 
 
 @dataclass
 class TaskItem:
     """单条任务。ID 由服务端 `_new_id()` 生成，LLM 不直接赋值。"""
 
-    task_id:    str
+    _task_id:    str
     content:    str
-    status:     TaskStatus   = TaskStatus.PENDING
-    priority:   int          = 0          # 数值越小优先级越高，列表按此排序
+    _status:     TaskStatus   = TaskStatus.PENDING
+    _priority:   int          = 0          # 数值越小优先级越高，列表按此排序
     tags:       List[str]    = field(default_factory=list)
     depends_on: List[str]    = field(default_factory=list)   # task_id 列表
-    created_at: str          = field(default_factory=lambda: datetime.now().isoformat())
-    updated_at: str          = field(default_factory=lambda: datetime.now().isoformat())
+    _created_at: str          = field(default_factory=lambda: datetime.now().isoformat())
+    _updated_at: str          = field(default_factory=lambda: datetime.now().isoformat())
+
+    def __init__(
+            self,
+            content: str,
+            priority: int = 0,
+            tags: List[str] = list(),
+            depends_on: List[str] = list()
+        ) -> None:
+        self._task_id = _new_id()
+        self.content = content.strip() or "(无描述)"
+        self._priority = priority
+        self.tags = tags or list()
+        self.depends_on = depends_on or list()
+        self._created_at = datetime.now().isoformat()
+        self._updated_at = self._created_at
+
+    @property
+    def task_id(self) -> str:
+        return self._task_id
+
+    @property
+    def status(self) -> TaskStatus:
+        return self._status
+
+    @status.setter
+    def status(self, value: TaskStatus) -> None:
+        if self._status in _IMMUTABLE_STATUSES and value != TaskStatus.CANCELLED:
+            logger.warning(f"任务 {self.task_id} 是不可变的，状态无法更新。")
+            return
+
+        if value in TaskStatus:
+            self._status = value
+            self._updated_at = datetime.now().isoformat()
+
+    @status.deleter
+    def status(self) -> None:
+        self._status = TaskStatus.PENDING
+        self._updated_at = datetime.now().isoformat()
+
+    @property
+    def priority(self) -> int:
+        return self._priority
+
+    @priority.setter
+    def priority(self, value: int) -> None:
+        if self.status in _IMMUTABLE_STATUSES or int(value) < 0:
+            logging.warning(f"任务 {self.task_id} 是不可变的，优先级无法更新。")
+            return
+        self._priority = int(value)
+        self._updated_at = datetime.now().isoformat()
+
+    def update(
+            self,
+            content: str = '',
+            priority: int = -1,
+            status: TaskStatus = TaskStatus.PENDING,
+            tags: List[str] = list(),
+            depends_on: List[str] = list()
+        ) -> None:
+        if content:
+            self.content = content.strip() or "(无描述)"
+        self.priority = priority
+        self.status = status
+        if tags:
+            self.tags = tags
+        if depends_on:
+            self.depends_on = depends_on
+        self._updated_at = datetime.now().isoformat()
 
     # ── 序列化 ──────────────────────────────────────────────────────────────
-
     def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        d["status"] = self.status.value
-        return d
+        return {
+            "task_id":    self._task_id,
+            "content":    self.content,
+            "status":     self._status.value,
+            "priority":   self._priority,
+            "tags":       list(self.tags),
+            "depends_on": list(self.depends_on),
+            "created_at": self._created_at,
+            "updated_at": self._updated_at,
+        }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TaskItem":
-        d = dict(d)
-        d["status"] = TaskStatus(d.get("status", "pending"))
-        return cls(**d)
+        obj = cls(
+            content    = d.get("content", ""),
+            priority   = d.get("priority", 0),
+            tags       = list(d.get("tags", [])),
+            depends_on = list(d.get("depends_on", [])),
+        )
+        obj._task_id    = d.get("task_id", obj._task_id)
+        obj._status     = TaskStatus(d.get("status", "pending"))
+        obj._created_at = d.get("created_at", obj._created_at)
+        obj._updated_at = d.get("updated_at", obj._updated_at)
+        return obj
 
     # ── 展示 ────────────────────────────────────────────────────────────────
 
@@ -360,11 +393,11 @@ class TaskStore:
     def __init__(
         self,
         user_id:   str,
-        redis_key: Optional[str] = None,
-        ttl:       int           = TASK_LIST_TTL,
+        redis_key: str,
+        ttl:       int = TASK_L1_TTL,
     ) -> None:
         self.user_id = user_id
-        self._key    = redis_key or TASK_LIST_KEY.format(user_id=user_id)
+        self._key    = redis_key
         self._ttl    = ttl
         self._cache: Optional[List[TaskItem]] = None   # 写透缓存
 
@@ -379,18 +412,13 @@ class TaskStore:
 
     async def replace(self, items: Sequence[Dict[str, Any]]) -> List[TaskItem]:
         """全量替换任务列表，忽略传入的 task_id，全部重新分配。"""
-        now = datetime.now().isoformat()
         new_list: List[TaskItem] = []
         for i, raw in enumerate(items):
             new_list.append(TaskItem(
-                task_id    = _new_id(),
-                content    = str(raw.get("content", "")).strip() or "(无描述)",
-                status     = TaskStatus.PENDING,
+                content    = raw.get("content", ""),
                 priority   = i,
                 tags       = list(raw.get("tags", [])),
                 depends_on = [],   # replace 时依赖关系在拆分阶段已处理
-                created_at = now,
-                updated_at = now,
             ))
         await self._save(new_list)
         return list(new_list)
@@ -404,7 +432,6 @@ class TaskStore:
         """
         current = await self._load()
         index   = {t.task_id: t for t in current}
-        now     = datetime.now().isoformat()
 
         for raw in items:
             tid = str(raw.get("task_id", "")).strip()
@@ -412,27 +439,19 @@ class TaskStore:
                 existing = index[tid]
                 if existing.status in _IMMUTABLE_STATUSES:
                     continue
-                if "content" in raw and raw["content"]:
-                    existing.content = str(raw["content"]).strip()
-                if "status" in raw:
-                    try:
-                        new_st = TaskStatus(raw["status"])
-                        if new_st not in _IMMUTABLE_STATUSES:
-                            existing.status = new_st
-                    except ValueError:
-                        pass
-                existing.updated_at = now
+                existing.update(
+                    content=raw.get("content", ""),
+                    status=TaskStatus(raw.get("status", existing.status)),
+                    tags=raw.get("tags", []),
+                    depends_on=raw.get("depends_on", [])
+                )
             else:
                 # 新任务：分配新 ID，优先级排到末尾
                 new_item = TaskItem(
-                    task_id    = _new_id(),
-                    content    = str(raw.get("content", "")).strip() or "(无描述)",
-                    status     = TaskStatus.PENDING,
+                    content    = str(raw.get("content", "")),
                     priority   = max((t.priority for t in current), default=-1) + 1,
                     tags       = list(raw.get("tags", [])),
-                    depends_on = [],
-                    created_at = now,
-                    updated_at = now,
+                    depends_on = []
                 )
                 current.append(new_item)
                 index[new_item.task_id] = new_item
@@ -451,7 +470,6 @@ class TaskStore:
         """
         current = await self._load()
         index   = {t.task_id: t for t in current}
-        now     = datetime.now().isoformat()
 
         for p in patches:
             tid = str(p.get("task_id", "")).strip()
@@ -460,35 +478,17 @@ class TaskStore:
                 continue
 
             task = index[tid]
-            immutable = task.status in _IMMUTABLE_STATUSES
 
-            if "priority" in p:
-                try:
-                    task.priority   = int(p["priority"])
-                    task.updated_at = now
-                except (TypeError, ValueError):
-                    pass
-
-            if immutable:
+            if task.status in _IMMUTABLE_STATUSES:
                 continue
 
-            if "content" in p and p["content"]:
-                task.content    = str(p["content"]).strip()
-                task.updated_at = now
-            if "status" in p:
-                try:
-                    new_st = TaskStatus(p["status"])
-                    if new_st not in _IMMUTABLE_STATUSES:
-                        task.status     = new_st
-                        task.updated_at = now
-                except ValueError:
-                    pass
-            if "tags" in p:
-                task.tags       = list(p["tags"])
-                task.updated_at = now
-            if "depends_on" in p:
-                task.depends_on = list(p["depends_on"])
-                task.updated_at = now
+            task.update(
+                content = p.get("content", ""),
+                priority=p.get("priority", -1),
+                status  = TaskStatus(p.get("status", task.status)),
+                tags    = p.get("tags", []),
+                depends_on = p.get("depends_on", [])
+            )
 
         _sort_by_priority(current)
         _recompute_blocked(current)
@@ -503,10 +503,8 @@ class TaskStore:
         found   = False
         for t in current:
             if t.task_id == task_id:
-                if t.status not in _IMMUTABLE_STATUSES or status == TaskStatus.CANCELLED:
-                    t.status     = status
-                    t.updated_at = datetime.now().isoformat()
-                    found = True
+                t.status     = status
+                found = True
                 break
         if found:
             _recompute_blocked(current)
@@ -522,17 +520,14 @@ class TaskStore:
         failed_ids   ：实际执行失败、应回退为 pending 的 task_id 列表
         """
         current = await self._load()
-        now = datetime.now().isoformat()
         done_set = set(completed_ids)
         fail_set = set(failed_ids)
 
         for t in current:
             if t.task_id in done_set and t.status != TaskStatus.COMPLETED:
                 t.status     = TaskStatus.COMPLETED
-                t.updated_at = now
             elif t.task_id in fail_set and t.status in (TaskStatus.IN_PROGRESS, TaskStatus.COMPLETED):
                 t.status     = TaskStatus.PENDING
-                t.updated_at = now
 
         _recompute_blocked(current)
         await self._save(current)
@@ -545,7 +540,7 @@ class TaskStore:
         与 hermes-agent 相同：completed/cancelled 不注入，避免 LLM 重做已完成工作。
         """
         current = await self._load()
-        active  = [t for t in current if t.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED)]
+        active  = [t for t in current if t.status in _VARIABLE_STATES]
         if not active:
             return None
 
@@ -558,7 +553,7 @@ class TaskStore:
 
     async def get_active(self) -> List[TaskItem]:
         """返回 pending + in_progress + blocked 的任务列表（按 priority 排序）。"""
-        return [t for t in await self.read() if t.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED)]
+        return [t for t in await self.read() if t.status in _VARIABLE_STATES]
 
     async def summary(self) -> Dict[str, int]:
         """返回各状态的任务计数。"""
@@ -626,53 +621,6 @@ class TaskDecomposer:
 
     def __init__(self, store: TaskStore) -> None:
         self._store = store
-
-    async def decompose(
-        self,
-        goal:    str,
-        llm:     Any,
-        context: Optional[str] = None,
-    ) -> List[TaskItem]:
-        """将 goal 拆解为子任务，写入 TaskStore（replace 模式）后返回任务列表。
-
-        Args:
-            goal:    用户描述的目标（自然语言）
-            llm:     LangChain BaseChatModel 实例
-            context: 可选的背景信息（项目结构、已知约束等）
-        """
-        context_block = f"背景信息：\n{context}" if context else ""
-        prompt        = DECOMPOSE_USER_TMPL.format(goal=goal, context_block=context_block)
-
-        raw_items = await self._call_llm_structured(
-            system=DECOMPOSE_SYSTEM,
-            user=prompt,
-            llm=llm,
-        )
-        if not raw_items:
-            logger.warning("[TaskDecomposer] 分解结果为空，goal=%s", goal[:60])
-            return []
-
-        # 处理 depends_on_indices → depends_on task_id
-        # 先 replace 写入（获取 task_id），再 patch 写入依赖
-        tasks = await self._store.replace(raw_items)
-        id_map = [t.task_id for t in tasks]
-
-        patches = []
-        for i, raw in enumerate(raw_items):
-            dep_indices = raw.get("depends_on_indices", [])
-            if dep_indices and i < len(id_map):
-                dep_ids = [id_map[j] for j in dep_indices if isinstance(j, int) and 0 <= j < len(id_map)]
-                if dep_ids:
-                    patches.append({"task_id": id_map[i], "depends_on": dep_ids})
-
-        if patches:
-            tasks = await self._store.patch(patches)
-
-        logger.info(
-            "[TaskDecomposer] 目标拆解完成 user=%s tasks=%d goal=%s",
-            self._store.user_id, len(tasks), goal[:60],
-        )
-        return tasks
 
     async def replan(
         self,
@@ -940,11 +888,6 @@ class L2Decomposer:
                 return 1
         return 0
 
-
-def make_task_planner(user_id: str) -> tuple[TaskStore, TaskDecomposer]:
-    """返回 (TaskStore, TaskDecomposer) 二元组，绑定到指定 user_id（向后兼容）。"""
-    store = TaskStore(user_id)
-    return store, TaskDecomposer(store)
 
 
 def make_l1_store(user_id: str, turn_id: str) -> tuple[TaskStore, "L1Decomposer"]:

@@ -201,9 +201,9 @@ class ConsentResponse(BaseModel):
     用户对"危险操作授权"的回复数据结构。
     request_id：对应哪一次危险操作请求的 ID
     decision（决策选项）：
-      - allow        → 仅允许这一次，下次同类操作还会再问
-      - deny         → 拒绝，AI 不执行该操作
-      - conversation → 本轮对话内所有危险操作都自动放行，不再弹窗
+      - allow   → 仅允许这一次，下次同类操作还会再问
+      - deny    → 拒绝，AI 不执行该操作
+      - conversation → 当前对话轮次内全部放行（下次新提问后恢复）
     """
     request_id: str
     decision:   Literal["allow", "deny", "conversation"] = "deny"
@@ -221,9 +221,9 @@ async def respond_consent(
 
     前端在收到 `consent_required` SSE 事件后，用户选择后调用此接口。
     decision 取值：
-      - allow        — 仅本次允许
-      - deny         — 拒绝
-      - conversation — 当前对话（用户消息轮次）内全部允许
+      - allow   — 仅本次允许
+      - deny    — 拒绝
+      - conversation — 当前对话轮次内全部放行（下次新提问后恢复）
     """
     ResponseHeaders().apply(response)
 

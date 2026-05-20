@@ -107,6 +107,7 @@ open http://localhost:8000/docs
 | `/auth` | auth.py | 注册、登录、Token 校验、登出 |
 | `/models` | models.py | LLM 模型配置 CRUD + 切换 |
 | `/chat` | chat.py | 消息发送（同步/SSE流式）、历史查询、文件上传、重向量化、危险操作授权响应 |
+| `/scoring` | scoring_api.py | Agent/Tool 评分查询、权重管理、统计重置 |
 | `/agents` | agents_api.py | Agent CRUD + 评分 + 热重载 |
 | `/tools` | tools_api.py | 工具查询与创建、危险操作类型开关管理 |
 | `/scheduler` | scheduler_api.py | 定时任务管理 + 通知 SSE |
@@ -151,7 +152,7 @@ ES 未就绪时自动降级到 Redis 近期对话。
 ### 月度 / 年度归档
 
 | 归档类型 | 触发时机 | 归档条件 | 摘要节数 |
-|---| --- | --- | --- |
+| --- | --- | --- | --- |
 | 月度归档 | 每月月底 UTC 23:00 | > 365 天的对话，按自然月 | 4 节 |
 | 年度归档 | 每年 12 月 31 日 | > 3 年的月度摘要，按自然年 | 4 节 |
 
@@ -222,16 +223,25 @@ smart_butler-server/
 │   │   ├── tools_api.py       # 工具管理
 │   │   ├── scheduler_api.py   # 定时任务
 │   │   ├── decision_api.py    # 工具构建决策门控
+│   │   ├── scoring_api.py     # Agent/Tool 评分查询与管理
 │   │   └── dependencies.py    # 依赖注入
 │   ├── core/                  # 核心引擎
 │   │   ├── hermes_engine.py   # 主编排引擎
-│   │   ├── memory_manager.py  # 三层记忆管理
+│   │   ├── task_planner.py    # 两级任务规划（L1 Agent 级 / L2 步骤级）
 │   │   ├── vector_store.py    # ES 向量索引
-│   │   ├── embedding_service.py # Embedding 服务
-│   │   ├── context_manager.py # 上下文组装
-│   │   ├── redis_keys.py      # Redis Key 常量
-│   │   ├── paths.py           # PROJECT_ROOT 统一入口
-│   │   └── config_loader.py   # YAML 配置加载
+│   │   ├── file_storage.py    # 文件上传管理
+│   │   └── config_loader.py   # YAML 配置加载（含环境变量占位符解析）
+│   ├── memory/                # 记忆系统（抽象层 + 后端实现）
+│   │   ├── base.py            # MemoryBackend / RagBackend ABC
+│   │   ├── factory.py         # 根据 MEMORY_BACKEND 环境变量选择后端
+│   │   └── backends/
+│   │       ├── vectordb/      # Redis+MySQL+ES 后端（原 memory_manager）
+│   │       └── filesystem/    # 纯文件系统后端（无外部依赖）
+│   ├── scoring/               # Agent/Tool 评分系统
+│   │   ├── models.py          # AgentStats / ToolStats / ScoreWeights 数据模型
+│   │   ├── algorithm.py       # 成功率×延迟×质量×频率加权评分算法
+│   │   ├── store.py           # 基于文件系统的评分持久化
+│   │   └── manager.py         # ScoringManager 单例（内存缓冲 + 异步落盘）
 │   ├── agents/                # Agent 体系
 │   │   ├── base.py            # BaseAgent 基类 + 技能记忆系统
 │   │   ├── router.py          # RouterAgent
@@ -274,9 +284,14 @@ smart_butler-server/
 │   │   ├── models.py          # 数据模型（TaskType/ActionType 枚举）
 │   │   ├── holiday.py         # 中国法定节假日
 │   │   └── system_tasks.py    # 系统级 cron（月度/年度归档注册）
-│   └── database/              # 数据库连接池
-│       ├── mysql.py / redis.py / elasticsearch.py
-│       └── pool.py            # 统一连接池管理
+│   ├── database/              # 数据库连接池与基础设施
+│   │   ├── pool.py            # 统一连接池管理
+│   │   ├── redis_keys.py      # Redis Key / TTL 常量（全局唯一）
+│   │   └── mysql.py / redis.py / elasticsearch.py
+│   └── utils/                 # 工具类
+│       ├── paths.py           # PROJECT_ROOT 统一入口
+│       ├── crypto.py          # 加解密工具
+│       └── log_bus.py / progress_bus.py  # 结构化日志与进度事件总线
 ├── scripts/
 │   ├── setup_embedding.py     # Embedding 模型初始化
 │   └── check_es_history.py    # ES 历史数据检查
@@ -360,7 +375,7 @@ python tests/run_demo.py
 | MySQL | 5.7+ / 8.0+ | 用户、模型、Agent、技能、调度任务、危险操作配置（`dangerous_op_configs`）、工具授权记录（`tool_consent_records`） |
 | Redis | 6.0+ | 近期对话、预取缓存、分布式锁、通知队列 |
 | Elasticsearch | 8.x | 聊天历史、向量索引 |
-| Ollama（可选）| 0.1.24+ | 本地 Embedding 模型服务 |
+| Ollama（可选） | 0.1.24+ | 本地 Embedding 模型服务 |
 
 ---
 
